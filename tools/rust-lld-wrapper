@@ -8,8 +8,25 @@ import subprocess
 import re
 from os import path
 
+def expand_response_files(args):
+    """Expand @file response files into actual arguments."""
+    expanded = []
+    for arg in args:
+        if arg.startswith("@") and path.isfile(arg[1:]):
+            with open(arg[1:], "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        # Response files on Windows may quote arguments
+                        if len(line) >= 2 and line[0] == '"' and line[-1] == '"':
+                            line = line[1:-1]
+                        expanded.append(line)
+        else:
+            expanded.append(arg)
+    return expanded
+
 def main():
-    args = sys.argv[1:]
+    args = expand_response_files(sys.argv[1:])
 
     strip_debug = "--v86-strip-debug" in args
 
@@ -52,12 +69,14 @@ def find_rust_lld():
     which.check_returncode()
 
     rustc_path = which.stdout.decode("utf8").strip()
-    assert path.basename(rustc_path) == "rustc"
+    assert path.basename(rustc_path) in ("rustc", "rustc.exe")
 
     bin_path = path.dirname(rustc_path)
     triplet = find_host_triplet()
 
     rust_lld_path = path.join(bin_path, "../lib/rustlib", triplet, "bin/rust-lld")
+    if not path.isfile(rust_lld_path):
+        rust_lld_path = rust_lld_path + ".exe"
     assert path.isfile(rust_lld_path)
 
     return rust_lld_path

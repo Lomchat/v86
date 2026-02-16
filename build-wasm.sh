@@ -23,13 +23,8 @@ node gen/generate_interpreter.js --output-dir build/ --table interpreter0f
 node gen/generate_analyzer.js --output-dir build/ --table analyzer
 node gen/generate_analyzer.js --output-dir build/ --table analyzer0f
 
-echo "=== Compiling C dependencies (softfloat, zstd) ==="
+echo "=== Compiling C dependencies (zstd) ==="
 mkdir -p build
-clang -c -Wall \
-    --target=wasm32 -O3 -flto -nostdlib -fvisibility=hidden -ffunction-sections -fdata-sections \
-    -DSOFTFLOAT_FAST_INT64 -DINLINE_LEVEL=5 -DSOFTFLOAT_FAST_DIV32TO16 -DSOFTFLOAT_FAST_DIV64TO32 \
-    -o build/softfloat.o \
-    lib/softfloat/softfloat.c
 
 clang -c -Wall \
     --target=wasm32 -O3 -flto -nostdlib -fvisibility=hidden -ffunction-sections -fdata-sections \
@@ -50,7 +45,6 @@ cargo rustc --release \
     -- \
     -C linker=$LINKER_WRAPPER \
     -C "link-args=--import-table --global-base=4096" \
-    -C "link-args=build/softfloat.o" \
     -C "link-args=build/zstddeclib.o" \
     -C target-feature=+bulk-memory \
     -C target-feature=+multivalue \

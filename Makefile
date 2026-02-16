@@ -72,7 +72,6 @@ CARGO_FLAGS_SAFE=\
 		-- \
 		-C linker=tools/rust-lld-wrapper \
 		-C link-args="--import-table --global-base=4096 $(STRIP_DEBUG_FLAG)" \
-		-C link-args="build/softfloat.o" \
 		-C link-args="build/zstddeclib.o" \
 		--verbose
 
@@ -206,7 +205,7 @@ src/rust/gen/analyzer.rs: $(ANALYZER_DEPENDENCIES)
 src/rust/gen/analyzer0f.rs: $(ANALYZER_DEPENDENCIES)
 	./gen/generate_analyzer.js --output-dir build/ --table analyzer0f
 
-build/v86.wasm: $(RUST_FILES) build/softfloat.o build/zstddeclib.o Cargo.toml
+build/v86.wasm: $(RUST_FILES) build/zstddeclib.o Cargo.toml
 	mkdir -p build/
 	-BLOCK_SIZE=K ls -l build/v86.wasm
 	cargo rustc --release $(CARGO_FLAGS)
@@ -214,38 +213,30 @@ build/v86.wasm: $(RUST_FILES) build/softfloat.o build/zstddeclib.o Cargo.toml
 	-$(WASM_OPT) && wasm-opt -O2 --strip-debug build/v86.wasm -o build/v86.wasm
 	BLOCK_SIZE=K ls -l build/v86.wasm
 
-build/v86-debug.wasm: $(RUST_FILES) build/softfloat.o build/zstddeclib.o Cargo.toml
+build/v86-debug.wasm: $(RUST_FILES) build/zstddeclib.o Cargo.toml
 	mkdir -p build/
 	-BLOCK_SIZE=K ls -l build/v86-debug.wasm
 	cargo rustc $(CARGO_FLAGS)
 	cp build/wasm32-unknown-unknown/debug/v86.wasm build/v86-debug.wasm
 	BLOCK_SIZE=K ls -l build/v86-debug.wasm
 
-build/v86-fallback.wasm: $(RUST_FILES) build/softfloat.o build/zstddeclib.o Cargo.toml
+build/v86-fallback.wasm: $(RUST_FILES) build/zstddeclib.o Cargo.toml
 	mkdir -p build/
 	cargo rustc --release $(CARGO_FLAGS_SAFE)
 	cp build/wasm32-unknown-unknown/release/v86.wasm build/v86-fallback.wasm || true
 
-debug-with-profiler: $(RUST_FILES) build/softfloat.o build/zstddeclib.o Cargo.toml
+debug-with-profiler: $(RUST_FILES) build/zstddeclib.o Cargo.toml
 	mkdir -p build/
 	cargo rustc --features profiler $(CARGO_FLAGS)
 	cp build/wasm32-unknown-unknown/debug/v86.wasm build/v86-debug.wasm || true
 
-with-profiler: $(RUST_FILES) build/softfloat.o build/zstddeclib.o Cargo.toml
+with-profiler: $(RUST_FILES) build/zstddeclib.o Cargo.toml
 	mkdir -p build/
 	cargo rustc --release --features profiler $(CARGO_FLAGS)
 	cp build/wasm32-unknown-unknown/release/v86.wasm build/v86.wasm || true
 
 watch:
 	cargo watch -x 'rustc $(CARGO_FLAGS)' -s 'cp build/wasm32-unknown-unknown/debug/v86.wasm build/v86-debug.wasm'
-
-build/softfloat.o: lib/softfloat/softfloat.c
-	mkdir -p build
-	clang -c -Wall \
-	    --target=wasm32 -O3 -flto -nostdlib -fvisibility=hidden -ffunction-sections -fdata-sections \
-	    -DSOFTFLOAT_FAST_INT64 -DINLINE_LEVEL=5 -DSOFTFLOAT_FAST_DIV32TO16 -DSOFTFLOAT_FAST_DIV64TO32 \
-	    -o build/softfloat.o \
-	    lib/softfloat/softfloat.c
 
 build/zstddeclib.o: lib/zstd/zstddeclib.c
 	mkdir -p build

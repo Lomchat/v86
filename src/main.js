@@ -51,7 +51,9 @@ v86.prototype.do_tick = function()
     }
 
     this.idle = false;
+    if(this["tick_hooks_before"]) this["tick_hooks_before"]();
     const t = this.cpu.main_loop();
+    if(this["tick_hooks_after"]) this["tick_hooks_after"](t);
 
     this.next_tick(t);
 };

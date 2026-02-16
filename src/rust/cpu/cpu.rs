@@ -3,6 +3,7 @@
 use crate::config;
 use crate::cpu::fpu::fpu_set_tag_word;
 use crate::cpu::global_pointers::*;
+use crate::cpu::hypercall;
 use crate::cpu::memory;
 use crate::cpu::misc_instr::{
     adjust_stack_reg, get_stack_pointer, getaf, getcf, getof, getpf, getsf, getzf, pop16, pop32s,
@@ -3163,8 +3164,19 @@ pub unsafe fn main_loop() -> f64 {
         }
     }
 
+    let cycle_limit = hypercall::read_cycle_limit();
+    let is_preempt_mode = cycle_limit < LOOP_COUNTER as u32;
+
     loop {
         do_many_cycles_native();
+
+        // If cycle_limit was lowered for preemption → lean yield
+        if is_preempt_mode {
+            let now = js::microtick();
+            js::run_hardware_timers(*acpi_enabled, now);
+            handle_irqs();
+            return 0.1; // anti-spin: minimal delay, not 0.0
+        }
 
         let now = js::microtick();
         let t = js::run_hardware_timers(*acpi_enabled, now);
@@ -3184,7 +3196,8 @@ pub unsafe fn main_loop() -> f64 {
 pub unsafe fn do_many_cycles_native() {
     profiler::stat_increment(stat::DO_MANY_CYCLES);
     let initial_instruction_counter = *instruction_counter;
-    while (*instruction_counter).wrapping_sub(initial_instruction_counter) < LOOP_COUNTER as u32
+    let limit = hypercall::read_cycle_limit();
+    while (*instruction_counter).wrapping_sub(initial_instruction_counter) < limit
         && !*in_hlt
     {
         cycle_internal();
@@ -4388,7 +4401,14 @@ pub fn io_port_write8(port: i32, value: i32) {
     }
 }
 pub fn io_port_write16(port: i32, value: i32) { unsafe { js::io_port_write16(port, value) } }
-pub fn io_port_write32(port: i32, value: i32) { unsafe { js::io_port_write32(port, value) } }
+pub fn io_port_write32(port: i32, value: i32) {
+    unsafe {
+        if port == 0xB077i32 && hypercall::try_dispatch(value) {
+            return;
+        }
+        js::io_port_write32(port, value)
+    }
+}
 
 #[no_mangle]
 #[cfg(debug_assertions)]

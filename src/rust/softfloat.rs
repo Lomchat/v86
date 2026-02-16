@@ -1,35 +1,7 @@
-extern "C" {
-    fn extF80M_add(x: *const F80, y: *const F80, ptr: *mut F80);
-    fn extF80M_sub(x: *const F80, y: *const F80, ptr: *mut F80);
-    fn extF80M_mul(x: *const F80, y: *const F80, ptr: *mut F80);
-    fn extF80M_div(x: *const F80, y: *const F80, ptr: *mut F80);
-    //fn extF80M_rem(x: *const F80, y: *const F80, ptr: *mut F80);
-    fn extF80M_sqrt(x: *const F80, ptr: *mut F80);
+// Native f64 FPU implementation - replaces Berkeley SoftFloat
+// Trades 80-bit extended precision for 64-bit double precision (acceptable for games).
 
-    fn extF80M_roundToInt(x: *const F80, rounding_mode: u8, raise_inexact: bool, dst: *mut F80);
-
-    fn extF80M_eq(x: *const F80, y: *const F80) -> bool;
-    //fn extF80M_eq_signaling(x: *const F80, y: *const F80) -> bool;
-
-    //fn extF80M_le(x: *const F80, y: *const F80) -> bool;
-    //fn extF80M_le_quiet(x: *const F80, y: *const F80) -> bool;
-    fn extF80M_lt(x: *const F80, y: *const F80) -> bool;
-    fn extF80M_lt_quiet(x: *const F80, y: *const F80) -> bool;
-
-    fn extF80M_to_i32(src: *const F80, rounding_mode: u8, raise_inexact: bool) -> i32;
-    fn extF80M_to_i64(src: *const F80, rounding_mode: u8, raise_inexact: bool) -> i64;
-    fn i32_to_extF80M(src: i32, dst: *mut F80);
-    fn i64_to_extF80M(src: i64, dst: *mut F80);
-
-    fn f32_to_extF80M(src: i32, dst: *mut F80);
-    fn f64_to_extF80M(src: u64, dst: *mut F80);
-    fn extF80M_to_f32(src: *const F80) -> i32;
-    fn extF80M_to_f64(src: *const F80) -> u64;
-
-    static mut softfloat_roundingMode: u8;
-    static mut extF80_roundingPrecision: u8;
-    static mut softfloat_exceptionFlags: u8;
-}
+static mut ROUNDING_MODE: u8 = 0; // 0=NearEven, 1=Trunc, 2=Floor, 3=Ceil
 
 pub enum RoundingMode {
     NearEven,
@@ -90,39 +62,191 @@ impl F80 {
     pub fn sign(&self) -> bool { (self.sign_exponent >> 15) == 1 }
     pub fn exponent(&self) -> i16 { (self.sign_exponent as i16 & 0x7FFF) - 0x3FFF }
 
-    pub fn of_i32(src: i32) -> F80 {
-        let mut x = F80::ZERO;
-        unsafe { i32_to_extF80M(src, &mut x) };
-        x
-    }
-    pub fn of_i64(src: i64) -> F80 {
-        let mut x = F80::ZERO;
-        unsafe { i64_to_extF80M(src, &mut x) };
-        x
-    }
+    pub fn to_f64(&self) -> u64 {
+        let sign = (self.sign_exponent >> 15) as u64;
+        let exp = (self.sign_exponent & 0x7FFF) as i32;
+        let mant = self.mantissa;
 
-    pub fn of_f32(src: i32) -> F80 {
-        let mut x = F80::ZERO;
-        unsafe { f32_to_extF80M(src, &mut x) };
-        x
+        // Zero (positive or negative)
+        if exp == 0 && mant == 0 {
+            return sign << 63;
+        }
+
+        // NaN or Infinity
+        if exp == 0x7FFF {
+            if mant == 0x8000000000000000 {
+                // Infinity
+                return (sign << 63) | (0x7FFu64 << 52);
+            }
+            // NaN - preserve as much payload as possible
+            let payload = (mant & 0x3FFFFFFFFFFFFFFF) >> 11;
+            let quiet = (mant >> 62) & 1;
+            return (sign << 63) | (0x7FFu64 << 52) | (quiet << 51) | (payload & 0x7FFFFFFFFFFFF);
+        }
+
+        // Denormal F80 (exponent == 0, mantissa != 0)
+        if exp == 0 {
+            // F80 pseudo-denormals: exponent 0 with integer bit set
+            // These are equivalent to exponent 1 in F80
+            // Extremely small - will underflow to zero in f64
+            return sign << 63;
+        }
+
+        // Normal: rebias exponent from F80 (bias 16383) to f64 (bias 1023)
+        let f64_exp = exp - 16383 + 1023;
+
+        if f64_exp >= 0x7FF {
+            // Overflow -> infinity
+            return (sign << 63) | (0x7FFu64 << 52);
+        }
+
+        if f64_exp <= 0 {
+            // Subnormal f64 or underflow
+            let shift = 1 - f64_exp;
+            if shift >= 64 {
+                return sign << 63; // underflow to zero
+            }
+            // Strip the explicit J-bit and shift mantissa for f64 subnormal
+            let f64_mant = mant >> (11 + shift as u32);
+            return (sign << 63) | f64_mant;
+        }
+
+        // Normal case: strip explicit J-bit (bit 63), take top 52 bits of remaining 63
+        let f64_mant = (mant & 0x7FFFFFFFFFFFFFFF) >> 11;
+        (sign << 63) | ((f64_exp as u64) << 52) | f64_mant
     }
 
     pub fn of_f64(src: u64) -> F80 {
-        let mut x = F80::ZERO;
-        unsafe { f64_to_extF80M(src, &mut x) };
-        x
-    }
-    fn of_f64x(src: f64) -> F80 { F80::of_f64(f64::to_bits(src)) }
+        let sign = (src >> 63) as u16;
+        let exp = ((src >> 52) & 0x7FF) as i32;
+        let mant = src & 0xFFFFFFFFFFFFF;
 
-    pub fn to_f32(&self) -> i32 { unsafe { extF80M_to_f32(self) } }
-    pub fn to_f64(&self) -> u64 { unsafe { extF80M_to_f64(self) } }
+        // Zero
+        if exp == 0 && mant == 0 {
+            return F80 {
+                mantissa: 0,
+                sign_exponent: sign << 15,
+            };
+        }
+
+        // NaN or Infinity
+        if exp == 0x7FF {
+            if mant == 0 {
+                // Infinity
+                return F80 {
+                    mantissa: 0x8000000000000000,
+                    sign_exponent: (sign << 15) | 0x7FFF,
+                };
+            }
+            // NaN - reconstruct F80 NaN
+            let quiet = (mant >> 51) & 1;
+            let payload = (mant & 0x7FFFFFFFFFFFF) << 11;
+            return F80 {
+                mantissa: 0x8000000000000000 | (quiet << 62) | payload,
+                sign_exponent: (sign << 15) | 0x7FFF,
+            };
+        }
+
+        // Denormal f64
+        if exp == 0 {
+            // Normalize: find the leading 1 bit
+            let shift = mant.leading_zeros() - 12; // 12 because top 12 bits of u64 are unused
+            let normalized_mant = mant << (shift + 1); // shift out the leading 1, then we add J-bit
+            let f80_exp = (1 - 1023 + 16383 - shift as i32) as u16;
+            return F80 {
+                mantissa: 0x8000000000000000 | (normalized_mant << 11),
+                sign_exponent: (sign << 15) | f80_exp,
+            };
+        }
+
+        // Normal: rebias exponent from f64 (bias 1023) to F80 (bias 16383)
+        let f80_exp = (exp - 1023 + 16383) as u16;
+        // Set explicit J-bit (integer bit) and expand mantissa from 52 to 63 bits
+        let f80_mant = 0x8000000000000000 | (mant << 11);
+        F80 {
+            mantissa: f80_mant,
+            sign_exponent: (sign << 15) | f80_exp,
+        }
+    }
+
+    fn of_f64x(src: f64) -> F80 { F80::of_f64(f64::to_bits(src)) }
     fn to_f64x(&self) -> f64 { f64::from_bits(self.to_f64()) }
 
-    pub fn to_i32(&self) -> i32 { unsafe { extF80M_to_i32(self, softfloat_roundingMode, false) } }
-    pub fn to_i64(&self) -> i64 { unsafe { extF80M_to_i64(self, softfloat_roundingMode, false) } }
+    pub fn of_f32(src: i32) -> F80 {
+        let f = f32::from_bits(src as u32);
+        F80::of_f64((f as f64).to_bits())
+    }
 
-    pub fn truncate_to_i32(&self) -> i32 { unsafe { extF80M_to_i32(self, 1, false) } }
-    pub fn truncate_to_i64(&self) -> i64 { unsafe { extF80M_to_i64(self, 1, false) } }
+    pub fn to_f32(&self) -> i32 {
+        let f = f64::from_bits(self.to_f64());
+        (f as f32).to_bits() as i32
+    }
+
+    pub fn of_i32(src: i32) -> F80 {
+        F80::of_f64((src as f64).to_bits())
+    }
+
+    pub fn of_i64(src: i64) -> F80 {
+        F80::of_f64((src as f64).to_bits())
+    }
+
+    pub fn to_i32(&self) -> i32 {
+        let f = f64::from_bits(self.to_f64());
+        if f.is_nan() {
+            return i32::MIN; // x87 indefinite integer
+        }
+        let rounded = unsafe {
+            match ROUNDING_MODE {
+                1 => f.trunc(),
+                2 => f.floor(),
+                3 => f.ceil(),
+                _ => round_ties_even(f),
+            }
+        };
+        if rounded >= (i32::MAX as f64 + 1.0) || rounded < (i32::MIN as f64) {
+            i32::MIN // overflow -> indefinite
+        } else {
+            rounded as i32
+        }
+    }
+
+    pub fn to_i64(&self) -> i64 {
+        let f = f64::from_bits(self.to_f64());
+        if f.is_nan() {
+            return i64::MIN; // x87 indefinite integer
+        }
+        let rounded = unsafe {
+            match ROUNDING_MODE {
+                1 => f.trunc(),
+                2 => f.floor(),
+                3 => f.ceil(),
+                _ => round_ties_even(f),
+            }
+        };
+        if rounded >= (i64::MAX as f64 + 1.0) || rounded < (i64::MIN as f64) {
+            i64::MIN // overflow -> indefinite
+        } else {
+            rounded as i64
+        }
+    }
+
+    pub fn truncate_to_i32(&self) -> i32 {
+        let f = f64::from_bits(self.to_f64());
+        if f.is_nan() || f >= (i32::MAX as f64 + 1.0) || f < (i32::MIN as f64) {
+            i32::MIN
+        } else {
+            f as i32
+        }
+    }
+
+    pub fn truncate_to_i64(&self) -> i64 {
+        let f = f64::from_bits(self.to_f64());
+        if f.is_nan() || f >= (i64::MAX as f64 + 1.0) || f < (i64::MIN as f64) {
+            i64::MIN
+        } else {
+            f as i64
+        }
+    }
 
     pub fn cos(self) -> F80 { F80::of_f64x(self.to_f64x().cos()) }
     pub fn sin(self) -> F80 { F80::of_f64x(self.to_f64x().sin()) }
@@ -140,35 +264,38 @@ impl F80 {
         }
     }
     pub fn two_pow(self) -> F80 { F80::of_f64x(2.0f64.powf(self.to_f64x())) }
+
     pub fn round(self) -> F80 {
-        let mut result = F80::ZERO;
-        unsafe { extF80M_roundToInt(&self, softfloat_roundingMode, false, &mut result) };
-        result
+        let f = self.to_f64x();
+        let rounded = unsafe {
+            match ROUNDING_MODE {
+                1 => f.trunc(),
+                2 => f.floor(),
+                3 => f.ceil(),
+                _ => round_ties_even(f),
+            }
+        };
+        F80::of_f64x(rounded)
     }
+
     pub fn trunc(self) -> F80 {
-        let mut result = F80::ZERO;
-        unsafe { extF80M_roundToInt(&self, 1, false, &mut result) };
-        result
+        F80::of_f64x(self.to_f64x().trunc())
     }
 
     pub fn sqrt(self) -> F80 {
-        let mut result = F80::ZERO;
-        unsafe { extF80M_sqrt(&self, &mut result) };
-        result
+        F80::of_f64x(self.to_f64x().sqrt())
     }
 
     pub fn is_finite(self) -> bool {
-        // TODO: Can probably be done more efficiently
         self != F80::POS_INFINITY && self != F80::NEG_INFINITY
     }
     pub fn is_nan(self) -> bool {
-        // TODO: Can probably be done more efficiently
         self != self
     }
 
     pub fn set_rounding_mode(mode: RoundingMode) {
         unsafe {
-            softfloat_roundingMode = match mode {
+            ROUNDING_MODE = match mode {
                 RoundingMode::NearEven => 0,
                 RoundingMode::Trunc => 1,
                 RoundingMode::Floor => 2,
@@ -176,54 +303,59 @@ impl F80 {
             }
         };
     }
-    pub fn set_precision(precision: Precision) {
-        unsafe {
-            extF80_roundingPrecision = match precision {
-                Precision::P80 => 80,
-                Precision::P64 => 64,
-                Precision::P32 => 32,
-            }
-        };
+    pub fn set_precision(_precision: Precision) {
+        // no-op: f64 is always 53-bit mantissa
     }
 
-    pub fn get_exception_flags() -> u8 {
-        let f = unsafe { softfloat_exceptionFlags };
-        // translate softfloat's flags to x87 status flags
-        f >> 4 & 1 | f >> 1 & 4 | f << 3 & 16
-    }
-    pub fn clear_exception_flags() { unsafe { softfloat_exceptionFlags = 0 } }
+    pub fn get_exception_flags() -> u8 { 0 }
+    pub fn clear_exception_flags() {}
 
     pub fn partial_cmp_quiet(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // TODO: Can probably be done more efficiently
-        if unsafe { extF80M_lt_quiet(self, other) } {
-            Some(std::cmp::Ordering::Less)
+        let a = f64::from_bits(self.to_f64());
+        let b = f64::from_bits(other.to_f64());
+        a.partial_cmp(&b)
+    }
+}
+
+fn round_ties_even(f: f64) -> f64 {
+    let rounded = f.round();
+    // Check for tie case: fractional part is exactly 0.5
+    let diff = (f - rounded).abs();
+    if diff == 0.0 {
+        // Not a tie, or already rounded correctly
+        return rounded;
+    }
+    // f.round() rounds ties away from zero in Rust.
+    // For ties-to-even, check if we need to adjust.
+    let frac = f.abs() % 1.0;
+    if (frac - 0.5).abs() < 1e-15 {
+        // It's a tie - round to even
+        let candidate = f.round();
+        if (candidate as i64) % 2 != 0 {
+            // Rounded to odd, go the other way
+            if f > 0.0 { candidate - 1.0 } else { candidate + 1.0 }
+        } else {
+            candidate
         }
-        else if unsafe { extF80M_lt_quiet(other, self) } {
-            Some(std::cmp::Ordering::Greater)
-        }
-        else if self == other {
-            Some(std::cmp::Ordering::Equal)
-        }
-        else {
-            None
-        }
+    } else {
+        rounded
     }
 }
 
 impl std::ops::Add for F80 {
     type Output = F80;
     fn add(self, other: Self) -> Self {
-        let mut result = F80::ZERO;
-        unsafe { extF80M_add(&self, &other, &mut result) };
-        result
+        let a = f64::from_bits(self.to_f64());
+        let b = f64::from_bits(other.to_f64());
+        F80::of_f64((a + b).to_bits())
     }
 }
 impl std::ops::Sub for F80 {
     type Output = F80;
     fn sub(self, other: Self) -> Self {
-        let mut result = F80::ZERO;
-        unsafe { extF80M_sub(&self, &other, &mut result) };
-        result
+        let a = f64::from_bits(self.to_f64());
+        let b = f64::from_bits(other.to_f64());
+        F80::of_f64((a - b).to_bits())
     }
 }
 impl std::ops::Neg for F80 {
@@ -237,17 +369,17 @@ impl std::ops::Neg for F80 {
 impl std::ops::Mul for F80 {
     type Output = F80;
     fn mul(self, other: Self) -> Self {
-        let mut result = F80::ZERO;
-        unsafe { extF80M_mul(&self, &other, &mut result) };
-        result
+        let a = f64::from_bits(self.to_f64());
+        let b = f64::from_bits(other.to_f64());
+        F80::of_f64((a * b).to_bits())
     }
 }
 impl std::ops::Div for F80 {
     type Output = F80;
     fn div(self, other: Self) -> Self {
-        let mut result = F80::ZERO;
-        unsafe { extF80M_div(&self, &other, &mut result) };
-        result
+        let a = f64::from_bits(self.to_f64());
+        let b = f64::from_bits(other.to_f64());
+        F80::of_f64((a / b).to_bits())
     }
 }
 impl std::ops::Rem for F80 {
@@ -255,32 +387,20 @@ impl std::ops::Rem for F80 {
     fn rem(self, other: Self) -> Self {
         let quot = (self / other).trunc();
         self - quot * other
-        // Uses round-to-nearest instead of truncation
-        //let mut result = F80::ZERO;
-        //unsafe {
-        //    extF80M_rem(&self, &other, &mut result)
-        //};
-        //result
     }
 }
 
 impl PartialEq for F80 {
-    fn eq(&self, other: &Self) -> bool { unsafe { extF80M_eq(self, other) } }
+    fn eq(&self, other: &Self) -> bool {
+        let a = f64::from_bits(self.to_f64());
+        let b = f64::from_bits(other.to_f64());
+        a == b
+    }
 }
 impl PartialOrd for F80 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // TODO: Can probably be done more efficiently
-        if unsafe { extF80M_lt(self, other) } {
-            Some(std::cmp::Ordering::Less)
-        }
-        else if unsafe { extF80M_lt(other, self) } {
-            Some(std::cmp::Ordering::Greater)
-        }
-        else if self == other {
-            Some(std::cmp::Ordering::Equal)
-        }
-        else {
-            None
-        }
+        let a = f64::from_bits(self.to_f64());
+        let b = f64::from_bits(other.to_f64());
+        a.partial_cmp(&b)
     }
 }

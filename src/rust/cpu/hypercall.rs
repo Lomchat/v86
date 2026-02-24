@@ -32,6 +32,7 @@
 
 use std::ptr::{addr_of, addr_of_mut};
 
+use crate::cpu::memory;
 use crate::cpu::cpu::{
     read_reg32, safe_read32s, safe_write32, write_reg32, EAX, EDX, ESP,
 };
@@ -1315,23 +1316,19 @@ unsafe fn handle_tls_get_value() -> bool {
     }
 
     // TEB+0x2C = ThreadLocalStoragePointer → address of TLS array
-    let tls_array_ptr = match safe_read32s((teb_base + 0x2C) as i32) {
-        Ok(v) => v as u32,
-        Err(_) => return false,
-    };
+    // Use direct memory read — TEB is in identity-mapped HEAP, TLB never has these pages
+    // (all guest TEB access is HLE via FS:), so safe_read32s always faults → JS fallback.
+    let tls_array_ptr = memory::read32_no_mmap_check(teb_base + 0x2C) as u32;
     if tls_array_ptr == 0 {
         return false;
     }
 
-    // Read TLS slot value
-    let value = match safe_read32s((tls_array_ptr + index * 4) as i32) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
+    // Read TLS slot value (direct memory — same identity-mapped HEAP region)
+    let value = memory::read32_no_mmap_check(tls_array_ptr + index * 4);
 
     // SetLastError(0) — TlsGetValue clears last error on success
     *(hp_mut().add(OFF_HC_LAST_ERROR) as *mut u32) = 0;
-    let _ = safe_write32((teb_base + 0x34) as i32, 0);
+    memory::write32_no_mmap_or_dirty_check(teb_base + 0x34, 0);
 
     write_reg32(EAX, value);
     true

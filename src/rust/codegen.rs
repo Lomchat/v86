@@ -2440,36 +2440,76 @@ pub fn gen_test_jcxz(ctx: &mut JitContext, is_asize_32: bool) {
 }
 
 pub fn gen_fpu_get_sti(ctx: &mut JitContext, i: u32) {
-    ctx.builder
-        .const_i32(global_pointers::sse_scratch_register as i32);
-    ctx.builder.const_i32(i as i32);
-    ctx.builder.call_fn2("fpu_get_sti_jit");
-    ctx.builder
-        .load_fixed_i64(global_pointers::sse_scratch_register as u32);
-    ctx.builder
-        .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
+    if crate::softfloat::is_fpu_relaxed() {
+        // Relaxed mode: directly read from fpu_st array, skipping scratch register round-trip.
+        // addr = fpu_st + ((fpu_stack_ptr + i) & 7) * 16
+        ctx.builder
+            .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+        ctx.builder.const_i32(i as i32);
+        ctx.builder.add_i32();
+        ctx.builder.const_i32(7);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(16);
+        ctx.builder.mul_i32();
+        ctx.builder.const_i32(global_pointers::fpu_st as i32);
+        ctx.builder.add_i32();
+        let addr_local = ctx.builder.tee_new_local();
+        ctx.builder.load_unaligned_i64(0); // mantissa
+        ctx.builder.get_local(&addr_local);
+        ctx.builder.load_unaligned_u16(8); // sign_exponent
+        ctx.builder.free_local(addr_local);
+    }
+    else {
+        ctx.builder
+            .const_i32(global_pointers::sse_scratch_register as i32);
+        ctx.builder.const_i32(i as i32);
+        ctx.builder.call_fn2("fpu_get_sti_jit");
+        ctx.builder
+            .load_fixed_i64(global_pointers::sse_scratch_register as u32);
+        ctx.builder
+            .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
+    }
 }
 
 pub fn gen_fpu_load_m32(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    ctx.builder
-        .const_i32(global_pointers::sse_scratch_register as i32);
-    gen_modrm_resolve_safe_read32(ctx, modrm_byte);
-    ctx.builder.call_fn2("f32_to_f80_jit");
-    ctx.builder
-        .load_fixed_i64(global_pointers::sse_scratch_register as u32);
-    ctx.builder
-        .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
+    if crate::softfloat::is_fpu_relaxed() {
+        // Relaxed mode: inline WASM type conversion ops, no scratch register.
+        // F80{mantissa=f64bits(f32bits), sign_exponent=RELAXED_TAG}
+        gen_modrm_resolve_safe_read32(ctx, modrm_byte); // i32 raw f32 bits
+        ctx.builder.reinterpret_i32_as_f32();           // f32
+        ctx.builder.promote_f32_to_f64();               // f64
+        ctx.builder.reinterpret_f64_as_i64();           // i64 mantissa
+        ctx.builder.const_i32(0x7FFE);                  // RELAXED_TAG sign_exponent
+    }
+    else {
+        ctx.builder
+            .const_i32(global_pointers::sse_scratch_register as i32);
+        gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+        ctx.builder.call_fn2("f32_to_f80_jit");
+        ctx.builder
+            .load_fixed_i64(global_pointers::sse_scratch_register as u32);
+        ctx.builder
+            .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
+    }
 }
 
 pub fn gen_fpu_load_m64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    ctx.builder
-        .const_i32(global_pointers::sse_scratch_register as i32);
-    gen_modrm_resolve_safe_read64(ctx, modrm_byte);
-    ctx.builder.call_fn2_i32_i64("f64_to_f80_jit");
-    ctx.builder
-        .load_fixed_i64(global_pointers::sse_scratch_register as u32);
-    ctx.builder
-        .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
+    if crate::softfloat::is_fpu_relaxed() {
+        // Relaxed mode: raw f64 bits from memory are already the mantissa.
+        // F80{mantissa=raw_bits, sign_exponent=RELAXED_TAG}
+        gen_modrm_resolve_safe_read64(ctx, modrm_byte); // i64 raw f64 bits = mantissa
+        ctx.builder.const_i32(0x7FFE);                  // RELAXED_TAG sign_exponent
+    }
+    else {
+        ctx.builder
+            .const_i32(global_pointers::sse_scratch_register as i32);
+        gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+        ctx.builder.call_fn2_i32_i64("f64_to_f80_jit");
+        ctx.builder
+            .load_fixed_i64(global_pointers::sse_scratch_register as u32);
+        ctx.builder
+            .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
+    }
 }
 
 pub fn gen_fpu_load_i16(ctx: &mut JitContext, modrm_byte: ModrmByte) {

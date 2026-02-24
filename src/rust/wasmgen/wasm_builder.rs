@@ -834,10 +834,10 @@ impl WasmBuilder {
     pub fn reinterpret_i64_as_f64(&mut self) {
         self.instruction_body.push(op::OP_F64REINTERPRETI64);
     }
-    //pub fn reinterpret_f64_as_i64(&mut self) {
-    //    self.instruction_body.push(op::OP_I64REINTERPRETF64);
-    //}
-    //pub fn promote_f32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64PROMOTEF32); }
+    pub fn reinterpret_f64_as_i64(&mut self) {
+        self.instruction_body.push(op::OP_I64REINTERPRETF64);
+    }
+    pub fn promote_f32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64PROMOTEF32); }
     //pub fn demote_f64_to_f32(&mut self) { self.instruction_body.push(op::OP_F32DEMOTEF64); }
     //pub fn convert_i32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI32); }
     //pub fn convert_i64_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI64); }

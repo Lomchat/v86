@@ -58,9 +58,7 @@ const OFF_HC_TEB_BASE: usize = 0x028;
 const OFF_HC_INSN_AT_TIME_UPDATE: usize = 0x02C;
 const OFF_HC_MIPS_ESTIMATE: usize = 0x030;
 const OFF_HC_CURRENT_THREAD_ID: usize = 0x034;
-const OFF_HC_PENDING_WAKE_COUNT: usize = 0x038;
-const OFF_HC_PENDING_WAKE_ADDRS: usize = 0x03C;
-const MAX_PENDING_WAKES: usize = 16;
+// (pending wake buffer removed — CS wake now uses LockSemaphore events)
 const OFF_HC_CURSOR_X: usize = 0x080;
 const OFF_HC_CURSOR_Y: usize = 0x084;
 const OFF_HC_WINDOW_X: usize = 0x088;
@@ -185,6 +183,7 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         62 => handle_memcmp(),
         // Scheduler hypercalls (Tier 4)
         63 => handle_sleep(),
+        64 => handle_tls_get_value(),
         _ => false,
     };
 
@@ -459,7 +458,8 @@ unsafe fn handle_enter_critical_section() -> bool {
 }
 
 /// LeaveCriticalSection — handles both recursive and full release.
-/// Full release enqueues the address for pending wakeAddress() in JS.
+/// If LockSemaphore (CS+16) != 0, returns false so JS handles release + SetEvent.
+/// If LockSemaphore == 0 (no waiters ever), releases entirely in WASM (zero JS overhead).
 unsafe fn handle_leave_critical_section() -> bool {
     let esp = read_reg32(ESP);
     let ptr = match safe_read32s(esp + 4) {
@@ -481,19 +481,21 @@ unsafe fn handle_leave_critical_section() -> bool {
         return true;
     }
 
-    // Full release
+    // Check LockSemaphore at offset 16 BEFORE releasing.
+    // If event handle exists, waiters may be present — fall to JS for SetEvent.
+    let lock_sem = match safe_read32s(ptr + 16) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if lock_sem != 0 {
+        // JS handles: release CS fields + SetEvent(lockSem) + ownership transfer
+        return false;
+    }
+
+    // No LockSemaphore — no waiter has ever contended. Release fully in WASM.
     if safe_write32(ptr + 4, -1).is_err() { return false; }  // LockCount = -1 (free)
     if safe_write32(ptr + 8, 0).is_err() { return false; }   // RecursionCount = 0
     if safe_write32(ptr + 12, 0).is_err() { return false; }  // OwningThread = 0
-
-    // Enqueue pending wake for JS to process in onTickHook
-    let page = hp_mut();
-    let count = *(page.add(OFF_HC_PENDING_WAKE_COUNT) as *const u32) as usize;
-    if count < MAX_PENDING_WAKES {
-        let addr_ptr = page.add(OFF_HC_PENDING_WAKE_ADDRS + count * 4) as *mut u32;
-        *addr_ptr = ptr as u32;
-        *(page.add(OFF_HC_PENDING_WAKE_COUNT) as *mut u32) = (count + 1) as u32;
-    }
 
     write_reg32(EAX, 0);
     true
@@ -1288,5 +1290,50 @@ unsafe fn handle_sleep() -> bool {
 
     // Non-zero sleep or starvation limit hit → fall through to JS for context switch
     false
+}
+
+/// TlsGetValue(dwTlsIndex) — stdcall(1).
+/// Reads TLS slot from guest TEB memory: TEB+0x2C → TLS array ptr, then array[index*4].
+/// Sets LastError to 0 on success (Windows behavior).
+/// Falls through to JS for out-of-range indices or memory faults.
+unsafe fn handle_tls_get_value() -> bool {
+    let esp = read_reg32(ESP);
+    let index = match safe_read32s(esp + 4) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+
+    // Only handle standard TLS slots (0..63)
+    if index >= 64 {
+        return false;
+    }
+
+    // Read TEB base from hypercall page
+    let teb_base = *(hp_ptr().add(OFF_HC_TEB_BASE) as *const u32);
+    if teb_base == 0 {
+        return false;
+    }
+
+    // TEB+0x2C = ThreadLocalStoragePointer → address of TLS array
+    let tls_array_ptr = match safe_read32s((teb_base + 0x2C) as i32) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if tls_array_ptr == 0 {
+        return false;
+    }
+
+    // Read TLS slot value
+    let value = match safe_read32s((tls_array_ptr + index * 4) as i32) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // SetLastError(0) — TlsGetValue clears last error on success
+    *(hp_mut().add(OFF_HC_LAST_ERROR) as *mut u32) = 0;
+    let _ = safe_write32((teb_base + 0x34) as i32, 0);
+
+    write_reg32(EAX, value);
+    true
 }
 

@@ -208,6 +208,50 @@ else
     v86.prototype.unregister_yield = function() {};
 }
 
+/**
+ * Replace the yield-Worker with a same-thread MessageChannel.
+ * Eliminates cross-Worker postMessage round-trip overhead (~4% at 5ms ticks).
+ * MessageChannel creates macrotasks — properly yields to the event loop,
+ * allowing rAF, setInterval, and Promise resolutions to run between ticks.
+ * queueMicrotask is intentionally NOT used: it blocks the event loop indefinitely.
+ * Call once after v86 instance creation (before run()).
+ * Uses bracket notation to survive Closure Compiler advanced mode.
+ */
+v86.prototype["register_yield_direct"] = function()
+{
+    // Terminate existing yield-Worker (if running)
+    if(this.worker && typeof this.worker.terminate === "function")
+    {
+        this.worker.terminate();
+        this.worker = null;
+    }
+
+    const self = this;
+
+    // Same-thread MessageChannel: port.postMessage creates a task (macrotask),
+    // so the event loop can service rAF, setInterval, etc. between ticks.
+    const channel = new MessageChannel();
+    channel.port2.onmessage = function(e) { self["yield_callback"](e.data); };
+
+    this["yield"] = function(t, tick)
+    {
+        if(t < 1)
+        {
+            channel.port1.postMessage(tick);
+        }
+        else
+        {
+            setTimeout(function() { self["yield_callback"](tick); }, t);
+        }
+    };
+
+    this["unregister_yield"] = function()
+    {
+        channel.port1.close();
+        channel.port2.close();
+    };
+};
+
 v86.prototype.save_state = function()
 {
     // TODO: Should be implemented here, not on cpu

@@ -29,6 +29,16 @@
 //!   0x0A0: hc_sleep_starvation_counter u32 — consecutive WASM-handled Sleep(0) calls with peers
 //!   0x0A4: hc_sleep_starvation_limit   u32 — max consecutive before JS fallthrough
 //!   0x100: hc_dispatch_table    [u8; 4096] — dispatch_table[functionId] = handler_id
+//!   0x1100: hc_fls_allocated    [u8; 129] — FLS slot allocation bitmap (written by JS, slot 0 unused)
+//!   0x1184: hc_fls_values       [u32; 129] — FLS slot values (written by JS)
+//!   0x1400: hc_slab_base        u32 — heap arena slab start (0=disabled, written by JS)
+//!   0x1404: hc_slab_end         u32 — heap arena slab end (exclusive)
+//!   0x1408: hc_slab_bump        u32 — current bump pointer
+//!   0x140C: hc_slab_generation  u32 — incremented on process reset
+//!   0x1410: hc_slab_alloc_count u32 — stats: allocations from slab
+//!   0x1414: hc_slab_free_count  u32 — stats: frees returned to slab
+//!   0x1418: hc_slab_fallback_count u32 — stats: fallbacks to JS
+//!   0x1420: hc_slab_freelist    [u32; 9] — per-bin free list heads (bins: 16..4096)
 
 use std::ptr::{addr_of, addr_of_mut};
 
@@ -71,6 +81,24 @@ const OFF_HC_HAS_RUNNABLE_PEERS: usize = 0x09C;
 const OFF_HC_SLEEP_STARVATION_COUNTER: usize = 0x0A0;
 const OFF_HC_SLEEP_STARVATION_LIMIT: usize = 0x0A4;
 const OFF_HC_DISPATCH_TABLE: usize = 0x100;
+const OFF_HC_FLS_ALLOCATED: usize = 0x1100;
+const OFF_HC_FLS_VALUES: usize = 0x1184;
+const HC_FLS_SLOT_COUNT: usize = 129;
+
+// Arena slab control block (HeapAlloc/HeapFree fast path)
+const OFF_HC_SLAB_BASE: usize = 0x1400;
+const OFF_HC_SLAB_END: usize = 0x1404;
+const OFF_HC_SLAB_BUMP: usize = 0x1408;
+#[allow(dead_code)]
+const OFF_HC_SLAB_GENERATION: usize = 0x140C;
+const OFF_HC_SLAB_ALLOC_COUNT: usize = 0x1410;
+const OFF_HC_SLAB_FREE_COUNT: usize = 0x1414;
+const OFF_HC_SLAB_FALLBACK_COUNT: usize = 0x1418;
+const OFF_HC_SLAB_FREELIST: usize = 0x1420; // 9 × u32
+
+const SLAB_MAGIC: u32 = 0x534C4100; // "SLA\0" with low nibble reserved for bin index
+const HEAP_ZERO_MEMORY_FLAG: u32 = 0x08;
+const BIN_SIZES: [u32; 9] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
 /// Helper: raw pointer to HYPERCALL_PAGE (avoids static_mut_refs warnings).
 #[inline(always)]
@@ -185,6 +213,10 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         // Scheduler hypercalls (Tier 4)
         63 => handle_sleep(),
         64 => handle_tls_get_value(),
+        69 => handle_fls_get_value(),
+        // Heap arena hypercalls (Tier 5)
+        70 => handle_heap_alloc(),
+        71 => handle_heap_free(),
         _ => false,
     };
 
@@ -461,6 +493,11 @@ unsafe fn handle_enter_critical_section() -> bool {
 /// LeaveCriticalSection — handles both recursive and full release.
 /// If LockSemaphore (CS+16) != 0, returns false so JS handles release + SetEvent.
 /// If LockSemaphore == 0 (no waiters ever), releases entirely in WASM (zero JS overhead).
+///
+/// CRITICAL: Must verify OwningThread matches current thread. Without this check,
+/// a non-owner thread calling LeaveCS (game bug or race) silently releases the CS,
+/// allowing another thread to acquire it — corrupting shared state and causing
+/// downstream crashes (ESP corruption → infinite #PF).
 unsafe fn handle_leave_critical_section() -> bool {
     let esp = read_reg32(ESP);
     let ptr = match safe_read32s(esp + 4) {
@@ -468,6 +505,17 @@ unsafe fn handle_leave_critical_section() -> bool {
         Err(_) => return false,
     };
     if ptr == 0 { return false; }
+
+    // Verify ownership: only the owning thread may release.
+    // Non-owner releases fall to JS for proper error reporting (FATAL_GUARD 0x3009).
+    let current_thread = *(hp_ptr().add(OFF_HC_CURRENT_THREAD_ID) as *const u32);
+    let owner = match safe_read32s(ptr + 12) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if current_thread == 0 || (owner != 0 && owner != current_thread) {
+        return false; // Non-owner or unknown thread → JS slow path handles it
+    }
 
     // Read RecursionCount at offset 8
     let rec = match safe_read32s(ptr + 8) {
@@ -1331,6 +1379,161 @@ unsafe fn handle_tls_get_value() -> bool {
     memory::write32_no_mmap_or_dirty_check(teb_base + 0x34, 0);
 
     write_reg32(EAX, value);
+    true
+}
+
+/// FlsGetValue(dwFlsIndex) — stdcall(1).
+/// Reads FLS slot value from HYPERCALL_PAGE shadow written by JS.
+/// Falls through to JS for out-of-range slots or for slots that are not allocated.
+unsafe fn handle_fls_get_value() -> bool {
+    let esp = read_reg32(ESP);
+    let index = match safe_read32s(esp + 4) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+
+    if index as usize >= HC_FLS_SLOT_COUNT {
+        return false;
+    }
+
+    let allocated = *(hp_ptr().add(OFF_HC_FLS_ALLOCATED + index as usize) as *const u8);
+    if allocated == 0 {
+        return false;
+    }
+
+    let value = *(hp_ptr().add(OFF_HC_FLS_VALUES + index as usize * 4) as *const u32);
+    write_reg32(EAX, value as i32);
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Heap arena: WASM-resident slab allocator for HeapAlloc/HeapFree
+// ---------------------------------------------------------------------------
+
+/// Map requested byte count to a size-class bin index (0–8).
+/// Returns None for 0 bytes or >4KB (JS fallback).
+fn size_to_bin(bytes: u32) -> Option<u32> {
+    if bytes == 0 { return None; }
+    if bytes <= 16 { return Some(0); }
+    if bytes <= 32 { return Some(1); }
+    if bytes <= 64 { return Some(2); }
+    if bytes <= 128 { return Some(3); }
+    if bytes <= 256 { return Some(4); }
+    if bytes <= 512 { return Some(5); }
+    if bytes <= 1024 { return Some(6); }
+    if bytes <= 2048 { return Some(7); }
+    if bytes <= 4096 { return Some(8); }
+    None
+}
+
+/// Zero a block of guest memory using 4-byte writes (identity-mapped).
+unsafe fn zero_block(addr: u32, size: u32) {
+    let mut off = 0u32;
+    while off < size {
+        memory::write32_no_mmap_or_dirty_check(addr + off, 0);
+        off += 4;
+    }
+}
+
+/// HeapAlloc(hHeap, dwFlags, dwBytes) — stdcall, 3 args.
+/// Fast path: slab bump allocation or free-list pop for blocks ≤4KB.
+/// Returns false to fall through to JS for large/zero-size/slab-exhausted cases.
+unsafe fn handle_heap_alloc() -> bool {
+    let page = hp_ptr();
+    let slab_base = *(page.add(OFF_HC_SLAB_BASE) as *const u32);
+    if slab_base == 0 { return false; } // slab not initialized
+
+    let esp = read_reg32(ESP);
+    // HeapAlloc(hHeap, dwFlags, dwBytes) at ESP+4, +8, +12
+    let dw_flags = match safe_read32s(esp + 8) { Ok(v) => v as u32, Err(_) => return false };
+    let dw_bytes = match safe_read32s(esp + 12) { Ok(v) => v as u32, Err(_) => return false };
+
+    if dw_bytes == 0 { return false; } // let JS set ERROR_NOT_ENOUGH_MEMORY
+
+    let bin = match size_to_bin(dw_bytes) {
+        Some(b) => b,
+        None => {
+            // >4KB — count fallback, let JS handle
+            let p = hp_mut().add(OFF_HC_SLAB_FALLBACK_COUNT) as *mut u32;
+            *p = (*p).wrapping_add(1);
+            return false;
+        }
+    };
+    let size_class = BIN_SIZES[bin as usize];
+    let zero = (dw_flags & HEAP_ZERO_MEMORY_FLAG) != 0;
+
+    // Try free list first
+    let fl_ptr = hp_mut().add(OFF_HC_SLAB_FREELIST + (bin as usize) * 4) as *mut u32;
+    let head = *fl_ptr;
+    if head != 0 {
+        // Pop from free list: first 4 bytes of user data = next pointer
+        let next = memory::read32_no_mmap_check(head) as u32;
+        *fl_ptr = next;
+        if zero { zero_block(head, size_class); }
+        write_reg32(EAX, head as i32);
+        let c = hp_mut().add(OFF_HC_SLAB_ALLOC_COUNT) as *mut u32;
+        *c = (*c).wrapping_add(1);
+        return true;
+    }
+
+    // Bump allocate: [bump..bump+16) = header zone, [bump+16..bump+16+size_class) = user data
+    let bump_ptr = hp_mut().add(OFF_HC_SLAB_BUMP) as *mut u32;
+    let bump = *bump_ptr;
+    let slab_end = *(page.add(OFF_HC_SLAB_END) as *const u32);
+    let user_ptr = bump + 16;
+    let new_bump = user_ptr + size_class;
+    if new_bump > slab_end {
+        let p = hp_mut().add(OFF_HC_SLAB_FALLBACK_COUNT) as *mut u32;
+        *p = (*p).wrapping_add(1);
+        return false; // slab exhausted → JS allocates + can refill slab
+    }
+
+    // Write block header at user_ptr - 4
+    memory::write32_no_mmap_or_dirty_check(user_ptr - 4, (SLAB_MAGIC | bin) as i32);
+    *bump_ptr = new_bump;
+
+    if zero { zero_block(user_ptr, size_class); }
+
+    write_reg32(EAX, user_ptr as i32);
+    let c = hp_mut().add(OFF_HC_SLAB_ALLOC_COUNT) as *mut u32;
+    *c = (*c).wrapping_add(1);
+    true
+}
+
+/// HeapFree(hHeap, dwFlags, lpMem) — stdcall, 3 args.
+/// Fast path: push freed block onto per-bin free list if it's within slab range.
+unsafe fn handle_heap_free() -> bool {
+    let page = hp_ptr();
+    let slab_base = *(page.add(OFF_HC_SLAB_BASE) as *const u32);
+    if slab_base == 0 { return false; }
+
+    let esp = read_reg32(ESP);
+    let lp_mem = match safe_read32s(esp + 12) { Ok(v) => v as u32, Err(_) => return false };
+
+    if lp_mem == 0 {
+        write_reg32(EAX, 1); // HeapFree(NULL) = TRUE per Windows spec
+        return true;
+    }
+
+    let slab_end = *(page.add(OFF_HC_SLAB_END) as *const u32);
+    // Must be within slab with room for header
+    if lp_mem < slab_base + 16 || lp_mem >= slab_end { return false; }
+
+    // Validate slab header at [lp_mem - 4]
+    let header = memory::read32_no_mmap_check(lp_mem - 4) as u32;
+    if (header & 0xFFFFFF00) != SLAB_MAGIC { return false; }
+    let bin = header & 0x0F;
+    if bin > 8 { return false; }
+
+    // Push to free list: store current head in freed block's first 4 bytes
+    let fl_ptr = hp_mut().add(OFF_HC_SLAB_FREELIST + (bin as usize) * 4) as *mut u32;
+    let old_head = *fl_ptr;
+    memory::write32_no_mmap_or_dirty_check(lp_mem, old_head as i32);
+    *fl_ptr = lp_mem;
+
+    let c = hp_mut().add(OFF_HC_SLAB_FREE_COUNT) as *mut u32;
+    *c = (*c).wrapping_add(1);
+    write_reg32(EAX, 1); // TRUE
     true
 }
 

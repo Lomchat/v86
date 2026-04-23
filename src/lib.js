@@ -17,11 +17,26 @@ export function pad0(str, len)
 export var view = function(constructor, memory, offset, length)
 {
     dbg_assert(offset >= 0);
+    // Cache the TypedArray view; invalidate only when the underlying buffer
+    // identity changes (WASM memory growth detaches the old ArrayBuffer and
+    // replaces memory.buffer with a fresh one). Without this, every read or
+    // write allocates a new TypedArray — visible in BottleShip profiles as
+    // several percent of worker CPU during PE load and JS-heavy thunks.
+    let cached = null;
+    let cachedBuffer = null;
+    const resolve = () => {
+        if(cachedBuffer !== memory.buffer)
+        {
+            cachedBuffer = memory.buffer;
+            cached = new constructor(cachedBuffer, offset, length);
+        }
+        return cached;
+    };
     return new Proxy({},
         {
             get: function(target, property, receiver)
             {
-                const b = new constructor(memory.buffer, offset, length);
+                const b = resolve();
                 const x = b[property];
                 if(typeof x === "function")
                 {
@@ -34,7 +49,7 @@ export var view = function(constructor, memory, offset, length)
             set: function(target, property, value, receiver)
             {
                 dbg_assert(/^\d+$/.test(property));
-                new constructor(memory.buffer, offset, length)[property] = value;
+                resolve()[property] = value;
                 return true;
             },
         });

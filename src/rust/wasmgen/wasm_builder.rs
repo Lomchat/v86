@@ -780,6 +780,96 @@ impl WasmBuilder {
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
 
+    // ─── v128 / WASM SIMD ───────────────────────────────────────────────
+    // All SIMD ops are 2-byte: 0xfd prefix + LEB128 sub-opcode.
+    // Memory ops use memarg (align + offset) the same way scalar ops do.
+    pub fn load_aligned_v128(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_V128_LOAD);
+        self.instruction_body.push(op::MEM_ALIGN128);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+    pub fn load_unaligned_v128(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_V128_LOAD);
+        self.instruction_body.push(op::MEM_NO_ALIGN);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+    pub fn store_aligned_v128(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_V128_STORE);
+        self.instruction_body.push(op::MEM_ALIGN128);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+    pub fn store_unaligned_v128(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_V128_STORE);
+        self.instruction_body.push(op::MEM_NO_ALIGN);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+    pub fn and_v128(&mut self) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_V128_AND);
+    }
+    pub fn or_v128(&mut self) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_V128_OR);
+    }
+    pub fn xor_v128(&mut self) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_V128_XOR);
+    }
+    // i64x2 shifts — shift count pushed as i32 before op.
+    pub fn shl_i64x2(&mut self) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_I64X2_SHL_LEB0);
+        self.instruction_body.push(op::SIMD_I64X2_SHL_LEB1);
+    }
+    pub fn shr_s_i64x2(&mut self) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_I64X2_SHR_S_LEB0);
+        self.instruction_body.push(op::SIMD_I64X2_SHR_S_LEB1);
+    }
+    pub fn shr_u_i64x2(&mut self) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_I64X2_SHR_U_LEB0);
+        self.instruction_body.push(op::SIMD_I64X2_SHR_U_LEB1);
+    }
+    pub fn add_i64x2(&mut self) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_I64X2_ADD_LEB0);
+        self.instruction_body.push(op::SIMD_I64X2_ADD_LEB1);
+    }
+    pub fn sub_i64x2(&mut self) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        self.instruction_body.push(op::SIMD_I64X2_SUB_LEB0);
+        self.instruction_body.push(op::SIMD_I64X2_SUB_LEB1);
+    }
+
+    // ─── Scalar float arithmetic (for SSE2 scalar ops) ──────────────────
+    // MULSD/ADDSD/SUBSD/DIVSD write ONLY the low 64 bits of the XMM — the
+    // upper 64 bits must be preserved. In WASM the cleanest way is to do
+    // the op as SCALAR f64 (not SIMD) and store back just the low 8 bytes
+    // via f64.store, leaving the upper 8 bytes physically untouched.
+    pub fn add_f64(&mut self) { self.instruction_body.push(op::OP_F64ADD); }
+    pub fn sub_f64(&mut self) { self.instruction_body.push(op::OP_F64SUB); }
+    pub fn mul_f64(&mut self) { self.instruction_body.push(op::OP_F64MUL); }
+    pub fn div_f64(&mut self) { self.instruction_body.push(op::OP_F64DIV); }
+    pub fn add_f32(&mut self) { self.instruction_body.push(op::OP_F32ADD); }
+    pub fn sub_f32(&mut self) { self.instruction_body.push(op::OP_F32SUB); }
+    pub fn mul_f32(&mut self) { self.instruction_body.push(op::OP_F32MUL); }
+    pub fn div_f32(&mut self) { self.instruction_body.push(op::OP_F32DIV); }
+    pub fn store_aligned_f64(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_F64STORE);
+        self.instruction_body.push(op::MEM_ALIGN64);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+    pub fn store_aligned_f32(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_F32STORE);
+        self.instruction_body.push(op::MEM_ALIGN32);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
     pub fn increment_fixed_i64(&mut self, byte_offset: u32, n: i64) {
         self.const_i32(byte_offset as i32);
         self.load_fixed_i64(byte_offset);

@@ -438,6 +438,13 @@ CPU.prototype.wasm_patch = function()
     this.zstd_free_ctx = get_import("zstd_free_ctx");
     this.zstd_read = get_import("zstd_read");
     this.zstd_read_free = get_import("zstd_read_free");
+
+    // JIT cache snapshot for BottleShip's dumpHotJitBlocks diagnostic.
+    // Bracket-assigned so Closure Compiler doesn't rename the properties.
+    this["jit_snapshot_cache"] = get_import("jit_snapshot_cache");
+    this["jit_snapshot_get_wasm_idx"] = get_import("jit_snapshot_get_wasm_idx");
+    this["jit_snapshot_get_phys_addr"] = get_import("jit_snapshot_get_phys_addr");
+    this["jit_snapshot_get_entry_count"] = get_import("jit_snapshot_get_entry_count");
 };
 
 CPU.prototype.jit_force_generate = function(addr)

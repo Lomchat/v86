@@ -53,6 +53,21 @@ cargo rustc --release \
 cp build/wasm32-unknown-unknown/release/v86.wasm build/v86.wasm
 echo "  → build/v86.wasm ($(du -h build/v86.wasm | cut -f1))"
 
+# BottleShip: Vite serves v86.wasm from public/ (dev) and dist/ (prod build).
+# Keeping them in sync with vendor/v86/build/v86.wasm is easy to forget and
+# manifests as "Missing import: <name>" at worker startup when the built
+# libv86.mjs references a Rust export that the stale .wasm doesn't have.
+# Mirror automatically. Both locations are project-relative; the build-wasm
+# script is invoked from the repo root (or the script's own dir — `cd
+# "$(dirname "$0")"` was done above), so compute paths relative to that.
+REPO_ROOT="$(cd ../.. && pwd)"
+for dest in "$REPO_ROOT/public/v86.wasm" "$REPO_ROOT/dist/v86.wasm"; do
+    if [ -f "$dest" ] || [ -d "$(dirname "$dest")" ]; then
+        cp build/v86.wasm "$dest"
+        echo "  → $dest"
+    fi
+done
+
 echo "=== Building libv86.mjs (Closure Compiler) ==="
 CLOSURE=closure-compiler/compiler.jar
 if [ ! -f "$CLOSURE" ]; then

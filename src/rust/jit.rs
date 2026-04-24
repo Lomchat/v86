@@ -2441,3 +2441,67 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         _ => 0,
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// JIT cache snapshot for diagnostics (BottleShip dumpHotJitBlocks).
+//
+// Pattern: JS calls `jit_snapshot_cache()` to take a point-in-time snapshot
+// of the current JitState.pages map, sorted by physical page address for
+// stable output. Entry fields are then read one at a time via the three
+// accessor functions. Kept in a mutable static mirroring the existing
+// JIT_DISABLED / MAX_PAGES pattern.
+// ──────────────────────────────────────────────────────────────────────────
+
+// (wasm_table_index, phys_page_addr, entry_points_count)
+static mut JIT_CACHE_SNAPSHOT: Option<Vec<(u16, u32, u16)>> = None;
+
+#[no_mangle]
+pub unsafe fn jit_snapshot_cache() -> u32 {
+    let ctx = get_jit_state();
+    let mut snapshot: Vec<(u16, u32, u16)> = ctx
+        .pages
+        .iter()
+        .map(|(page, info)| {
+            (
+                info.wasm_table_index.to_u16(),
+                page.to_address(),
+                info.entry_points.len() as u16,
+            )
+        })
+        .collect();
+    // Sort by physical page address so repeated snapshots give stable indexing.
+    snapshot.sort_by_key(|&(_, addr, _)| addr);
+    let len = snapshot.len() as u32;
+    JIT_CACHE_SNAPSHOT = Some(snapshot);
+    len
+}
+
+#[no_mangle]
+pub unsafe fn jit_snapshot_get_wasm_idx(i: u32) -> u32 {
+    if let Some(ref snap) = JIT_CACHE_SNAPSHOT {
+        if let Some(&(idx, _, _)) = snap.get(i as usize) {
+            return idx as u32;
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe fn jit_snapshot_get_phys_addr(i: u32) -> u32 {
+    if let Some(ref snap) = JIT_CACHE_SNAPSHOT {
+        if let Some(&(_, addr, _)) = snap.get(i as usize) {
+            return addr;
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe fn jit_snapshot_get_entry_count(i: u32) -> u32 {
+    if let Some(ref snap) = JIT_CACHE_SNAPSHOT {
+        if let Some(&(_, _, count)) = snap.get(i as usize) {
+            return count as u32;
+        }
+    }
+    0
+}

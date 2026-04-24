@@ -219,3 +219,25 @@ c!(MEM_NO_ALIGN, 0);
 c!(MEM_ALIGN16, 1);
 c!(MEM_ALIGN32, 2);
 c!(MEM_ALIGN64, 3);
+c!(MEM_ALIGN128, 4);
+
+// ─── WASM SIMD (v128) ─────────────────────────────────────────────────────
+// All SIMD ops are 2-byte opcodes: 0xfd prefix + LEB128 sub-opcode.
+// Sub-opcodes <128 encode as a single byte; larger values need LEB.
+// Reference: https://webassembly.github.io/spec/core/appendix/index-instructions.html
+c!(OP_SIMD_PREFIX, 0xfd);
+// Memory ops — memarg (align+offset) follows like other load/store ops.
+c!(SIMD_V128_LOAD, 0x00);      // v128.load
+c!(SIMD_V128_STORE, 0x0b);     // v128.store
+// Most-useful fixed-size ops (all single-byte sub-opcodes here).
+c!(SIMD_V128_AND, 0x4e);       // v128.and  (78)
+c!(SIMD_V128_OR, 0x50);        // v128.or   (80)
+c!(SIMD_V128_XOR, 0x51);       // v128.xor  (81)
+// Multi-byte sub-opcodes (>= 128) — emitted via two LEB bytes.
+// i64x2 shifts: sub-opcode values 203 (SHL) / 204 (SHR_S) / 205 (SHR_U).
+c!(SIMD_I64X2_SHL_LEB0, 0xcb);   c!(SIMD_I64X2_SHL_LEB1, 0x01);   // 203
+c!(SIMD_I64X2_SHR_S_LEB0, 0xcc); c!(SIMD_I64X2_SHR_S_LEB1, 0x01); // 204
+c!(SIMD_I64X2_SHR_U_LEB0, 0xcd); c!(SIMD_I64X2_SHR_U_LEB1, 0x01); // 205
+// i64x2 arithmetic.
+c!(SIMD_I64X2_ADD_LEB0, 0xce); c!(SIMD_I64X2_ADD_LEB1, 0x01);   // 206
+c!(SIMD_I64X2_SUB_LEB0, 0xd1); c!(SIMD_I64X2_SUB_LEB1, 0x01);   // 209

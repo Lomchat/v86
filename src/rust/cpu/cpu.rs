@@ -367,6 +367,195 @@ impl LastJump {
 }
 pub static mut debug_last_jump: LastJump = LastJump::None;
 
+// =============================================================================
+// [BOTTLESHIP-UT] UnrealScript execLocalVariable entry tracer (UT99 GETPING hunt)
+// -----------------------------------------------------------------------------
+// FFrame::Step is INLINED across UE1, so there is no single dispatcher address
+// to hook. Instead hook the GNatives[0] handler execLocalVariable directly
+// (single address, runtime 0x1309e110 with Core.dll @ 0x13070000) — every
+// EX_LocalVariable opcode routes through it. At entry: FFrame=[ESP+4],
+// Code=[FFrame+0xc], property=*Code. Record (Code, property) into a ring. When
+// the property is MISALIGNED (cannot be a real UProperty* — the 1-byte Code
+// desync fingerprint), dump the ring + a wide bytecode window around Code so we
+// can see the surrounding opcodes (GETPING etc). Requires JIT disabled
+// (set_jit_config(0,1)) so the interpreter path is taken. ut_step_eip is the
+// armed handler entry; ut_trace_alive logs once to confirm the hook + console
+// output are live.
+// =============================================================================
+pub static mut ut_step_eip: u32 = 0; // disarmed — UT99 investigation tracer (bug resolved 2026-06)
+pub static mut ut_trace_code: [u32; 192] = [0; 192];
+pub static mut ut_trace_prop: [u32; 192] = [0; 192];
+pub static mut ut_trace_idx: u32 = 0;
+pub static mut ut_trace_dumped: u32 = 0;
+pub static mut ut_trace_alive: u32 = 0;
+
+#[no_mangle]
+pub unsafe fn ut_arm_step_trace(eip: u32) {
+    ut_step_eip = eip;
+    ut_trace_idx = 0;
+    ut_trace_dumped = 0;
+    ut_trace_alive = 0;
+}
+
+// Precise per-instruction trace through the derailment window: log (eip, Code,
+// *Code) for EVERY interpreted instruction while the crashing frame's
+// FFrame.Code (0x10f98ac) is in [0x12cb4d8, 0x12cb4ee]. Shows exactly which
+// handler the 0xf3 opcode (0x12cb4de) and the 0x1F opcode (0x12cb4e2) dispatch
+// to, and how Code advances — pinning the upstream opcode that under-consumes.
+const UT_FRAME_CODE: u32 = 0x10f98ac; // FFrame(0x10f98a0).Code
+pub static mut ut_win_count: u32 = 0;
+
+#[inline(always)]
+pub unsafe fn ut_strconst_ss(eip: i32) {
+    let code = ptr::read_unaligned(memory::mem8.offset(UT_FRAME_CODE as isize) as *const u32);
+    if code < 0x12cb4d8 || code > 0x12cb4ee || ut_win_count >= 300 {
+        return;
+    }
+    ut_win_count = ut_win_count.wrapping_add(1);
+    let e = eip as u32;
+    // tag known regions for readability
+    let tag = if e >= 0x1309fde0 && e < 0x1309fe78 { " <execStrConst?>" }
+              else if e >= 0x13236c50 && e < 0x13236d00 { " <engine.execSilentLogBatcher>" }
+              else if e >= 0x1309e110 && e < 0x1309e150 { " <execLocalVariable>" }
+              else { "" };
+    let b0 = *memory::mem8.offset(code as isize);
+    crate::dbg::console_log_to_js_console(format!(
+        "[UT-WIN] eip=0x{:08x} Code=0x{:x} *Code=0x{:02x}{}", e, code, b0, tag));
+}
+
+#[inline(always)]
+pub unsafe fn ut_step_hook(initial_eip: i32) {
+    if ut_step_eip == 0 || (initial_eip as u32) != ut_step_eip {
+        return;
+    }
+    let esp = read_reg32(ESP) as u32;
+    let frame = ptr::read_unaligned(memory::mem8.offset(esp.wrapping_add(4) as isize) as *const u32);
+    let code = ptr::read_unaligned(memory::mem8.offset(frame.wrapping_add(0xc) as isize) as *const u32);
+    let prop = ptr::read_unaligned(memory::mem8.offset(code as isize) as *const u32);
+    if ut_trace_alive == 0 {
+        ut_trace_alive = 1;
+        crate::dbg::console_log_to_js_console(format!(
+            "[UT-TRACE] hook ALIVE @ execLocalVariable 0x{:x}: frame=0x{:x} code=0x{:x} prop=0x{:x}",
+            ut_step_eip, frame, code, prop
+        ));
+    }
+    let i = (ut_trace_idx % 192) as usize;
+    ut_trace_code[i] = code;
+    ut_trace_prop[i] = prop;
+    ut_trace_idx = ut_trace_idx.wrapping_add(1);
+
+    if ut_trace_dumped == 0 && prop & 3 != 0 {
+        ut_trace_dumped = 1;
+        crate::dbg::console_log_to_js_console(format!(
+            "[UT-TRACE] *** DESYNC: execLocalVariable frame=0x{:x} Code=0x{:x} prop=0x{:x} (misaligned &3={})",
+            frame, code, prop, prop & 3
+        ));
+        // Wide bytecode window around the (desynced) Code pointer.
+        let lo = code.wrapping_sub(24);
+        for row in 0..6u32 {
+            let base = lo.wrapping_add(row * 8);
+            let mut s = format!("[UT-TRACE] bc 0x{:08x}:", base);
+            for j in 0..8u32 {
+                let b = *memory::mem8.offset(base.wrapping_add(j) as isize);
+                let mark = if base.wrapping_add(j) == code { ">" } else { " " };
+                s.push_str(&format!(" {}{:02x}", mark, b));
+            }
+            crate::dbg::console_log_to_js_console(s);
+        }
+        // Ring of recent execLocalVariable accesses (Code + property literal).
+        let total = ut_trace_idx;
+        let n: u32 = if total < 48 { total } else { 48 };
+        let start = total - n;
+        for k in 0..n {
+            let idx = ((start + k) % 192) as usize;
+            crate::dbg::console_log_to_js_console(format!(
+                "[UT-TRACE] LV #{:3} Code=0x{:08x} prop=0x{:08x}{}",
+                k, ut_trace_code[idx], ut_trace_prop[idx],
+                if ut_trace_prop[idx] & 3 != 0 { " <== MISALIGNED" } else { "" }
+            ));
+        }
+    }
+}
+
+// ============================================================================
+// BottleShip guest debugger — settable breakpoints + step-trace + watches.
+// Drivable from JS via the wasm exports below (worker `dbg` object + window.dbg
+// page bridge). Requires JIT off (set_jit_config(0,1)) so guest handlers run
+// through cycle_internal where dbg_on_instruction is hooked. Each dump line is
+// emitted with the [DBG] prefix so it can be grepped out of the console stream.
+// ============================================================================
+const DBG_MAX_BP: usize = 32;
+const DBG_MAX_WATCH: usize = 8;
+pub static mut DBG_ENABLED: bool = false;
+pub static mut DBG_BP: [u32; DBG_MAX_BP] = [0u32; DBG_MAX_BP];
+pub static mut DBG_BP_COUNT: usize = 0;
+pub static mut DBG_STEP_REMAINING: u32 = 0; // when >0, trace each instr and decrement
+pub static mut DBG_STEP_ON_BP: u32 = 0;     // on a breakpoint hit, auto-arm this many step traces
+pub static mut DBG_WATCH: [u32; DBG_MAX_WATCH] = [0u32; DBG_MAX_WATCH];
+pub static mut DBG_WATCH_COUNT: usize = 0;
+pub static mut DBG_WATCH_INDIRECT: bool = false; // log *(watch) and the byte at *(watch) too
+pub static mut DBG_STEP_COUNTER: u32 = 0;
+pub static mut DBG_MAX_DUMPS: u32 = 4000;   // hard cap so a runaway trace can't flood
+
+#[no_mangle] pub unsafe fn dbg_enable(on: u32) { DBG_ENABLED = on != 0; }
+#[no_mangle] pub unsafe fn dbg_clear() {
+    DBG_BP_COUNT = 0; DBG_WATCH_COUNT = 0; DBG_STEP_REMAINING = 0; DBG_STEP_ON_BP = 0;
+    DBG_WATCH_INDIRECT = false; DBG_STEP_COUNTER = 0;
+}
+#[no_mangle] pub unsafe fn dbg_add_bp(eip: u32) {
+    if DBG_BP_COUNT < DBG_MAX_BP { DBG_BP[DBG_BP_COUNT] = eip; DBG_BP_COUNT += 1; }
+}
+#[no_mangle] pub unsafe fn dbg_set_step_on_bp(n: u32) { DBG_STEP_ON_BP = n; }
+#[no_mangle] pub unsafe fn dbg_arm_step(n: u32) { DBG_STEP_REMAINING = n; }
+#[no_mangle] pub unsafe fn dbg_add_watch(addr: u32) {
+    if DBG_WATCH_COUNT < DBG_MAX_WATCH { DBG_WATCH[DBG_WATCH_COUNT] = addr; DBG_WATCH_COUNT += 1; }
+}
+#[no_mangle] pub unsafe fn dbg_set_indirect(on: u32) { DBG_WATCH_INDIRECT = on != 0; }
+#[no_mangle] pub unsafe fn dbg_set_max_dumps(n: u32) { DBG_MAX_DUMPS = n; }
+#[no_mangle] pub unsafe fn dbg_read_u32(addr: u32) -> u32 {
+    ptr::read_unaligned(memory::mem8.offset(addr as isize) as *const u32)
+}
+#[no_mangle] pub unsafe fn dbg_read_u8(addr: u32) -> u32 {
+    (*memory::mem8.offset(addr as isize)) as u32
+}
+
+#[inline(always)]
+pub unsafe fn dbg_on_instruction(eip: u32) {
+    if !DBG_ENABLED { return; }
+    let stepping = DBG_STEP_REMAINING > 0;
+    let mut is_bp = false;
+    let mut i = 0;
+    while i < DBG_BP_COUNT {
+        if DBG_BP[i] == eip { is_bp = true; break; }
+        i += 1;
+    }
+    if !is_bp && !stepping { return; }
+    if is_bp && DBG_STEP_ON_BP > 0 { DBG_STEP_REMAINING = DBG_STEP_ON_BP; }
+    if DBG_STEP_REMAINING > 0 { DBG_STEP_REMAINING -= 1; }
+    if DBG_STEP_COUNTER >= DBG_MAX_DUMPS { return; }
+    DBG_STEP_COUNTER = DBG_STEP_COUNTER.wrapping_add(1);
+    let tag = if is_bp { " <BP>" } else { "" };
+    let mut s = format!(
+        "[DBG] #{:<5} eip=0x{:08x}{} eax={:08x} ecx={:08x} edx={:08x} ebx={:08x} esp={:08x} ebp={:08x} esi={:08x} edi={:08x}",
+        DBG_STEP_COUNTER, eip, tag,
+        read_reg32(EAX) as u32, read_reg32(ECX) as u32, read_reg32(EDX) as u32, read_reg32(EBX) as u32,
+        read_reg32(ESP) as u32, read_reg32(EBP) as u32, read_reg32(ESI) as u32, read_reg32(EDI) as u32,
+    );
+    let mut w = 0;
+    while w < DBG_WATCH_COUNT {
+        let a = DBG_WATCH[w];
+        let v = ptr::read_unaligned(memory::mem8.offset(a as isize) as *const u32);
+        if DBG_WATCH_INDIRECT {
+            let b = *memory::mem8.offset(v as isize);
+            s.push_str(&format!(" | W{}[{:x}]={:08x}(*={:02x})", w, a, v, b));
+        } else {
+            s.push_str(&format!(" | W{}[{:x}]={:08x}", w, a, v));
+        }
+        w += 1;
+    }
+    crate::dbg::console_log_to_js_console(s);
+}
+
 #[derive(Copy, Clone)]
 pub struct SegmentSelector {
     raw: u16,
@@ -2905,6 +3094,9 @@ pub unsafe fn cycle_internal() {
     profiler::stat_increment(stat::CYCLE_INTERNAL);
     let mut jit_entry = None;
     let initial_eip = *instruction_pointer;
+    // ut_step_hook(initial_eip) removed from hot path — UT99 tracer (resolved). dbg_on_instruction
+    // stays: it's gated by DBG_ENABLED (off by default), the guest debugger's interpreter hook.
+    dbg_on_instruction(initial_eip as u32);
     let initial_state_flags = *state_flags;
 
     match tlb_code[(initial_eip as u32 >> 12) as usize] {
@@ -3084,6 +3276,8 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
 
         i += 1;
         let start_eip = *instruction_pointer;
+        // ut_strconst_ss(start_eip) removed from the interpreter inner loop — UT99 tracer (resolved);
+        // it cost a per-interpreted-instruction memory read + compares for every game.
         let opcode = *memory::mem8.offset(phys_addr as isize) as i32;
         *instruction_pointer += 1;
         dbg_assert!(*prefixes == 0);

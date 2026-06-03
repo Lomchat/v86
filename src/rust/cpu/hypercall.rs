@@ -659,15 +659,20 @@ unsafe fn read_stack_f64(addr: i32) -> f64 {
     f64::from_bits((hi as u64) << 32 | lo as u64)
 }
 
-/// _ftol: Convert ST(0) to signed int32, pop stack. Result in EAX, sign-extend to EDX.
+/// _ftol / __ftol: convert ST(0) to a signed __int64 (truncate toward zero), pop the stack,
+/// return the FULL 64-bit result in EDX:EAX. The caller uses EAX alone for `(long)` or EDX:EAX
+/// for `__int64`. The old code returned only a 32-bit value CLAMPED to INT32_MAX/MIN — that
+/// broke every 64-bit user, notably the UE1 (Harry Potter) launcher's RDTSC timebase:
+/// `now = _ftol(GSecondsPerCycle * TSC * 2^32)` exceeds INT32_MAX within ~0.5s of uptime, so the
+/// clamp pinned `now` to 0x7fffffff every frame -> per-frame DeltaTime = (now-last)/2^32 = 0 ->
+/// frozen splash countdown / racing storybook / audio underrun (all one defect). Must be int64.
 unsafe fn handle_ftol() -> bool {
     let st0 = fpu_get_st0();
     let val = f64::from_bits(st0.to_f64());
     fpu_pop();
-    let truncated = val as i32;
-    write_reg32(EAX, truncated);
-    // EDX = sign extension (some code expects this from _ftol)
-    write_reg32(EDX, if truncated < 0 { -1 } else { 0 });
+    let v = val as i64; // Rust float->int `as` truncates toward zero and saturates on overflow
+    write_reg32(EAX, v as i32);          // low 32
+    write_reg32(EDX, (v >> 32) as i32);  // high 32
     true
 }
 

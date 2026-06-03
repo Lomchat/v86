@@ -4306,58 +4306,48 @@ pub unsafe fn decr_ecx_asize(is_asize_32: bool) -> i32 {
 pub unsafe fn set_tsc(low: u32, high: u32) {
     let new_value = low as u64 | (high as u64) << 32;
     let current_value = read_tsc();
-    tsc_offset = current_value - new_value;
+    tsc_offset = current_value.wrapping_sub(new_value);
+    // Re-seed the monotonic baseline to the value the guest just set (WRMSR/reset/state-restore),
+    // otherwise read_tsc's backward-step guard would clamp a legitimately-lowered TSC to the old value.
+    tsc_last_value = new_value;
 }
+
+// 2^32 ticks per second = 4_294_967_296 / 1000 ticks per millisecond.
+const TSC_TICKS_PER_MS: f64 = 4_294_967.296;
 
 #[no_mangle]
 pub unsafe fn read_tsc() -> u64 {
-    let value = (js::microtick() * TSC_RATE) as u64 - tsc_offset;
-
-    if !TSC_ENABLE_IMPRECISE_BROWSER_WORKAROUND {
-        return value;
-    }
-
-    if value == tsc_last_value {
-        // If the browser returns the same value as last time, extrapolate based on the number of
-        // rdtsc calls between the last two changes
-        tsc_number_of_same_readings += 1;
-        let extra = (tsc_number_of_same_readings * tsc_resolution) / tsc_speed;
-        let extra = u64::min(extra, tsc_resolution - 1);
-        #[cfg(debug_assertions)]
-        {
-            tsc_last_extra = extra;
-        }
-        return value + extra;
-    }
-
-    #[cfg(debug_assertions)]
-    if tsc_last_extra != 0 {
-        if TSC_VERBOSE_LOGGING || tsc_last_extra >= tsc_resolution {
-            dbg_log!(
-                "rdtsc: jump from {}+{} to {} (diff {}, {}%)",
-                tsc_last_value as u64,
-                tsc_last_extra as u64,
-                value,
-                value - (tsc_last_value + tsc_last_extra),
-                (100 * tsc_last_extra) / tsc_resolution,
-            );
-            dbg_assert!(tsc_last_extra < tsc_resolution, "XXX: Overshot tsc");
-        }
-        tsc_last_extra = 0;
-    }
-
-    let d = value - tsc_last_value;
-    if d < tsc_resolution {
-        dbg_log!("rdtsc resolution: {}", d);
-    }
-    tsc_resolution = tsc_resolution.min(d);
-    tsc_last_value = value;
-    if tsc_number_of_same_readings != 0 {
-        tsc_speed = tsc_number_of_same_readings;
-        tsc_number_of_same_readings = 0;
-    }
-
-    value
+    // WALL-ANCHORED TSC (BottleShip, post-SESSION-6 correction). RDTSC is a free-running ~4.29 GHz
+    // (2^32 ticks/sec) counter derived DIRECTLY from wall clock (performance.now), DECOUPLED from the
+    // instruction-virtual page clock that QPC/GetTickCount use. Rationale (validated against the live
+    // HP freeze + two independent emulator-dev reviews):
+    //
+    //  * DeltaTime needs ELAPSED REAL TIME, not retired-instruction count. An instruction-interpolated
+    //    RDTSC freezes during async Flip parks (the bulk of an idle UE1 front-end frame: no guest
+    //    instructions retire, the idle-pump is gated off for async waits) and PLATEAUS under the
+    //    MAX_AHEAD wall-clamp + monotonic guard (measured: ~49% of calls guard-pinned). Both made the
+    //    two RDTSC reads bracketing a frame identical -> DeltaTime==0 -> the EA-splash countdown froze.
+    //  * 2^32 ticks/sec is SELF-CONSISTENT with UE1's GSecondsPerCycle == 2^-32 (= 1/2^32): a guest
+    //    calibrating RDTSC against QPC(1 MHz) measures the ratio 4295 and derives 2^-32 naturally, and
+    //    the uncalibrated fallback also assumes ~4.29 GHz — so NO engine-memory patch is needed and
+    //    DeltaTime = rdtsc_delta * 2^-32 = real seconds (4294967.296 tick/ms * 2^-32 sec/tick = 1e-3).
+    //  * On real hardware RDTSC (free-running ~GHz TSC) and QPC (PMC/HPET, MHz) are DIFFERENT clocks;
+    //    the game calibrates the ratio. Forcing them equal at 1 MHz (the SESSION-6 "unified clock")
+    //    broke resolution and calibration. They are intentionally decoupled again here.
+    let value = (js::microtick() * TSC_TICKS_PER_MS) as u64;
+    let value = value.wrapping_sub(tsc_offset);
+    // Monotonic floor + sub-sample forward progress: never return <= the previous value. When wall
+    // clock hasn't advanced since the last call (performance.now resolution / tight RDTSC loops in
+    // light frames), advance by 1 tick so consecutive reads ALWAYS differ — a real wall jump snaps it
+    // forward again. This is a rare safety net, not the normal path (unlike the old guard, which
+    // plateaued).
+    let result = if value <= tsc_last_value {
+        tsc_last_value.wrapping_add(1)
+    } else {
+        value
+    };
+    tsc_last_value = result;
+    result
 }
 
 pub unsafe fn vm86_mode() -> bool { return *flags & FLAG_VM == FLAG_VM; }

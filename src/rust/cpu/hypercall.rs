@@ -80,6 +80,7 @@ const OFF_HC_PEEK_STARVATION_LIMIT: usize = 0x098;
 const OFF_HC_HAS_RUNNABLE_PEERS: usize = 0x09C;
 const OFF_HC_SLEEP_STARVATION_COUNTER: usize = 0x0A0;
 const OFF_HC_SLEEP_STARVATION_LIMIT: usize = 0x0A4;
+const OFF_HC_RAND_SEED: usize = 0x0B0;
 const OFF_HC_DISPATCH_TABLE: usize = 0x100;
 const OFF_HC_FLS_ALLOCATED: usize = 0x1100;
 const OFF_HC_FLS_VALUES: usize = 0x1184;
@@ -213,6 +214,10 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         // Scheduler hypercalls (Tier 4)
         63 => handle_sleep(),
         64 => handle_tls_get_value(),
+        65 => handle_rand(),
+        66 => handle_wcsstr(),
+        67 => handle_wcsnicmp(),
+        68 => handle_wcsncpy(),
         69 => handle_fls_get_value(),
         // Heap arena hypercalls (Tier 5)
         70 => handle_heap_alloc(),
@@ -327,6 +332,19 @@ unsafe fn handle_qpf() -> bool {
 unsafe fn handle_get_last_error() -> bool {
     let err = *(hp_ptr().add(OFF_HC_LAST_ERROR) as *const u32);
     write_reg32(EAX, err as i32);
+    true
+}
+
+/// msvcrt/crtdll rand() — MSVCRT LCG, fully in WASM (no JS round-trip). UE1 games flood
+/// rand() hundreds of times per frame; routing it here removes that thunk-dispatch cost.
+/// Seed lives in the shared page (OFF_HC_RAND_SEED); srand() syncs JS→page via updateRandSeed,
+/// and since every rand() goes through this handler the JS-side seed is never read, so the
+/// sequence stays consistent. Returns (seed >> 16) & 0x7fff in EAX, matching the JS impl.
+unsafe fn handle_rand() -> bool {
+    let p = hp_ptr().add(OFF_HC_RAND_SEED) as *mut u32;
+    let seed = (*p).wrapping_mul(214013).wrapping_add(2531011);
+    *p = seed;
+    write_reg32(EAX, ((seed >> 16) & 0x7fff) as i32);
     true
 }
 
@@ -1070,6 +1088,152 @@ unsafe fn handle_wcschr() -> bool {
         if i > 0x100000 { break; }
     }
     write_reg32(EAX, 0);
+    true
+}
+
+/// wcsstr(wchar_t* haystack, wchar_t* needle): find substring, return ptr or NULL.
+/// Naive O(n*m) search, matching MSVCRT. Hot during game asset/string loading.
+unsafe fn handle_wcsstr() -> bool {
+    let esp = read_reg32(ESP);
+    let haystack = match safe_read32s(esp + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let needle = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if haystack == 0 || needle == 0 {
+        write_reg32(EAX, 0);
+        return true;
+    }
+    // Empty needle → return haystack (C standard).
+    let first = match hc_safe_read16(needle) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if first == 0 {
+        write_reg32(EAX, haystack);
+        return true;
+    }
+    let mut i: u32 = 0;
+    loop {
+        let hc = match hc_safe_read16(haystack + i as i32 * 2) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if hc == 0 { break; }
+        if hc == first {
+            let mut j: u32 = 1;
+            let matched = loop {
+                let nc = match hc_safe_read16(needle + j as i32 * 2) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if nc == 0 { break true; }
+                let h2 = match hc_safe_read16(haystack + (i + j) as i32 * 2) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if h2 != nc { break false; }
+                j += 1;
+                if j > 0x100000 { break false; }
+            };
+            if matched {
+                write_reg32(EAX, haystack + i as i32 * 2);
+                return true;
+            }
+        }
+        i += 1;
+        if i > 0x100000 { break; }
+    }
+    write_reg32(EAX, 0);
+    true
+}
+
+/// _wcsnicmp(wchar_t* s1, wchar_t* s2, size_t count): case-insensitive compare up to count.
+/// MUST mirror the JS fastPathWcsnicmp (msvcrt.ts) byte-for-byte: in this codebase's
+/// convention count==0 means "compare the whole string" (limit 0x10000), NOT "0 chars =
+/// equal". Returning 0 for count==0 made every such compare report equal → wrong config/
+/// name branch → HP camera-follow regression. Keep the count==0 semantics identical to JS.
+unsafe fn handle_wcsnicmp() -> bool {
+    let esp = read_reg32(ESP);
+    let s1 = match safe_read32s(esp + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let s2 = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let count = match safe_read32s(esp + 12) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let limit: u32 = if count > 0 { count } else { 0x10000 };
+    let mut i: u32 = 0;
+    let result = loop {
+        if i >= limit { break 0i32; }
+        let c1 = match hc_safe_read16(s1 + i as i32 * 2) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        let c2 = match hc_safe_read16(s2 + i as i32 * 2) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        // ASCII tolower
+        let l1 = if c1 >= 0x41 && c1 <= 0x5A { c1 + 0x20 } else { c1 };
+        let l2 = if c2 >= 0x41 && c2 <= 0x5A { c2 + 0x20 } else { c2 };
+        if l1 != l2 { break (l1 as i32) - (l2 as i32); }
+        if c1 == 0 { break 0i32; }
+        i += 1;
+    };
+    write_reg32(EAX, result);
+    true
+}
+
+/// wcsncpy(wchar_t* dst, wchar_t* src, size_t count): copy up to count wchars, null-pad
+/// remainder if src is shorter. No implicit terminator when src >= count (C standard).
+/// Mirrors JS wcsncpy (msvcrt.ts): only dst==0 short-circuits. Do NOT special-case src==0
+/// — JS doesn't, and early-returning there left dst holding stale data (divergence). When
+/// src==0 the read below faults → hc_safe_read16 Err → JS fallback handles it like JS.
+unsafe fn handle_wcsncpy() -> bool {
+    let esp = read_reg32(ESP);
+    let dst = match safe_read32s(esp + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let src = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let count = match safe_read32s(esp + 12) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if dst == 0 {
+        write_reg32(EAX, dst);
+        return true;
+    }
+    // Defer pathologically large copies to JS rather than spin in WASM.
+    if count > 0x100000 { return false; }
+    let mut i: u32 = 0;
+    let mut hit_null = false;
+    while i < count {
+        let ch = if hit_null {
+            0
+        } else {
+            match hc_safe_read16(src + i as i32 * 2) {
+                Ok(v) => v,
+                Err(_) => return false,
+            }
+        };
+        if hc_safe_write16(dst + i as i32 * 2, ch).is_err() { return false; }
+        if ch == 0 { hit_null = true; }
+        i += 1;
+    }
+    write_reg32(EAX, dst);
     true
 }
 

@@ -2544,6 +2544,314 @@ pub fn gen_fpu_load_i64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
         .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
 }
 
+// ── Relaxed FPU inline fast path (BottleShip plan B) ───────────────────────
+// Tag-check ST entries; fall back to fpu_* helpers on non-RELAXED_TAG values.
+// Skips stack-fault / status-word accumulation (same as relaxed softfloat).
+
+const FPU_RELAXED_TAG: i32 = 0x7FFE;
+
+#[derive(Copy, Clone)]
+pub enum FpuFastBinOp {
+    Add,
+    Mul,
+    Sub,
+    SubR,
+    Div,
+    DivR,
+}
+
+fn gen_fpu_st_addr(ctx: &mut JitContext, i: u32) -> WasmLocal {
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.const_i32(i as i32);
+    ctx.builder.add_i32();
+    ctx.builder.const_i32(7);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(16);
+    ctx.builder.mul_i32();
+    ctx.builder.const_i32(global_pointers::fpu_st as i32);
+    ctx.builder.add_i32();
+    ctx.builder.set_new_local()
+}
+
+fn gen_fpu_relaxed_tag_ok(ctx: &mut JitContext, addr: &WasmLocal) {
+    ctx.builder.get_local(addr);
+    ctx.builder.load_unaligned_u16(8);
+    ctx.builder.const_i32(FPU_RELAXED_TAG);
+    ctx.builder.eq_i32();
+}
+
+fn gen_fpu_load_relaxed_f64(ctx: &mut JitContext, addr: &WasmLocal) {
+    ctx.builder.get_local(addr);
+    ctx.builder.load_unaligned_i64(0);
+    ctx.builder.reinterpret_i64_as_f64();
+}
+
+fn gen_fpu_store_relaxed_f64(ctx: &mut JitContext, addr: &WasmLocal) {
+    ctx.builder.reinterpret_f64_as_i64();
+    let bits = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local(addr);
+    ctx.builder.get_local_i64(&bits);
+    ctx.builder.store_unaligned_i64(0);
+    ctx.builder.get_local(addr);
+    ctx.builder.const_i32(FPU_RELAXED_TAG);
+    ctx.builder.store_unaligned_u16(8);
+    ctx.builder.free_local_i64(bits);
+}
+
+fn gen_fpu_apply_f64_binop(ctx: &mut JitContext, op: FpuFastBinOp) {
+    match op {
+        FpuFastBinOp::Add => ctx.builder.add_f64(),
+        FpuFastBinOp::Mul => ctx.builder.mul_f64(),
+        FpuFastBinOp::Sub => ctx.builder.sub_f64(),
+        FpuFastBinOp::SubR => ctx.builder.sub_f64(),
+        FpuFastBinOp::Div => ctx.builder.div_f64(),
+        FpuFastBinOp::DivR => ctx.builder.div_f64(),
+    }
+}
+
+fn gen_fpu_load_m32_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+    ctx.builder.reinterpret_i32_as_f32();
+    ctx.builder.promote_f32_to_f64();
+}
+
+fn gen_fpu_load_m64_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    ctx.builder.reinterpret_i64_as_f64();
+}
+
+fn gen_fpu_relaxed_load_binop_operands_m32(
+    ctx: &mut JitContext,
+    op: FpuFastBinOp,
+    st0_addr: &WasmLocal,
+    modrm_byte: ModrmByte,
+) {
+    let reversed = matches!(op, FpuFastBinOp::SubR | FpuFastBinOp::DivR);
+    if reversed {
+        gen_fpu_load_m32_as_f64(ctx, modrm_byte);
+        gen_fpu_load_relaxed_f64(ctx, st0_addr);
+    }
+    else {
+        gen_fpu_load_relaxed_f64(ctx, st0_addr);
+        gen_fpu_load_m32_as_f64(ctx, modrm_byte);
+    }
+}
+
+fn gen_fpu_relaxed_load_binop_operands_m64(
+    ctx: &mut JitContext,
+    op: FpuFastBinOp,
+    st0_addr: &WasmLocal,
+    modrm_byte: ModrmByte,
+) {
+    let reversed = matches!(op, FpuFastBinOp::SubR | FpuFastBinOp::DivR);
+    if reversed {
+        gen_fpu_load_m64_as_f64(ctx, modrm_byte);
+        gen_fpu_load_relaxed_f64(ctx, st0_addr);
+    }
+    else {
+        gen_fpu_load_relaxed_f64(ctx, st0_addr);
+        gen_fpu_load_m64_as_f64(ctx, modrm_byte);
+    }
+}
+
+fn gen_fpu_relaxed_load_binop_operands_sti(
+    ctx: &mut JitContext,
+    op: FpuFastBinOp,
+    st0_addr: &WasmLocal,
+    op_addr: &WasmLocal,
+) {
+    let reversed = matches!(op, FpuFastBinOp::SubR | FpuFastBinOp::DivR);
+    if reversed {
+        gen_fpu_load_relaxed_f64(ctx, op_addr);
+        gen_fpu_load_relaxed_f64(ctx, st0_addr);
+    }
+    else {
+        gen_fpu_load_relaxed_f64(ctx, st0_addr);
+        gen_fpu_load_relaxed_f64(ctx, op_addr);
+    }
+}
+
+pub fn gen_fpu_relaxed_binop_m32(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    target_sti: u32,
+    op: FpuFastBinOp,
+    slow_helper: &str,
+) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        ctx.builder.const_i32(target_sti as i32);
+        gen_fpu_load_m32(ctx, modrm_byte);
+        ctx.builder.call_fn3_i32_i64_i32(slow_helper);
+        return;
+    }
+    let modrm_slow = modrm_byte.clone();
+    let target_addr = gen_fpu_st_addr(ctx, target_sti);
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    ctx.builder.const_i32(target_sti as i32);
+    gen_fpu_load_m32(ctx, modrm_slow);
+    ctx.builder.call_fn3_i32_i64_i32(slow_helper);
+    ctx.builder.else_();
+    gen_fpu_relaxed_load_binop_operands_m32(ctx, op, &st0_addr, modrm_byte);
+    gen_fpu_apply_f64_binop(ctx, op);
+    gen_fpu_store_relaxed_f64(ctx, &target_addr);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(target_addr);
+}
+
+pub fn gen_fpu_relaxed_binop_m64(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    target_sti: u32,
+    op: FpuFastBinOp,
+    slow_helper: &str,
+) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        ctx.builder.const_i32(target_sti as i32);
+        gen_fpu_load_m64(ctx, modrm_byte);
+        ctx.builder.call_fn3_i32_i64_i32(slow_helper);
+        return;
+    }
+    let modrm_slow = modrm_byte.clone();
+    let target_addr = gen_fpu_st_addr(ctx, target_sti);
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    ctx.builder.const_i32(target_sti as i32);
+    gen_fpu_load_m64(ctx, modrm_slow);
+    ctx.builder.call_fn3_i32_i64_i32(slow_helper);
+    ctx.builder.else_();
+    gen_fpu_relaxed_load_binop_operands_m64(ctx, op, &st0_addr, modrm_byte);
+    gen_fpu_apply_f64_binop(ctx, op);
+    gen_fpu_store_relaxed_f64(ctx, &target_addr);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(target_addr);
+}
+
+pub fn gen_fpu_relaxed_binop_sti(
+    ctx: &mut JitContext,
+    sti: u32,
+    target_sti: u32,
+    op: FpuFastBinOp,
+    slow_helper: &str,
+) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        ctx.builder.const_i32(target_sti as i32);
+        gen_fpu_get_sti(ctx, sti);
+        ctx.builder.call_fn3_i32_i64_i32(slow_helper);
+        return;
+    }
+    let target_addr = gen_fpu_st_addr(ctx, target_sti);
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let op_addr = gen_fpu_st_addr(ctx, sti);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    gen_fpu_relaxed_tag_ok(ctx, &op_addr);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    ctx.builder.const_i32(target_sti as i32);
+    gen_fpu_get_sti(ctx, sti);
+    ctx.builder.call_fn3_i32_i64_i32(slow_helper);
+    ctx.builder.else_();
+    gen_fpu_relaxed_load_binop_operands_sti(ctx, op, &st0_addr, &op_addr);
+    gen_fpu_apply_f64_binop(ctx, op);
+    gen_fpu_store_relaxed_f64(ctx, &target_addr);
+    ctx.builder.block_end();
+    ctx.builder.free_local(op_addr);
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(target_addr);
+}
+
+pub fn gen_fpu_relaxed_pop(ctx: &mut JitContext) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        ctx.builder.call_fn0("fpu_pop");
+        return;
+    }
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    let ptr_local = ctx.builder.set_new_local();
+    ctx.builder.const_i32(1);
+    ctx.builder.get_local(&ptr_local);
+    ctx.builder.shl_i32();
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder.or_i32();
+    let new_empty = ctx.builder.set_new_local();
+    ctx.builder.const_i32(global_pointers::fpu_stack_empty as i32);
+    ctx.builder.get_local(&new_empty);
+    ctx.builder.store_u8(0);
+
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.const_i32(1);
+    ctx.builder.add_i32();
+    ctx.builder.const_i32(7);
+    ctx.builder.and_i32();
+    let new_ptr = ctx.builder.set_new_local();
+    ctx.builder.const_i32(global_pointers::fpu_stack_ptr as i32);
+    ctx.builder.get_local(&new_ptr);
+    ctx.builder.store_u8(0);
+    ctx.builder.free_local(ptr_local);
+    ctx.builder.free_local(new_ptr);
+    ctx.builder.free_local(new_empty);
+}
+
+pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
+    // stack: i64 mantissa, i32 tag
+    if !crate::softfloat::is_fpu_relaxed() {
+        ctx.builder.call_fn2_i64_i32("fpu_push");
+        return;
+    }
+    let tag = ctx.builder.set_new_local();
+    let mantissa = ctx.builder.set_new_local_i64();
+
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.const_i32(1);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32(7);
+    ctx.builder.and_i32();
+    let new_ptr = ctx.builder.set_new_local();
+
+    ctx.builder.const_i32(global_pointers::fpu_stack_ptr as i32);
+    ctx.builder.get_local(&new_ptr);
+    ctx.builder.store_u8(0);
+
+    ctx.builder.const_i32(1);
+    ctx.builder.get_local(&new_ptr);
+    ctx.builder.shl_i32();
+    ctx.builder.const_i32(-1);
+    ctx.builder.xor_i32();
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder.and_i32();
+    let new_empty = ctx.builder.set_new_local();
+    ctx.builder.const_i32(global_pointers::fpu_stack_empty as i32);
+    ctx.builder.get_local(&new_empty);
+    ctx.builder.store_u8(0);
+
+    ctx.builder.get_local(&new_ptr);
+    ctx.builder.const_i32(16);
+    ctx.builder.mul_i32();
+    ctx.builder.const_i32(global_pointers::fpu_st as i32);
+    ctx.builder.add_i32();
+    let st_addr = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&st_addr);
+    ctx.builder.get_local_i64(&mantissa);
+    ctx.builder.store_unaligned_i64(0);
+    ctx.builder.get_local(&st_addr);
+    ctx.builder.get_local(&tag);
+    ctx.builder.store_unaligned_u16(8);
+
+    ctx.builder.free_local(st_addr);
+    ctx.builder.free_local(new_empty);
+    ctx.builder.free_local(new_ptr);
+    ctx.builder.free_local(tag);
+    ctx.builder.free_local_i64(mantissa);
+}
+
 pub fn gen_trigger_de(ctx: &mut JitContext) {
     gen_fn1_const(
         ctx.builder,

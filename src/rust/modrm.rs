@@ -8,6 +8,7 @@ use crate::regs::{BP, BX, DI, SI};
 use crate::regs::{CS, DS, ES, FS, GS, SS};
 use crate::regs::{EAX, EBP, EBX, ECX, EDI, EDX, ESI, ESP};
 
+#[derive(Clone)]
 pub struct ModrmByte {
     segment: u32,
     first_reg: Option<u32>,

@@ -39,6 +39,9 @@
 //!   0x1414: hc_slab_free_count  u32 — stats: frees returned to slab
 //!   0x1418: hc_slab_fallback_count u32 — stats: fallbacks to JS
 //!   0x1420: hc_slab_freelist    [u32; 9] — per-bin free list heads (bins: 16..4096)
+//!   0x1448: hc_event_table      [u8; 2048] — mirrored kernel event state (see EVT_* flags)
+//!   0x1C48: hc_event_starvation_counter u32 — consecutive WASM-handled SetEvent calls
+//!   0x1C4C: hc_event_starvation_limit   u32 — max consecutive before JS fallthrough
 
 use std::ptr::{addr_of, addr_of_mut};
 
@@ -96,6 +99,17 @@ const OFF_HC_SLAB_ALLOC_COUNT: usize = 0x1410;
 const OFF_HC_SLAB_FREE_COUNT: usize = 0x1414;
 const OFF_HC_SLAB_FALLBACK_COUNT: usize = 0x1418;
 const OFF_HC_SLAB_FREELIST: usize = 0x1420; // 9 × u32
+const OFF_HC_EVENT_TABLE: usize = 0x1448;
+const OFF_HC_EVENT_STARVATION_COUNTER: usize = 0x1C48;
+const OFF_HC_EVENT_STARVATION_LIMIT: usize = 0x1C4C;
+
+const KERNEL_HANDLE_BASE: u32 = 0x30000;
+const EVENT_TABLE_SLOTS: u32 = 2048;
+const EVT_VALID: u8 = 0x01;
+const EVT_SIGNALED: u8 = 0x02;
+const EVT_MANUAL: u8 = 0x04;
+const EVT_HAS_WAITERS: u8 = 0x08;
+const EVT_PENDING_WAKE: u8 = 0x10;
 
 const SLAB_MAGIC: u32 = 0x534C4100; // "SLA\0" with low nibble reserved for bin index
 const HEAP_ZERO_MEMORY_FLAG: u32 = 0x08;
@@ -222,6 +236,7 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         // Heap arena hypercalls (Tier 5)
         70 => handle_heap_alloc(),
         71 => handle_heap_free(),
+        72 => handle_set_event(),
         _ => false,
     };
 
@@ -1467,6 +1482,53 @@ unsafe fn handle_memcmp() -> bool {
 // ---------------------------------------------------------------------------
 // Tier 4: Scheduler hypercall handlers
 // ---------------------------------------------------------------------------
+
+/// SetEvent(hEvent) — stdcall(1).
+/// Fast path: valid mirrored event with no waiters → set signaled in shared table.
+/// Falls through to JS when waiters are present, handle is out of range, or
+/// periodic starvation limit is hit (scheduler/onThunkComplete hooks).
+unsafe fn handle_set_event() -> bool {
+    let esp = read_reg32(ESP);
+    let handle = match safe_read32s(esp + 4) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+
+    if handle < KERNEL_HANDLE_BASE {
+        return false;
+    }
+    let slot = (handle - KERNEL_HANDLE_BASE) >> 2;
+    if slot >= EVENT_TABLE_SLOTS {
+        return false;
+    }
+
+    let table_ptr = hp_mut().add(OFF_HC_EVENT_TABLE + slot as usize);
+    let flags = *table_ptr;
+    if flags & EVT_VALID == 0 {
+        return false;
+    }
+    if flags & EVT_HAS_WAITERS != 0 {
+        return false;
+    }
+
+    let counter_ptr = hp_mut().add(OFF_HC_EVENT_STARVATION_COUNTER) as *mut u32;
+    let counter = *counter_ptr;
+    let limit = *(hp_ptr().add(OFF_HC_EVENT_STARVATION_LIMIT) as *const u32);
+    if limit > 0 && counter >= limit {
+        *counter_ptr = 0;
+        return false;
+    }
+    *counter_ptr = counter + 1;
+
+    let mut new_flags = flags | EVT_SIGNALED;
+    if flags & EVT_MANUAL != 0 {
+        new_flags |= EVT_PENDING_WAKE;
+    }
+    *table_ptr = new_flags;
+
+    write_reg32(EAX, 1);
+    true
+}
 
 /// Sleep(dwMilliseconds) — stdcall(1).
 /// Fast path: Sleep(0) with no other runnable threads is a pure no-op.

@@ -3551,20 +3551,16 @@ pub fn instr_D8_1_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_D8_reg_jit(ctx, r, "fpu_fmul")
 }
 pub fn instr_D8_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_m32(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcom")
+    codegen::gen_fpu_relaxed_fcom_m32(ctx, modrm_byte, 0, "fpu_fcom")
 }
 pub fn instr_D8_2_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fpu_get_sti(ctx, r);
-    ctx.builder.call_fn2_i64_i32("fpu_fcom")
+    codegen::gen_fpu_relaxed_fcom_sti(ctx, r, 0, "fpu_fcom")
 }
 pub fn instr_D8_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_m32(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcomp")
+    codegen::gen_fpu_relaxed_fcom_m32(ctx, modrm_byte, 1, "fpu_fcomp")
 }
 pub fn instr_D8_3_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fpu_get_sti(ctx, r);
-    ctx.builder.call_fn2_i64_i32("fpu_fcomp")
+    codegen::gen_fpu_relaxed_fcom_sti(ctx, r, 1, "fpu_fcomp")
 }
 pub fn instr_D8_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     instr_group_D8_mem_jit(ctx, modrm_byte, "fpu_fsub")
@@ -3609,8 +3605,7 @@ pub fn instr16_D9_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr16_D9_1_reg_jit(ctx: &mut JitContext, r: u32) {
-    ctx.builder.const_i32(r as i32);
-    ctx.builder.call_fn1("fpu_fxch");
+    codegen::gen_fpu_relaxed_fxch(ctx, r);
 }
 pub fn instr32_D9_1_reg_jit(ctx: &mut JitContext, r: u32) { instr16_D9_1_reg_jit(ctx, r) }
 pub fn instr32_D9_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -3618,14 +3613,7 @@ pub fn instr32_D9_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 
 pub fn instr16_D9_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret("f80_to_f32");
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_safe_write32(ctx, &address_local, &value_local);
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local(value_local);
+    codegen::gen_fpu_relaxed_store_m32(ctx, modrm_byte, false);
 }
 pub fn instr16_D9_2_reg_jit(ctx: &mut JitContext, r: u32) {
     if r != 0 {
@@ -3638,18 +3626,10 @@ pub fn instr32_D9_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 
 pub fn instr16_D9_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret("f80_to_f32");
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_safe_write32(ctx, &address_local, &value_local);
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local(value_local);
-    codegen::gen_fn0_const(ctx.builder, "fpu_pop");
+    codegen::gen_fpu_relaxed_store_m32(ctx, modrm_byte, true);
 }
 pub fn instr16_D9_3_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fn1_const(ctx.builder, "fpu_fstp", r);
+    codegen::gen_fpu_relaxed_fst(ctx, r, true);
 }
 pub fn instr32_D9_3_reg_jit(ctx: &mut JitContext, r: u32) { instr16_D9_3_reg_jit(ctx, r) }
 pub fn instr32_D9_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -3676,7 +3656,8 @@ pub fn instr16_D9_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 pub fn instr16_D9_4_reg_jit(ctx: &mut JitContext, r: u32) {
     match r {
-        0 | 1 | 4 | 5 => {
+        0 | 1 => codegen::gen_fpu_relaxed_fchs_or_fabs(ctx, r),
+        4 | 5 => {
             ctx.builder.const_i32(r as i32);
             ctx.builder.call_fn1("instr16_D9_4_reg");
         },
@@ -3697,7 +3678,16 @@ pub fn instr16_D9_5_reg_jit(ctx: &mut JitContext, r: u32) {
         codegen::gen_trigger_ud(ctx);
     }
     else {
-        codegen::gen_fn1_const(ctx.builder, "instr16_D9_5_reg", r);
+        match r {
+            0 => codegen::gen_fpu_relaxed_push_const_f64(ctx, 1.0, r),
+            1 => codegen::gen_fpu_relaxed_push_const_f64(ctx, std::f64::consts::LOG2_10, r),
+            2 => codegen::gen_fpu_relaxed_push_const_f64(ctx, std::f64::consts::LOG2_E, r),
+            3 => codegen::gen_fpu_relaxed_push_const_f64(ctx, std::f64::consts::PI, r),
+            4 => codegen::gen_fpu_relaxed_push_const_f64(ctx, std::f64::consts::LOG10_2, r),
+            5 => codegen::gen_fpu_relaxed_push_const_f64(ctx, std::f64::consts::LN_2, r),
+            6 => codegen::gen_fpu_relaxed_push_const_f64(ctx, 0.0, r),
+            _ => codegen::gen_trigger_ud(ctx),
+        }
     }
 }
 pub fn instr32_D9_5_reg_jit(ctx: &mut JitContext, r: u32) { instr16_D9_5_reg_jit(ctx, r) }
@@ -3765,7 +3755,7 @@ pub fn instr_DA_3_reg_jit(ctx: &mut JitContext, r: u32) {
 pub fn instr_DA_4_reg_jit(ctx: &mut JitContext, _r: u32) { codegen::gen_trigger_ud(ctx) }
 pub fn instr_DA_5_reg_jit(ctx: &mut JitContext, r: u32) {
     if r == 1 {
-        codegen::gen_fn0_const(ctx.builder, "fpu_fucompp")
+        codegen::gen_fpu_relaxed_fucompp(ctx)
     }
     else {
         codegen::gen_trigger_ud(ctx)
@@ -3776,7 +3766,8 @@ pub fn instr_DA_7_reg_jit(ctx: &mut JitContext, _r: u32) { codegen::gen_trigger_
 
 pub fn instr_group_DA_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
     ctx.builder.const_i32(0);
-    codegen::gen_fpu_load_i32(ctx, modrm_byte);
+    // operand goes to the f80 helper, so load it as f80, not the relaxed form
+    codegen::gen_fpu_load_i32_f80(ctx, modrm_byte);
     ctx.builder.call_fn3_i32_i64_i32(op)
 }
 pub fn instr_DA_0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -3786,12 +3777,10 @@ pub fn instr_DA_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     instr_group_DA_mem_jit(ctx, modrm_byte, "fpu_fmul")
 }
 pub fn instr_DA_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_i32(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcom")
+    codegen::gen_fpu_relaxed_fcom_i32(ctx, modrm_byte, 0, "fpu_fcom")
 }
 pub fn instr_DA_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_i32(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcomp")
+    codegen::gen_fpu_relaxed_fcom_i32(ctx, modrm_byte, 1, "fpu_fcomp")
 }
 pub fn instr_DA_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     instr_group_DA_mem_jit(ctx, modrm_byte, "fpu_fsub")
@@ -3808,50 +3797,27 @@ pub fn instr_DA_7_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 
 pub fn instr_DB_0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_fpu_load_i32(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_push");
+    codegen::gen_fpu_relaxed_push_loaded(ctx);
 }
 pub fn instr_DB_0_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fn1_const(ctx.builder, "instr_DB_0_reg", r);
 }
 
 pub fn instr_DB_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret("fpu_truncate_to_i32");
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_safe_write32(ctx, &address_local, &value_local);
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local(value_local);
-    codegen::gen_fn0_const(ctx.builder, "fpu_pop");
+    codegen::gen_fpu_relaxed_fist_m32(ctx, modrm_byte, true, true);
 }
 pub fn instr_DB_1_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fn1_const(ctx.builder, "instr_DB_1_reg", r);
 }
 
 pub fn instr_DB_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret("fpu_convert_to_i32");
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_safe_write32(ctx, &address_local, &value_local);
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local(value_local);
+    codegen::gen_fpu_relaxed_fist_m32(ctx, modrm_byte, false, false);
 }
 pub fn instr_DB_2_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fn1_const(ctx.builder, "instr_DB_2_reg", r);
 }
 pub fn instr_DB_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret("fpu_convert_to_i32");
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_safe_write32(ctx, &address_local, &value_local);
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local(value_local);
-    codegen::gen_fn0_const(ctx.builder, "fpu_pop");
+    codegen::gen_fpu_relaxed_fist_m32(ctx, modrm_byte, true, false);
 }
 pub fn instr_DB_3_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fn1_const(ctx.builder, "instr_DB_3_reg", r);
@@ -3876,16 +3842,14 @@ pub fn instr_DB_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder.block_end();
 }
 pub fn instr_DB_5_reg_jit(ctx: &mut JitContext, r: u32) {
-    ctx.builder.const_i32(r as i32);
-    ctx.builder.call_fn1("fpu_fucomi");
+    codegen::gen_fpu_relaxed_fcomi(ctx, r, false, "fpu_fucomi");
 }
 
 pub fn instr_DB_6_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte) {
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr_DB_6_reg_jit(ctx: &mut JitContext, r: u32) {
-    ctx.builder.const_i32(r as i32);
-    ctx.builder.call_fn1("fpu_fcomi");
+    codegen::gen_fpu_relaxed_fcomi(ctx, r, false, "fpu_fcomi");
 }
 
 fn instr_group_DC_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
@@ -3908,20 +3872,16 @@ pub fn instr_DC_1_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_DC_reg_jit(ctx, r, "fpu_fmul")
 }
 pub fn instr_DC_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_m64(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcom")
+    codegen::gen_fpu_relaxed_fcom_m64(ctx, modrm_byte, 0, "fpu_fcom")
 }
 pub fn instr_DC_2_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fpu_get_sti(ctx, r);
-    ctx.builder.call_fn2_i64_i32("fpu_fcom")
+    codegen::gen_fpu_relaxed_fcom_sti(ctx, r, 0, "fpu_fcom")
 }
 pub fn instr_DC_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_m64(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcomp")
+    codegen::gen_fpu_relaxed_fcom_m64(ctx, modrm_byte, 1, "fpu_fcomp")
 }
 pub fn instr_DC_3_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fpu_get_sti(ctx, r);
-    ctx.builder.call_fn2_i64_i32("fpu_fcomp")
+    codegen::gen_fpu_relaxed_fcom_sti(ctx, r, 1, "fpu_fcomp")
 }
 pub fn instr_DC_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     instr_group_DC_mem_jit(ctx, modrm_byte, "fpu_fsub")
@@ -3972,7 +3932,7 @@ pub fn instr16_DD_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_fn0_const(ctx.builder, "fpu_pop");
 }
 pub fn instr16_DD_1_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fn1_const(ctx.builder, "fpu_fxch", r);
+    codegen::gen_fpu_relaxed_fxch(ctx, r);
 }
 pub fn instr32_DD_1_reg_jit(ctx: &mut JitContext, r: u32) { instr16_DD_1_reg_jit(ctx, r) }
 pub fn instr32_DD_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -3980,17 +3940,10 @@ pub fn instr32_DD_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 
 pub fn instr16_DD_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret_i64("f80_to_f64");
-    let value_local = ctx.builder.set_new_local_i64();
-    codegen::gen_safe_write64(ctx, &address_local, &value_local);
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local_i64(value_local);
+    codegen::gen_fpu_relaxed_store_m64(ctx, modrm_byte, false);
 }
 pub fn instr16_DD_2_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fn1_const(ctx.builder, "fpu_fst", r);
+    codegen::gen_fpu_relaxed_fst(ctx, r, false);
 }
 pub fn instr32_DD_2_reg_jit(ctx: &mut JitContext, r: u32) { instr16_DD_2_reg_jit(ctx, r) }
 pub fn instr32_DD_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -3998,18 +3951,10 @@ pub fn instr32_DD_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 
 pub fn instr16_DD_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret_i64("f80_to_f64");
-    let value_local = ctx.builder.set_new_local_i64();
-    codegen::gen_safe_write64(ctx, &address_local, &value_local);
-    codegen::gen_fn0_const(ctx.builder, "fpu_pop");
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local_i64(value_local);
+    codegen::gen_fpu_relaxed_store_m64(ctx, modrm_byte, true);
 }
 pub fn instr16_DD_3_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fn1_const(ctx.builder, "fpu_fstp", r);
+    codegen::gen_fpu_relaxed_fst(ctx, r, true);
 }
 pub fn instr32_DD_3_reg_jit(ctx: &mut JitContext, r: u32) { instr16_DD_3_reg_jit(ctx, r) }
 pub fn instr32_DD_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -4021,8 +3966,7 @@ pub fn instr16_DD_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr16_DD_5_reg_jit(ctx: &mut JitContext, r: u32) {
-    ctx.builder.const_i32(r as i32);
-    ctx.builder.call_fn1("fpu_fucomp");
+    codegen::gen_fpu_relaxed_fucom_sti(ctx, r, 1, "fpu_fucomp");
 }
 pub fn instr32_DD_5_reg_jit(ctx: &mut JitContext, r: u32) { instr16_DD_5_reg_jit(ctx, r) }
 pub fn instr32_DD_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -4031,7 +3975,8 @@ pub fn instr32_DD_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 
 fn instr_group_DE_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
     ctx.builder.const_i32(0);
-    codegen::gen_fpu_load_i16(ctx, modrm_byte);
+    // f80 operand for the helper (see DA group)
+    codegen::gen_fpu_load_i16_f80(ctx, modrm_byte);
     ctx.builder.call_fn3_i32_i64_i32(op)
 }
 fn instr_group_DE_reg_jit(ctx: &mut JitContext, r: u32, op: &str) {
@@ -4052,23 +3997,17 @@ pub fn instr_DE_1_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_DE_reg_jit(ctx, r, "fpu_fmul")
 }
 pub fn instr_DE_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_i16(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcom")
+    codegen::gen_fpu_relaxed_fcom_i16(ctx, modrm_byte, 0, "fpu_fcom")
 }
 pub fn instr_DE_2_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fpu_get_sti(ctx, r);
-    ctx.builder.call_fn2_i64_i32("fpu_fcom");
-    codegen::gen_fn0_const(ctx.builder, "fpu_pop")
+    codegen::gen_fpu_relaxed_fcom_sti(ctx, r, 1, "fpu_fcom")
 }
 pub fn instr_DE_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_i16(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcomp")
+    codegen::gen_fpu_relaxed_fcom_i16(ctx, modrm_byte, 1, "fpu_fcomp")
 }
 pub fn instr_DE_3_reg_jit(ctx: &mut JitContext, r: u32) {
     if r == 1 {
-        codegen::gen_fpu_get_sti(ctx, r);
-        ctx.builder.call_fn2_i64_i32("fpu_fcomp");
-        codegen::gen_fn0_const(ctx.builder, "fpu_pop")
+        codegen::gen_fpu_relaxed_fcom_sti(ctx, r, 2, "fpu_fcomp")
     }
     else {
         codegen::gen_trigger_ud(ctx);
@@ -4100,46 +4039,23 @@ pub fn instr_DE_7_reg_jit(ctx: &mut JitContext, r: u32) {
 }
 
 pub fn instr_DF_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret("fpu_truncate_to_i16");
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_safe_write16(ctx, &address_local, &value_local);
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local(value_local);
-    codegen::gen_fn0_const(ctx.builder, "fpu_pop");
+    codegen::gen_fpu_relaxed_fist_m16(ctx, modrm_byte, true, true);
 }
 pub fn instr_DF_1_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fn1_const(ctx.builder, "fpu_fxch", r);
+    codegen::gen_fpu_relaxed_fxch(ctx, r);
 }
 
 pub fn instr_DF_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret("fpu_convert_to_i16");
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_safe_write16(ctx, &address_local, &value_local);
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local(value_local);
+    codegen::gen_fpu_relaxed_fist_m16(ctx, modrm_byte, false, false);
 }
 pub fn instr_DF_2_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fn1_const(ctx.builder, "fpu_fstp", r);
+    codegen::gen_fpu_relaxed_fst(ctx, r, true);
 }
 pub fn instr_DF_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
-    codegen::gen_fpu_get_sti(ctx, 0);
-    ctx.builder.call_fn2_i64_i32_ret("fpu_convert_to_i16");
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_safe_write16(ctx, &address_local, &value_local);
-    ctx.builder.free_local(address_local);
-    ctx.builder.free_local(value_local);
-    codegen::gen_fn0_const(ctx.builder, "fpu_pop");
+    codegen::gen_fpu_relaxed_fist_m16(ctx, modrm_byte, true, false);
 }
 pub fn instr_DF_3_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fn1_const(ctx.builder, "fpu_fstp", r);
+    codegen::gen_fpu_relaxed_fst(ctx, r, true);
 }
 
 pub fn instr_DF_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -4159,10 +4075,10 @@ pub fn instr_DF_4_reg_jit(ctx: &mut JitContext, r: u32) {
 
 pub fn instr_DF_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_fpu_load_i64(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_push");
+    codegen::gen_fpu_relaxed_push_loaded(ctx);
 }
 pub fn instr_DF_5_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fn1_const(ctx.builder, "fpu_fucomip", r);
+    codegen::gen_fpu_relaxed_fcomi(ctx, r, true, "fpu_fucomip");
 }
 
 pub fn instr_DF_6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -4184,8 +4100,7 @@ pub fn instr_DF_6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder.block_end();
 }
 pub fn instr_DF_6_reg_jit(ctx: &mut JitContext, r: u32) {
-    ctx.builder.const_i32(r as i32);
-    ctx.builder.call_fn1("fpu_fcomip");
+    codegen::gen_fpu_relaxed_fcomi(ctx, r, true, "fpu_fcomip");
 }
 
 pub fn instr_DF_7_reg_jit(ctx: &mut JitContext, _r: u32) { codegen::gen_trigger_ud(ctx); }

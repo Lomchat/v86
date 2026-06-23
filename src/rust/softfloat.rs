@@ -18,9 +18,33 @@ pub extern "C" fn set_relaxed_fpu(enabled: u32) {
     unsafe { FPU_RELAXED = enabled != 0; }
 }
 
+#[no_mangle]
+pub extern "C" fn get_relaxed_fpu() -> u32 {
+    unsafe { FPU_RELAXED as u32 }
+}
+
 #[allow(dead_code)]
 pub fn is_fpu_relaxed() -> bool {
     unsafe { FPU_RELAXED }
+}
+
+/// When off (default), the relaxed fast path emits no hit/fallback counter increment.
+/// Toggle on (and clear the JIT cache so blocks recompile) only to measure hit-rate.
+static mut FPU_RELAXED_STATS: bool = false;
+
+#[no_mangle]
+pub extern "C" fn set_fpu_relaxed_stats(enabled: u32) {
+    unsafe { FPU_RELAXED_STATS = enabled != 0; }
+}
+
+#[no_mangle]
+pub extern "C" fn get_fpu_relaxed_stats() -> u32 {
+    unsafe { FPU_RELAXED_STATS as u32 }
+}
+
+#[allow(dead_code)]
+pub fn is_fpu_relaxed_stats() -> bool {
+    unsafe { FPU_RELAXED_STATS }
 }
 
 pub enum RoundingMode {

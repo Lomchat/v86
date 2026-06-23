@@ -32,6 +32,18 @@ const C64B    = DATA + 24;        // f64 1.25
 const ACC     = DATA + 32;        // f64 result slot
 const LAST    = DATA + 40;        // f32 scratch slot
 const C80     = DATA + 48;        // f80 1.5 (untagged when FLD'd)
+const CW_NEAR = DATA + 64;
+const CW_CEIL = DATA + 66;
+const CW_TRUNC = DATA + 68;
+const CW_FLOOR = DATA + 70;        // RC=01 (round down)
+const ROUND_POS = DATA + 80;      // f64 2.5
+const ROUND_NEG = DATA + 112;     // f64 -2.5
+const OUT0    = DATA + 96;
+const OUT1    = DATA + 100;
+const OUT2    = DATA + 104;
+const OUT3    = DATA + 108;
+const I16V    = DATA + 120;       // i16 7
+const I64V    = DATA + 128;       // i64 5
 
 function build_image(bodyName)
 {
@@ -59,6 +71,14 @@ function build_image(bodyName)
     dv.setUint32(C80 - BASE, 0, true);
     dv.setUint32(C80 - BASE + 4, 0xC0000000, true);
     dv.setUint16(C80 - BASE + 8, 0x3FFF, true);
+    dv.setUint16(CW_NEAR - BASE, 0x037F, true);
+    dv.setUint16(CW_CEIL - BASE, 0x0B7F, true);
+    dv.setUint16(CW_TRUNC - BASE, 0x0F7F, true);
+    dv.setUint16(CW_FLOOR - BASE, 0x077F, true);
+    dv.setFloat64(ROUND_POS - BASE, 2.5, true);
+    dv.setFloat64(ROUND_NEG - BASE, -2.5, true);
+    dv.setInt16(I16V - BASE, 7, true);
+    dv.setBigInt64(I64V - BASE, 5n, true);
 
     let o = ENTRY_OFF;
     const labels = {}, patches = [];
@@ -74,9 +94,42 @@ function build_image(bodyName)
     const fldsti  = (i) => emit(0xD9, 0xC0 + i);
     const fstp32  = (a) => { emit(0xD9, 0x1D); imm32(a); };
     const fstp64  = (a) => { emit(0xDD, 0x1D); imm32(a); };
+    const fist32  = (a) => { emit(0xDB, 0x15); imm32(a); };
+    const fldcw   = (a) => { emit(0xD9, 0x2D); imm32(a); };
     const d8mem   = (op, a) => { emit(0xD8, op); imm32(a); };   // op: 05 add, 0D mul, 25 sub, 2D subr, 35 div, 3D divr
     const dcmem   = (op, a) => { emit(0xDC, op); imm32(a); };
     const fxch1   = () => emit(0xD9, 0xC9);
+    const fcom1   = () => emit(0xD8, 0xD1);
+    const fnstsw_ax = () => emit(0xDF, 0xE0);
+    const fld1    = () => emit(0xD9, 0xE8);
+    const fldpi   = () => emit(0xD9, 0xEB);
+    const fldz    = () => emit(0xD9, 0xEE);
+    const fchs    = () => emit(0xD9, 0xE0);
+    const fabs    = () => emit(0xD9, 0xE1);
+    const faddp1  = () => emit(0xDE, 0xC1);
+    const fcomi1  = () => emit(0xDB, 0xF1);
+    const movEaxMem = (a) => { emit(0xA1); imm32(a); };
+    const movMemEax = (a) => { emit(0xA3); imm32(a); };
+    // --- additional emitters for the previously-untested new relaxed families ---
+    const fcom_m32  = (a) => { emit(0xD8, 0x15); imm32(a); };   // FCOM  m32
+    const fcomp_m32 = (a) => { emit(0xD8, 0x1D); imm32(a); };   // FCOMP m32
+    const fcom_m64  = (a) => { emit(0xDC, 0x15); imm32(a); };   // FCOM  m64
+    const fcomp_m64 = (a) => { emit(0xDC, 0x1D); imm32(a); };   // FCOMP m64
+    const fcom_i32  = (a) => { emit(0xDA, 0x15); imm32(a); };   // FICOM  m32int
+    const fcom_i16  = (a) => { emit(0xDE, 0x15); imm32(a); };   // FICOM  m16int
+    const fst_sti   = (i) => emit(0xDD, 0xD0 + i);             // FST  ST(i)
+    const fstp_sti  = (i) => emit(0xDD, 0xD8 + i);             // FSTP ST(i)
+    const fild16    = (a) => { emit(0xDF, 0x05); imm32(a); };   // FILD m16int
+    const fild64    = (a) => { emit(0xDF, 0x2D); imm32(a); };   // FILD m64int
+    const fist16    = (a) => { emit(0xDF, 0x15); imm32(a); };   // FIST m16int
+    const fistp16   = (a) => { emit(0xDF, 0x1D); imm32(a); };   // FISTP m16int
+    const fldl2t = () => emit(0xD9, 0xE9);
+    const fldl2e = () => emit(0xD9, 0xEA);
+    const fldlg2 = () => emit(0xD9, 0xEC);
+    const fldln2 = () => emit(0xD9, 0xED);
+    const fucomi1  = () => emit(0xDB, 0xE9);                    // FUCOMI  ST,ST(1)
+    const fucomip1 = () => emit(0xDF, 0xE9);                    // FUCOMIP ST,ST(1)
+    const fcomip1  = () => emit(0xDF, 0xF1);                    // FCOMIP  ST,ST(1)
 
     const bodies = {
         // inline pushes: FLD m32, FLD m64, FLD st(i); pops via helper FSTP
@@ -215,6 +268,172 @@ function build_image(bodyName)
             fstp64(ACC);
             fstp32(LAST);
         },
+        fxch_sticky() {
+            fild32(COUNTER);              // tagged int -> relaxed f64
+            fld32(C32);                   // tagged m32
+            fxch1();                      // must preserve tags
+            emit(0xD8, 0xC1);             // fadd st0,st1 should stay fast
+            fstp64(ACC);
+            fstp32(LAST);
+        },
+        fcom_sticky() {
+            fild32(COUNTER);
+            fld32(C32);
+            fcom1();                      // compare must not poison either slot
+            emit(0xD8, 0xC9);             // fmul st0,st1 should stay fast
+            fstp64(ACC);
+            fstp32(LAST);
+            fnstsw_ax();
+            movMemEax(LAST);
+        },
+        consts_sign() {
+            fld1();
+            fchs();
+            fabs();
+            fldpi();
+            faddp1();                     // st0 = pi + abs(-1)
+            fstp64(ACC);
+        },
+        fist_round() {
+            fld64(ROUND_POS);
+            fldcw(CW_NEAR);
+            fist32(OUT0);
+            movEaxMem(OUT0);
+            movMemEax(ACC);
+            fldcw(CW_CEIL);
+            fist32(OUT1);
+            movEaxMem(OUT1);
+            movMemEax(ACC + 4);
+            fldcw(CW_TRUNC);
+            fist32(OUT2);
+            movEaxMem(OUT2);
+            movMemEax(LAST);
+            fstp32(OUT3);
+            fldcw(CW_NEAR);
+        },
+        fcomi_flags() {
+            fldz();
+            fld1();
+            fcomi1();                     // st0=1 > st1=0, CF=ZF=PF=0
+            emit(0x31, 0xC0);             // xor eax,eax
+            emit(0x0F, 0x97, 0xC0);       // seta al
+            movMemEax(LAST);
+            fstp32(OUT0);
+            fstp32(OUT1);
+        },
+        // FIST of a negative value across the RC=01 (floor/down) mode the positive
+        // fist_round case never exercises. floor(-2.5)=-3 distinguishes it from
+        // nearest/ceil(-2.5)=-2, so a wrong RC-decode in the codegen diverges here.
+        fist_round_neg() {
+            fld64(ROUND_NEG);             // st0 = -2.5
+            fldcw(CW_FLOOR);
+            fist32(OUT0);                 // floor(-2.5) = -3
+            movEaxMem(OUT0);
+            movMemEax(ACC);
+            fldcw(CW_NEAR);
+            fist32(OUT1);                 // nearest-even(-2.5) = -2
+            movEaxMem(OUT1);
+            movMemEax(ACC + 4);
+            fldcw(CW_CEIL);
+            fist32(OUT2);                 // ceil(-2.5) = -2
+            movEaxMem(OUT2);
+            movMemEax(LAST);
+            fstp32(OUT3);                 // drop st0
+            fldcw(CW_NEAR);
+        },
+        // FCOM against MEMORY operands (m32/m64/m16int/m32int) — none of which the
+        // other variants exercise (they only do FCOM ST(i)). Each: push, compare, drain.
+        fcom_mem() {
+            fild32(COUNTER); fcomp_m64(C64); fnstsw_ax(); movMemEax(ACC + 4);   // FCOMP m64 (pops)
+            fild32(COUNTER); fcom_i16(I16V); fnstsw_ax(); movMemEax(LAST); fstp32(LAST); // FICOM m16
+            fild32(COUNTER); fcom_i32(COUNTER); fnstsw_ax(); movMemEax(ACC); fstp32(LAST); // FICOM m32
+            fild32(COUNTER); fcomp_m32(C32); fnstsw_ax();                       // FCOMP m32 (pops)
+        },
+        // FST / FSTP to a REGISTER (DD /2, DD /3 reg) — raw 16-byte slot copy path.
+        fst_reg() {
+            fild32(COUNTER);
+            fld32(C32);                   // [1.5, n]
+            fst_sti(1);                   // FST ST(1): [1.5, 1.5]
+            fstp_sti(1);                  // FSTP ST(1): [1.5]
+            fstp64(ACC);                  // ACC = 1.5, empty
+        },
+        // FILD m16int / m64int widths (only m32 was covered).
+        fild_widths() {
+            fild16(I16V);                 // FILD m16
+            fild64(I64V);                 // FILD m64
+            emit(0xDE, 0xC1);             // faddp -> i16 + i64
+            fstp64(ACC);
+        },
+        // FIST / FISTP m16int + the 16-bit clamp path.
+        fist16_round() {
+            fld64(ROUND_POS);             // 2.5
+            fldcw(CW_NEAR);
+            fist16(OUT0);                 // nearest-even(2.5) = 2
+            movEaxMem(OUT0);
+            movMemEax(ACC);
+            fistp16(OUT1);                // nearest(2.5)=2, pop
+            movEaxMem(OUT1);
+            movMemEax(ACC + 4);
+            fldcw(CW_NEAR);
+        },
+        // remaining FLD constants (l2t/l2e/lg2/ln2 — only 1/pi/z were covered).
+        consts_all() {
+            fldl2t(); fldl2e(); faddp1();
+            fldlg2(); faddp1();
+            fldln2(); faddp1();
+            fstp64(ACC);
+        },
+        // FUCOMI / FCOMIP / FUCOMIP eflags forms (only FCOMI was covered).
+        fcomi_more() {
+            fldz(); fld1(); fucomi1();    // FUCOMI ST,ST(1)
+            emit(0x9C); emit(0x58); movMemEax(ACC);   // pushfd; pop eax
+            fstp32(LAST); fstp32(LAST);
+            fldz(); fld1(); fcomip1();    // FCOMIP (pops 1)
+            emit(0x9C); emit(0x58); movMemEax(ACC + 4);
+            fstp32(LAST);
+            fldz(); fld1(); fucomip1();   // FUCOMIP (pops 1)
+            emit(0x9C); emit(0x58); movMemEax(LAST);
+            fstp32(LAST);
+        },
+        // Compiled-VC6-T&L-shaped mix: FILD/FLD/FMUL/FXCH/FADDP/FCOM-mem/FNSTSW/
+        // FDIV-mem/FST-reg/FSTP interleaved (closer to real engine code than the
+        // isolated patterns above; this is where the poison/structural bug should bite).
+        tl_mix() {
+            fild32(COUNTER);              // [n]
+            fld32(C32);                   // [1.5, n]
+            fld64(C64);                   // [.75, 1.5, n]
+            emit(0xD8, 0xC9);             // fmul st0,st1 -> [1.125, 1.5, n]
+            fxch1();                      // -> [1.5, 1.125, n]
+            emit(0xDE, 0xC1);             // faddp st1,st0 -> [2.625, n]
+            fcom_m64(C64);                // compare vs .75 (no pop)
+            fnstsw_ax(); movMemEax(LAST);
+            d8mem(0x35, C32);             // fdiv m32 -> [1.75, n]
+            fst_sti(1);                   // FST ST(1) -> [1.75, 1.75]
+            fstp64(ACC);                  // -> [1.75]
+            fstp64(OUT0);                 // -> empty
+        },
+        // FIADD/FIMUL/FISUB/FIDIV m32int (DA group): integer operand reaches the f80
+        // helper, so it must be loaded as f80 — relaxed mode used to emit the relaxed
+        // (f64-bits, RELAXED_TAG) form here, misread as a wild operand. Regression guard.
+        fiarith32() {
+            fild32(COUNTER);              // st0 = n (relaxed-tagged)
+            emit(0xDA, 0x05); imm32(COUNTER);  // FIADD m32 -> 2n
+            emit(0xDA, 0x0D); imm32(COUNTER);  // FIMUL m32 -> 2n*n
+            emit(0xDA, 0x25); imm32(COUNTER);  // FISUB m32
+            emit(0xDA, 0x35); imm32(COUNTER);  // FIDIV m32 (counter >= 1, never 0)
+            emit(0xDA, 0x3D); imm32(COUNTER);  // FIDIVR m32
+            fstp64(ACC);
+        },
+        // FIADD/FIMUL/FISUB/FIDIV m16int (DE group) — same f80-format requirement.
+        fiarith16() {
+            fild32(COUNTER);
+            emit(0xDE, 0x05); imm32(I16V);     // FIADD m16 (7)
+            emit(0xDE, 0x0D); imm32(I16V);     // FIMUL m16
+            emit(0xDE, 0x25); imm32(I16V);     // FISUB m16
+            emit(0xDE, 0x35); imm32(I16V);     // FIDIV m16
+            emit(0xDE, 0x2D); imm32(I16V);     // FISUBR m16
+            fstp64(ACC);
+        },
     };
 
     emit(0xBC); imm32(0x200000);          // mov esp, 0x200000
@@ -259,9 +478,13 @@ function run(bodyName, { jit, relaxed })
             clearTimeout(timer);
             try { emulator.stop(); } catch(e) {}
             const cpu = emulator.v86.cpu;
+            const ex = cpu.wm?.exports ?? {};
+            const hit = typeof ex.profiler_fpu_relaxed_hit_get === "function" ? Number(ex.profiler_fpu_relaxed_hit_get()) : 0;
+            const fallback = typeof ex.profiler_fpu_relaxed_fallback_get === "function" ? Number(ex.profiler_fpu_relaxed_fallback_get()) : 0;
             resolve({ status,
                       eax: cpu.reg32[0] >>> 0, ecx: cpu.reg32[1] >>> 0,
                       edx: cpu.reg32[2] >>> 0, ebx: cpu.reg32[3] >>> 0,
+                      hit, fallback,
                       eip: cpu.instruction_pointer[0] >>> 0 });
         };
         emulator.bus.register("cpu-event-halt", () => { halted = true; finish("halt"); });
@@ -270,28 +493,52 @@ function run(bodyName, { jit, relaxed })
             const setRelaxed = cpu.wm?.exports?.set_relaxed_fpu;
             if(!setRelaxed) { console.error("FATAL: set_relaxed_fpu export not found"); process.exit(2); }
             setRelaxed(relaxed ? 1 : 0);
+            cpu.wm?.exports?.set_fpu_relaxed_stats?.(1);   // counters are gated; enable for the diff harness
+            cpu.wm?.exports?.profiler_init?.();
             cpu.reboot_internal(); cpu.reset_memory();
             cpu.load_multiboot(img.buffer);
             setRelaxed(relaxed ? 1 : 0);   // re-assert in case reset touched it
+            cpu.wm?.exports?.set_fpu_relaxed_stats?.(1);
+            cpu.wm?.exports?.profiler_init?.();
             timer = setTimeout(() => { if(!halted) finish("HANG"); }, TIMEOUT_MS);
             emulator.run();
         });
     });
 }
 
-const fmt = (r) => `${r.status} acc=${r.ebx.toString(16).padStart(8,"0")}:${r.eax.toString(16).padStart(8,"0")} last=${r.ecx.toString(16).padStart(8,"0")} n=${r.edx}`;
+const fmt = (r) => `${r.status} acc=${r.ebx.toString(16).padStart(8,"0")}:${r.eax.toString(16).padStart(8,"0")} last=${r.ecx.toString(16).padStart(8,"0")} n=${r.edx} hit=${r.hit} fallback=${r.fallback}`;
 
-const variants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_sti", "m80_mem", "m80_pop", "m80_nopop", "tag_pop", "full"];
+const variants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_sti", "m80_mem", "m80_pop", "m80_nopop", "tag_pop", "full", "fxch_sticky", "fcom_sticky", "consts_sign", "fist_round", "fist_round_neg", "fcomi_flags",
+    // newly-covered families (previously untested, where Bug #2 is hypothesised to live)
+    "fcom_mem", "fst_reg", "fild_widths", "fist16_round", "consts_all", "fcomi_more", "tl_mix",
+    "fiarith32", "fiarith16"];
+// FCOM/FXCH between two relaxed values must not fall back to the helper (that re-poisons
+// the slot). Only meaningful in relaxed(1).
+const stickyVariants = ["fxch_sticky", "fcom_sticky"];
 let anyDiverged = false;
-for(const v of variants) {
-    const oracle  = await run(v, { jit:false, relaxed:true });
-    const suspect = await run(v, { jit:true,  relaxed:true });
-    const same = oracle.status === "halt" && suspect.status === "halt"
-              && oracle.eax === suspect.eax && oracle.ebx === suspect.ebx
-              && oracle.ecx === suspect.ecx && oracle.edx === suspect.edx;
-    if(!same) anyDiverged = true;
-    console.log(`${v.padEnd(6)} interp: ${fmt(oracle)}`);
-    console.log(`${"".padEnd(6)} jit   : ${fmt(suspect)}  ${same ? "OK" : "<<< DIVERGED"}`);
+// Run both modes: relaxed(1) = inline fast path, relaxed(0) = helper branch. A non-"halt"
+// status in either mode is a failure (a structural codegen bug hangs), not just a mismatch.
+for(const relaxed of [true, false]) {
+    console.log(`\n===== relaxed(${relaxed ? 1 : 0}) =====`);
+    for(const v of variants) {
+        const oracle  = await run(v, { jit:false, relaxed });
+        const suspect = await run(v, { jit:true,  relaxed });
+        const bothHalted = oracle.status === "halt" && suspect.status === "halt";
+        const same = bothHalted
+                  && oracle.eax === suspect.eax && oracle.ebx === suspect.ebx
+                  && oracle.ecx === suspect.ecx && oracle.edx === suspect.edx;
+        const stickyCountersOk = !relaxed || !stickyVariants.includes(v)
+                  || (suspect.hit > 0 && suspect.fallback === 0);
+        if(!same || !stickyCountersOk) anyDiverged = true;
+        console.log(`${v.padEnd(14)} interp: ${fmt(oracle)}`);
+        console.log(`${"".padEnd(14)} jit   : ${fmt(suspect)}  ${same && stickyCountersOk ? "OK" : "<<< DIVERGED"}`);
+        if(!bothHalted) {
+            console.log(`${"".padEnd(14)}       non-halt (hang/crash): interp=${oracle.status}@${oracle.eip.toString(16)} jit=${suspect.status}@${suspect.eip.toString(16)}`);
+        }
+        if(relaxed && stickyVariants.includes(v) && !stickyCountersOk) {
+            console.log(`${"".padEnd(14)}       expected ${v} to stay fully relaxed (hit>0 fallback=0)`);
+        }
+    }
 }
 console.log(anyDiverged ? "\nVERDICT: inline fast path DIVERGES from helpers" : "\nVERDICT: all variants match");
 process.exit(anyDiverged ? 1 : 0);

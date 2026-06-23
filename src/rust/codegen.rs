@@ -1,6 +1,6 @@
 use crate::cpu::cpu::{
-    tlb_data, FLAG_CARRY, FLAG_OVERFLOW, FLAG_SIGN, FLAG_ZERO, OPSIZE_16, OPSIZE_32, OPSIZE_8,
-    TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_USER, TLB_READONLY, TLB_VALID,
+    tlb_data, FLAGS_ALL, FLAG_CARRY, FLAG_OVERFLOW, FLAG_PARITY, FLAG_SIGN, FLAG_ZERO, OPSIZE_16,
+    OPSIZE_32, OPSIZE_8, TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_USER, TLB_READONLY, TLB_VALID,
 };
 use crate::cpu::global_pointers;
 use crate::cpu::memory;
@@ -2512,7 +2512,9 @@ pub fn gen_fpu_load_m64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     }
 }
 
-pub fn gen_fpu_load_i16(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+// Load an int memory operand as a real 80-bit value (mantissa i64, sign_exponent u16)
+// for the fpu_* helpers. Distinct from the relaxed (f64-bits, RELAXED_TAG) form below.
+pub fn gen_fpu_load_i16_f80(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder
         .const_i32(global_pointers::sse_scratch_register as i32);
     gen_modrm_resolve_safe_read16(ctx, modrm_byte);
@@ -2523,7 +2525,7 @@ pub fn gen_fpu_load_i16(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder
         .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
 }
-pub fn gen_fpu_load_i32(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+pub fn gen_fpu_load_i32_f80(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder
         .const_i32(global_pointers::sse_scratch_register as i32);
     gen_modrm_resolve_safe_read32(ctx, modrm_byte);
@@ -2533,7 +2535,7 @@ pub fn gen_fpu_load_i32(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder
         .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
 }
-pub fn gen_fpu_load_i64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+pub fn gen_fpu_load_i64_f80(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder
         .const_i32(global_pointers::sse_scratch_register as i32);
     gen_modrm_resolve_safe_read64(ctx, modrm_byte);
@@ -2544,11 +2546,51 @@ pub fn gen_fpu_load_i64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
         .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
 }
 
+// Relaxed mode: leave (f64-bits i64, RELAXED_TAG i32) for push_loaded / relaxed FICOM.
+// Strict mode: fall through to the f80 loaders above.
+pub fn gen_fpu_load_i16(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    if crate::softfloat::is_fpu_relaxed() {
+        gen_modrm_resolve_safe_read16(ctx, modrm_byte);
+        sign_extend_i16(ctx.builder);
+        ctx.builder.convert_i32_to_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.const_i32(FPU_RELAXED_TAG);
+        return;
+    }
+    gen_fpu_load_i16_f80(ctx, modrm_byte);
+}
+pub fn gen_fpu_load_i32(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    if crate::softfloat::is_fpu_relaxed() {
+        gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+        ctx.builder.convert_i32_to_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.const_i32(FPU_RELAXED_TAG);
+        return;
+    }
+    gen_fpu_load_i32_f80(ctx, modrm_byte);
+}
+pub fn gen_fpu_load_i64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    if crate::softfloat::is_fpu_relaxed() {
+        gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+        ctx.builder.convert_i64_to_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.const_i32(FPU_RELAXED_TAG);
+        return;
+    }
+    gen_fpu_load_i64_f80(ctx, modrm_byte);
+}
+
 // ── Relaxed FPU inline fast path (BottleShip plan B) ───────────────────────
 // Tag-check ST entries; fall back to fpu_* helpers on non-RELAXED_TAG values.
 // Skips stack-fault / status-word accumulation (same as relaxed softfloat).
 
 const FPU_RELAXED_TAG: i32 = 0x7FFE;
+const FPU_C0: i32 = 0x100;
+const FPU_C1: i32 = 0x200;
+const FPU_C2: i32 = 0x400;
+const FPU_C3: i32 = 0x4000;
+// includes C1: x87 FCOM clears C0/C1/C2/C3 (see cpu/fpu.rs FPU_RESULT_FLAGS)
+const FPU_RESULT_FLAGS: i32 = FPU_C0 | FPU_C1 | FPU_C2 | FPU_C3;
 
 #[derive(Copy, Clone)]
 pub enum FpuFastBinOp {
@@ -2581,10 +2623,35 @@ fn gen_fpu_relaxed_tag_ok(ctx: &mut JitContext, addr: &WasmLocal) {
     ctx.builder.eq_i32();
 }
 
+fn gen_fpu_relaxed_stat_increment(builder: &mut WasmBuilder, stat: profiler::stat) {
+    let addr = unsafe { &raw mut profiler::stat_array[stat as usize] } as u32;
+    builder.increment_fixed_i64(addr, 1);
+}
+
+fn gen_fpu_relaxed_record_hit(ctx: &mut JitContext) {
+    if !crate::softfloat::is_fpu_relaxed_stats() {
+        return;
+    }
+    gen_fpu_relaxed_stat_increment(ctx.builder, profiler::stat::FPU_RELAXED_HIT);
+}
+
+fn gen_fpu_relaxed_record_fallback(ctx: &mut JitContext) {
+    if !crate::softfloat::is_fpu_relaxed_stats() {
+        return;
+    }
+    gen_fpu_relaxed_stat_increment(ctx.builder, profiler::stat::FPU_RELAXED_FALLBACK);
+}
+
 fn gen_fpu_load_relaxed_f64(ctx: &mut JitContext, addr: &WasmLocal) {
     ctx.builder.get_local(addr);
     ctx.builder.load_unaligned_i64(0);
     ctx.builder.reinterpret_i64_as_f64();
+}
+
+fn gen_fpu_load_relaxed_f64_bits(ctx: &mut JitContext, addr: &WasmLocal) -> WasmLocalI64 {
+    ctx.builder.get_local(addr);
+    ctx.builder.load_unaligned_i64(0);
+    ctx.builder.set_new_local_i64()
 }
 
 fn gen_fpu_store_relaxed_f64(ctx: &mut JitContext, addr: &WasmLocal) {
@@ -2597,6 +2664,254 @@ fn gen_fpu_store_relaxed_f64(ctx: &mut JitContext, addr: &WasmLocal) {
     ctx.builder.const_i32(FPU_RELAXED_TAG);
     ctx.builder.store_unaligned_u16(8);
     ctx.builder.free_local_i64(bits);
+}
+
+fn gen_fpu_copy_raw(ctx: &mut JitContext, src_addr: &WasmLocal, dst_addr: &WasmLocal) {
+    ctx.builder.get_local(src_addr);
+    ctx.builder.load_unaligned_i64(0);
+    let lo = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local(src_addr);
+    ctx.builder.load_unaligned_i64(8);
+    let hi = ctx.builder.set_new_local_i64();
+
+    ctx.builder.get_local(dst_addr);
+    ctx.builder.get_local_i64(&lo);
+    ctx.builder.store_unaligned_i64(0);
+    ctx.builder.get_local(dst_addr);
+    ctx.builder.get_local_i64(&hi);
+    ctx.builder.store_unaligned_i64(8);
+
+    ctx.builder.free_local_i64(hi);
+    ctx.builder.free_local_i64(lo);
+}
+
+fn gen_fpu_relaxed_pop_n(ctx: &mut JitContext, count: u32) {
+    for _ in 0..count {
+        gen_fpu_relaxed_pop(ctx);
+    }
+}
+
+fn gen_fpu_load_m32_as_f64_bits(ctx: &mut JitContext, modrm_byte: ModrmByte) -> WasmLocalI64 {
+    gen_fpu_load_m32_as_f64(ctx, modrm_byte);
+    ctx.builder.reinterpret_f64_as_i64();
+    ctx.builder.set_new_local_i64()
+}
+
+fn gen_fpu_load_m64_as_f64_bits(ctx: &mut JitContext, modrm_byte: ModrmByte) -> WasmLocalI64 {
+    gen_fpu_load_m64_as_f64(ctx, modrm_byte);
+    ctx.builder.reinterpret_f64_as_i64();
+    ctx.builder.set_new_local_i64()
+}
+
+fn gen_fpu_load_i16_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    gen_modrm_resolve_safe_read16(ctx, modrm_byte);
+    sign_extend_i16(ctx.builder);
+    ctx.builder.convert_i32_to_f64();
+}
+
+fn gen_fpu_load_i32_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+    ctx.builder.convert_i32_to_f64();
+}
+
+fn gen_fpu_load_i16_as_f64_bits(ctx: &mut JitContext, modrm_byte: ModrmByte) -> WasmLocalI64 {
+    gen_fpu_load_i16_as_f64(ctx, modrm_byte);
+    ctx.builder.reinterpret_f64_as_i64();
+    ctx.builder.set_new_local_i64()
+}
+
+fn gen_fpu_load_i32_as_f64_bits(ctx: &mut JitContext, modrm_byte: ModrmByte) -> WasmLocalI64 {
+    gen_fpu_load_i32_as_f64(ctx, modrm_byte);
+    ctx.builder.reinterpret_f64_as_i64();
+    ctx.builder.set_new_local_i64()
+}
+
+fn gen_f64_is_nan(ctx: &mut JitContext, bits: &WasmLocalI64) {
+    ctx.builder.get_local_i64(bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.get_local_i64(bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.ne_f64();
+}
+
+fn gen_fpu_compare_flags(
+    ctx: &mut JitContext,
+    x_bits: &WasmLocalI64,
+    y_bits: &WasmLocalI64,
+    unordered_flags: i32,
+    less_flags: i32,
+    equal_flags: i32,
+) -> WasmLocal {
+    gen_f64_is_nan(ctx, x_bits);
+    gen_f64_is_nan(ctx, y_bits);
+    ctx.builder.or_i32();
+    ctx.builder.if_i32();
+    ctx.builder.const_i32(unordered_flags);
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(x_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.get_local_i64(y_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.lt_f64();
+    ctx.builder.if_i32();
+    ctx.builder.const_i32(less_flags);
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(x_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.get_local_i64(y_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.eq_f64();
+    ctx.builder.if_i32();
+    ctx.builder.const_i32(equal_flags);
+    ctx.builder.else_();
+    ctx.builder.const_i32(0);
+    ctx.builder.block_end();
+    ctx.builder.block_end();
+    ctx.builder.block_end();
+    ctx.builder.set_new_local()
+}
+
+fn gen_fpu_write_status_compare_flags(ctx: &mut JitContext, compare_flags: &WasmLocal) {
+    ctx.builder
+        .const_i32(global_pointers::fpu_status_word as i32);
+    ctx.builder
+        .load_fixed_u16(global_pointers::fpu_status_word as u32);
+    ctx.builder.const_i32(!FPU_RESULT_FLAGS);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(compare_flags);
+    ctx.builder.or_i32();
+    ctx.builder.store_aligned_u16(0);
+}
+
+fn gen_fpu_write_eflags_compare_flags(ctx: &mut JitContext, compare_flags: &WasmLocal) {
+    ctx.builder.const_i32(global_pointers::flags_changed as i32);
+    ctx.builder.const_i32(0);
+    ctx.builder.store_aligned_i32(0);
+
+    ctx.builder.const_i32(global_pointers::flags as i32);
+    ctx.builder.load_fixed_i32(global_pointers::flags as u32);
+    ctx.builder.const_i32(!FLAGS_ALL);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(compare_flags);
+    ctx.builder.or_i32();
+    ctx.builder.store_aligned_i32(0);
+}
+
+fn gen_fpu_compare_status_from_bits(
+    ctx: &mut JitContext,
+    x_bits: &WasmLocalI64,
+    y_bits: &WasmLocalI64,
+) {
+    let flags = gen_fpu_compare_flags(ctx, x_bits, y_bits, FPU_C0 | FPU_C2 | FPU_C3, FPU_C0, FPU_C3);
+    gen_fpu_write_status_compare_flags(ctx, &flags);
+    ctx.builder.free_local(flags);
+}
+
+fn gen_fpu_compare_eflags_from_bits(
+    ctx: &mut JitContext,
+    x_bits: &WasmLocalI64,
+    y_bits: &WasmLocalI64,
+) {
+    let flags = gen_fpu_compare_flags(
+        ctx,
+        x_bits,
+        y_bits,
+        FLAG_CARRY | FLAG_PARITY | FLAG_ZERO,
+        FLAG_CARRY,
+        FLAG_ZERO,
+    );
+    gen_fpu_write_eflags_compare_flags(ctx, &flags);
+    ctx.builder.free_local(flags);
+}
+
+fn gen_fpu_round_f64_bits_to_i32(ctx: &mut JitContext, bits: &WasmLocalI64, truncate: bool) {
+    if truncate {
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.trunc_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+    }
+    else {
+        ctx.builder.load_fixed_u16(global_pointers::fpu_control_word as u32);
+        ctx.builder.const_i32(10);
+        ctx.builder.shr_u_i32();
+        ctx.builder.const_i32(3);
+        ctx.builder.and_i32();
+        let rc = ctx.builder.set_new_local();
+
+        ctx.builder.get_local(&rc);
+        ctx.builder.const_i32(1);
+        ctx.builder.eq_i32();
+        ctx.builder.if_i64();
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.floor_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.else_();
+        ctx.builder.get_local(&rc);
+        ctx.builder.const_i32(2);
+        ctx.builder.eq_i32();
+        ctx.builder.if_i64();
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.ceil_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.else_();
+        ctx.builder.get_local(&rc);
+        ctx.builder.const_i32(3);
+        ctx.builder.eq_i32();
+        ctx.builder.if_i64();
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.trunc_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.else_();
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.nearest_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.block_end();
+        ctx.builder.block_end();
+        ctx.builder.block_end();
+
+        ctx.builder.free_local(rc);
+    }
+
+    let rounded_bits = ctx.builder.set_new_local_i64();
+    gen_f64_is_nan(ctx, &rounded_bits);
+    ctx.builder.get_local_i64(&rounded_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.const_f64(2147483648.0);
+    ctx.builder.ge_f64();
+    ctx.builder.or_i32();
+    ctx.builder.get_local_i64(&rounded_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.const_f64(-2147483648.0);
+    ctx.builder.lt_f64();
+    ctx.builder.or_i32();
+    ctx.builder.if_i32();
+    ctx.builder.const_i32(i32::MIN);
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(&rounded_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.trunc_s_f64_to_i32();
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(rounded_bits);
+}
+
+fn gen_fpu_clamp_i32_to_i16(ctx: &mut JitContext, value: &WasmLocal) {
+    ctx.builder.get_local(value);
+    ctx.builder.const_i32(-0x8000);
+    ctx.builder.lt_i32();
+    ctx.builder.get_local(value);
+    ctx.builder.const_i32(0x7FFF);
+    ctx.builder.gt_i32();
+    ctx.builder.or_i32();
+    ctx.builder.if_i32();
+    ctx.builder.const_i32(-0x8000);
+    ctx.builder.else_();
+    ctx.builder.get_local(value);
+    ctx.builder.block_end();
 }
 
 fn gen_fpu_apply_f64_binop(ctx: &mut JitContext, op: FpuFastBinOp) {
@@ -2691,10 +3006,12 @@ pub fn gen_fpu_relaxed_binop_m32(
     gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
     ctx.builder.eqz_i32();
     ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_load_m32(ctx, modrm_slow);
     ctx.builder.call_fn3_i32_i64_i32(slow_helper);
     ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
     gen_fpu_relaxed_load_binop_operands_m32(ctx, op, &st0_addr, modrm_byte);
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_relaxed_f64(ctx, &target_addr);
@@ -2722,10 +3039,12 @@ pub fn gen_fpu_relaxed_binop_m64(
     gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
     ctx.builder.eqz_i32();
     ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_load_m64(ctx, modrm_slow);
     ctx.builder.call_fn3_i32_i64_i32(slow_helper);
     ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
     gen_fpu_relaxed_load_binop_operands_m64(ctx, op, &st0_addr, modrm_byte);
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_relaxed_f64(ctx, &target_addr);
@@ -2755,10 +3074,12 @@ pub fn gen_fpu_relaxed_binop_sti(
     ctx.builder.and_i32();
     ctx.builder.eqz_i32();
     ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_get_sti(ctx, sti);
     ctx.builder.call_fn3_i32_i64_i32(slow_helper);
     ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
     gen_fpu_relaxed_load_binop_operands_sti(ctx, op, &st0_addr, &op_addr);
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_relaxed_f64(ctx, &target_addr);
@@ -2850,6 +3171,558 @@ pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
     ctx.builder.free_local(new_ptr);
     ctx.builder.free_local(tag);
     ctx.builder.free_local_i64(mantissa);
+}
+
+pub fn gen_fpu_relaxed_fxch(ctx: &mut JitContext, i: u32) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        ctx.builder.const_i32(i as i32);
+        ctx.builder.call_fn1("fpu_fxch");
+        return;
+    }
+
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let sti_addr = gen_fpu_st_addr(ctx, i);
+
+    ctx.builder.get_local(&st0_addr);
+    ctx.builder.load_unaligned_i64(0);
+    let st0_lo = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local(&st0_addr);
+    ctx.builder.load_unaligned_i64(8);
+    let st0_hi = ctx.builder.set_new_local_i64();
+
+    ctx.builder.get_local(&sti_addr);
+    ctx.builder.load_unaligned_i64(0);
+    let sti_lo = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local(&sti_addr);
+    ctx.builder.load_unaligned_i64(8);
+    let sti_hi = ctx.builder.set_new_local_i64();
+
+    ctx.builder.get_local(&st0_addr);
+    ctx.builder.get_local_i64(&sti_lo);
+    ctx.builder.store_unaligned_i64(0);
+    ctx.builder.get_local(&st0_addr);
+    ctx.builder.get_local_i64(&sti_hi);
+    ctx.builder.store_unaligned_i64(8);
+
+    ctx.builder.get_local(&sti_addr);
+    ctx.builder.get_local_i64(&st0_lo);
+    ctx.builder.store_unaligned_i64(0);
+    ctx.builder.get_local(&sti_addr);
+    ctx.builder.get_local_i64(&st0_hi);
+    ctx.builder.store_unaligned_i64(8);
+
+    ctx.builder.free_local_i64(sti_hi);
+    ctx.builder.free_local_i64(sti_lo);
+    ctx.builder.free_local_i64(st0_hi);
+    ctx.builder.free_local_i64(st0_lo);
+    ctx.builder.free_local(sti_addr);
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_fst(ctx: &mut JitContext, i: u32, pop: bool) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_fn1_const(ctx.builder, if pop { "fpu_fstp" } else { "fpu_fst" }, i);
+        return;
+    }
+
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let sti_addr = gen_fpu_st_addr(ctx, i);
+    gen_fpu_copy_raw(ctx, &st0_addr, &sti_addr);
+    if pop {
+        gen_fpu_relaxed_pop(ctx);
+    }
+    ctx.builder.free_local(sti_addr);
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_fchs_or_fabs(ctx: &mut JitContext, r: u32) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        ctx.builder.const_i32(r as i32);
+        ctx.builder.call_fn1("instr16_D9_4_reg");
+        return;
+    }
+
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    ctx.builder.const_i32(r as i32);
+    ctx.builder.call_fn1("instr16_D9_4_reg");
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    gen_fpu_load_relaxed_f64(ctx, &st0_addr);
+    if r == 0 {
+        ctx.builder.neg_f64();
+    }
+    else {
+        ctx.builder.abs_f64();
+    }
+    gen_fpu_store_relaxed_f64(ctx, &st0_addr);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_push_const_f64(ctx: &mut JitContext, value: f64, slow_r: u32) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_fn1_const(ctx.builder, "instr16_D9_5_reg", slow_r);
+        return;
+    }
+
+    ctx.builder.const_f64(value);
+    ctx.builder.reinterpret_f64_as_i64();
+    ctx.builder.const_i32(FPU_RELAXED_TAG);
+    gen_fpu_relaxed_push_loaded(ctx);
+}
+
+pub fn gen_fpu_relaxed_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_modrm_resolve(ctx, modrm_byte);
+        let address_local = ctx.builder.set_new_local();
+        gen_fpu_get_sti(ctx, 0);
+        ctx.builder.call_fn2_i64_i32_ret("f80_to_f32");
+        let value_local = ctx.builder.set_new_local();
+        gen_safe_write32(ctx, &address_local, &value_local);
+        ctx.builder.free_local(address_local);
+        ctx.builder.free_local(value_local);
+        if pop {
+            ctx.builder.call_fn0("fpu_pop");
+        }
+        return;
+    }
+
+    gen_modrm_resolve(ctx, modrm_byte);
+    let address_local = ctx.builder.set_new_local();
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_get_sti(ctx, 0);
+    ctx.builder.call_fn2_i64_i32_ret("f80_to_f32");
+    let slow_value = ctx.builder.set_new_local();
+    gen_safe_write32(ctx, &address_local, &slow_value);
+    ctx.builder.free_local(slow_value);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    gen_fpu_load_relaxed_f64(ctx, &st0_addr);
+    ctx.builder.demote_f64_to_f32();
+    ctx.builder.reinterpret_f32_as_i32();
+    let fast_value = ctx.builder.set_new_local();
+    gen_safe_write32(ctx, &address_local, &fast_value);
+    ctx.builder.free_local(fast_value);
+    ctx.builder.block_end();
+    if pop {
+        gen_fpu_relaxed_pop(ctx);
+    }
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(address_local);
+}
+
+pub fn gen_fpu_relaxed_store_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_modrm_resolve(ctx, modrm_byte);
+        let address_local = ctx.builder.set_new_local();
+        gen_fpu_get_sti(ctx, 0);
+        ctx.builder.call_fn2_i64_i32_ret_i64("f80_to_f64");
+        let value_local = ctx.builder.set_new_local_i64();
+        gen_safe_write64(ctx, &address_local, &value_local);
+        ctx.builder.free_local(address_local);
+        ctx.builder.free_local_i64(value_local);
+        if pop {
+            ctx.builder.call_fn0("fpu_pop");
+        }
+        return;
+    }
+
+    gen_modrm_resolve(ctx, modrm_byte);
+    let address_local = ctx.builder.set_new_local();
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_get_sti(ctx, 0);
+    ctx.builder.call_fn2_i64_i32_ret_i64("f80_to_f64");
+    let slow_value = ctx.builder.set_new_local_i64();
+    gen_safe_write64(ctx, &address_local, &slow_value);
+    ctx.builder.free_local_i64(slow_value);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let fast_value = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    gen_safe_write64(ctx, &address_local, &fast_value);
+    ctx.builder.free_local_i64(fast_value);
+    ctx.builder.block_end();
+    if pop {
+        gen_fpu_relaxed_pop(ctx);
+    }
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(address_local);
+}
+
+pub fn gen_fpu_relaxed_fist_m32(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    pop: bool,
+    truncate: bool,
+) {
+    let helper = if truncate { "fpu_truncate_to_i32" } else { "fpu_convert_to_i32" };
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_modrm_resolve(ctx, modrm_byte);
+        let address_local = ctx.builder.set_new_local();
+        gen_fpu_get_sti(ctx, 0);
+        ctx.builder.call_fn2_i64_i32_ret(helper);
+        let value_local = ctx.builder.set_new_local();
+        gen_safe_write32(ctx, &address_local, &value_local);
+        ctx.builder.free_local(address_local);
+        ctx.builder.free_local(value_local);
+        if pop {
+            ctx.builder.call_fn0("fpu_pop");
+        }
+        return;
+    }
+
+    gen_modrm_resolve(ctx, modrm_byte);
+    let address_local = ctx.builder.set_new_local();
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_get_sti(ctx, 0);
+    ctx.builder.call_fn2_i64_i32_ret(helper);
+    let slow_value = ctx.builder.set_new_local();
+    gen_safe_write32(ctx, &address_local, &slow_value);
+    ctx.builder.free_local(slow_value);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    gen_fpu_round_f64_bits_to_i32(ctx, &bits, truncate);
+    let fast_value = ctx.builder.set_new_local();
+    gen_safe_write32(ctx, &address_local, &fast_value);
+    ctx.builder.free_local(fast_value);
+    ctx.builder.free_local_i64(bits);
+    ctx.builder.block_end();
+    if pop {
+        gen_fpu_relaxed_pop(ctx);
+    }
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(address_local);
+}
+
+pub fn gen_fpu_relaxed_fist_m16(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    pop: bool,
+    truncate: bool,
+) {
+    let helper = if truncate { "fpu_truncate_to_i16" } else { "fpu_convert_to_i16" };
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_modrm_resolve(ctx, modrm_byte);
+        let address_local = ctx.builder.set_new_local();
+        gen_fpu_get_sti(ctx, 0);
+        ctx.builder.call_fn2_i64_i32_ret(helper);
+        let value_local = ctx.builder.set_new_local();
+        gen_safe_write16(ctx, &address_local, &value_local);
+        ctx.builder.free_local(address_local);
+        ctx.builder.free_local(value_local);
+        if pop {
+            ctx.builder.call_fn0("fpu_pop");
+        }
+        return;
+    }
+
+    gen_modrm_resolve(ctx, modrm_byte);
+    let address_local = ctx.builder.set_new_local();
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_get_sti(ctx, 0);
+    ctx.builder.call_fn2_i64_i32_ret(helper);
+    let slow_value = ctx.builder.set_new_local();
+    gen_safe_write16(ctx, &address_local, &slow_value);
+    ctx.builder.free_local(slow_value);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    gen_fpu_round_f64_bits_to_i32(ctx, &bits, truncate);
+    let rounded = ctx.builder.set_new_local();
+    gen_fpu_clamp_i32_to_i16(ctx, &rounded);
+    let fast_value = ctx.builder.set_new_local();
+    gen_safe_write16(ctx, &address_local, &fast_value);
+    ctx.builder.free_local(fast_value);
+    ctx.builder.free_local(rounded);
+    ctx.builder.free_local_i64(bits);
+    ctx.builder.block_end();
+    if pop {
+        gen_fpu_relaxed_pop(ctx);
+    }
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(address_local);
+}
+
+pub fn gen_fpu_relaxed_fcom_sti(
+    ctx: &mut JitContext,
+    i: u32,
+    pop_count: u32,
+    slow_helper: &str,
+) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_fpu_get_sti(ctx, i);
+        ctx.builder.call_fn2_i64_i32(slow_helper);
+        let helper_pops = if slow_helper == "fpu_fcomp" { 1 } else { 0 };
+        if pop_count > helper_pops {
+            for _ in 0..(pop_count - helper_pops) {
+                gen_fn0_const(ctx.builder, "fpu_pop");
+            }
+        }
+        return;
+    }
+
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let sti_addr = gen_fpu_st_addr(ctx, i);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    gen_fpu_relaxed_tag_ok(ctx, &sti_addr);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_get_sti(ctx, i);
+    ctx.builder.call_fn2_i64_i32(slow_helper);
+    let helper_pops = if slow_helper == "fpu_fcomp" { 1 } else { 0 };
+    if pop_count > helper_pops {
+        for _ in 0..(pop_count - helper_pops) {
+            gen_fn0_const(ctx.builder, "fpu_pop");
+        }
+    }
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let x_bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    let y_bits = gen_fpu_load_relaxed_f64_bits(ctx, &sti_addr);
+    gen_fpu_compare_status_from_bits(ctx, &x_bits, &y_bits);
+    ctx.builder.free_local_i64(y_bits);
+    ctx.builder.free_local_i64(x_bits);
+    gen_fpu_relaxed_pop_n(ctx, pop_count);
+    ctx.builder.block_end();
+    ctx.builder.free_local(sti_addr);
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_fcom_m32(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    pop_count: u32,
+    slow_helper: &str,
+) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_fpu_load_m32(ctx, modrm_byte);
+        ctx.builder.call_fn2_i64_i32(slow_helper);
+        return;
+    }
+    let modrm_slow = modrm_byte.clone();
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_load_m32(ctx, modrm_slow);
+    ctx.builder.call_fn2_i64_i32(slow_helper);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let x_bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    let y_bits = gen_fpu_load_m32_as_f64_bits(ctx, modrm_byte);
+    gen_fpu_compare_status_from_bits(ctx, &x_bits, &y_bits);
+    ctx.builder.free_local_i64(y_bits);
+    ctx.builder.free_local_i64(x_bits);
+    gen_fpu_relaxed_pop_n(ctx, pop_count);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_fcom_m64(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    pop_count: u32,
+    slow_helper: &str,
+) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_fpu_load_m64(ctx, modrm_byte);
+        ctx.builder.call_fn2_i64_i32(slow_helper);
+        return;
+    }
+    let modrm_slow = modrm_byte.clone();
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_load_m64(ctx, modrm_slow);
+    ctx.builder.call_fn2_i64_i32(slow_helper);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let x_bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    let y_bits = gen_fpu_load_m64_as_f64_bits(ctx, modrm_byte);
+    gen_fpu_compare_status_from_bits(ctx, &x_bits, &y_bits);
+    ctx.builder.free_local_i64(y_bits);
+    ctx.builder.free_local_i64(x_bits);
+    gen_fpu_relaxed_pop_n(ctx, pop_count);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_fcom_i16(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    pop_count: u32,
+    slow_helper: &str,
+) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_fpu_load_i16(ctx, modrm_byte);
+        ctx.builder.call_fn2_i64_i32(slow_helper);
+        return;
+    }
+    let modrm_slow = modrm_byte.clone();
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_load_i16(ctx, modrm_slow);
+    ctx.builder.call_fn2_i64_i32(slow_helper);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let x_bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    let y_bits = gen_fpu_load_i16_as_f64_bits(ctx, modrm_byte);
+    gen_fpu_compare_status_from_bits(ctx, &x_bits, &y_bits);
+    ctx.builder.free_local_i64(y_bits);
+    ctx.builder.free_local_i64(x_bits);
+    gen_fpu_relaxed_pop_n(ctx, pop_count);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_fcom_i32(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    pop_count: u32,
+    slow_helper: &str,
+) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_fpu_load_i32(ctx, modrm_byte);
+        ctx.builder.call_fn2_i64_i32(slow_helper);
+        return;
+    }
+    let modrm_slow = modrm_byte.clone();
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_load_i32(ctx, modrm_slow);
+    ctx.builder.call_fn2_i64_i32(slow_helper);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let x_bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    let y_bits = gen_fpu_load_i32_as_f64_bits(ctx, modrm_byte);
+    gen_fpu_compare_status_from_bits(ctx, &x_bits, &y_bits);
+    ctx.builder.free_local_i64(y_bits);
+    ctx.builder.free_local_i64(x_bits);
+    gen_fpu_relaxed_pop_n(ctx, pop_count);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_fucom_sti(
+    ctx: &mut JitContext,
+    i: u32,
+    pop_count: u32,
+    slow_helper: &str,
+) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_fn1_const(ctx.builder, slow_helper, i);
+        return;
+    }
+
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let sti_addr = gen_fpu_st_addr(ctx, i);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    gen_fpu_relaxed_tag_ok(ctx, &sti_addr);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fn1_const(ctx.builder, slow_helper, i);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let x_bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    let y_bits = gen_fpu_load_relaxed_f64_bits(ctx, &sti_addr);
+    gen_fpu_compare_status_from_bits(ctx, &x_bits, &y_bits);
+    ctx.builder.free_local_i64(y_bits);
+    ctx.builder.free_local_i64(x_bits);
+    gen_fpu_relaxed_pop_n(ctx, pop_count);
+    ctx.builder.block_end();
+    ctx.builder.free_local(sti_addr);
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_fucompp(ctx: &mut JitContext) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        ctx.builder.call_fn0("fpu_fucompp");
+        return;
+    }
+
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let st1_addr = gen_fpu_st_addr(ctx, 1);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    gen_fpu_relaxed_tag_ok(ctx, &st1_addr);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    ctx.builder.call_fn0("fpu_fucompp");
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let x_bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    let y_bits = gen_fpu_load_relaxed_f64_bits(ctx, &st1_addr);
+    gen_fpu_compare_status_from_bits(ctx, &x_bits, &y_bits);
+    ctx.builder.free_local_i64(y_bits);
+    ctx.builder.free_local_i64(x_bits);
+    gen_fpu_relaxed_pop_n(ctx, 2);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st1_addr);
+    ctx.builder.free_local(st0_addr);
+}
+
+pub fn gen_fpu_relaxed_fcomi(ctx: &mut JitContext, i: u32, pop: bool, slow_helper: &str) {
+    if !crate::softfloat::is_fpu_relaxed() {
+        gen_fn1_const(ctx.builder, slow_helper, i);
+        return;
+    }
+
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let sti_addr = gen_fpu_st_addr(ctx, i);
+    gen_fpu_relaxed_tag_ok(ctx, &st0_addr);
+    gen_fpu_relaxed_tag_ok(ctx, &sti_addr);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fn1_const(ctx.builder, slow_helper, i);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let x_bits = gen_fpu_load_relaxed_f64_bits(ctx, &st0_addr);
+    let y_bits = gen_fpu_load_relaxed_f64_bits(ctx, &sti_addr);
+    gen_fpu_compare_eflags_from_bits(ctx, &x_bits, &y_bits);
+    ctx.builder.free_local_i64(y_bits);
+    ctx.builder.free_local_i64(x_bits);
+    if pop {
+        gen_fpu_relaxed_pop(ctx);
+    }
+    ctx.builder.block_end();
+    ctx.builder.free_local(sti_addr);
+    ctx.builder.free_local(st0_addr);
 }
 
 pub fn gen_trigger_de(ctx: &mut JitContext) {

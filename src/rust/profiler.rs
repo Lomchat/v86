@@ -118,6 +118,9 @@ pub enum stat {
     SEG_OFFSET_NOT_OPTIMISED_FS,
     SEG_OFFSET_NOT_OPTIMISED_GS,
     SEG_OFFSET_NOT_OPTIMISED_NOT_FLAT,
+
+    FPU_RELAXED_HIT,
+    FPU_RELAXED_FALLBACK,
 }
 
 #[allow(non_upper_case_globals)]
@@ -130,6 +133,8 @@ pub fn stat_increment_by(stat: stat, by: u64) {
         unsafe { stat_array[stat as usize] += by }
     }
 }
+
+pub fn stat_increment_always(stat: stat) { unsafe { stat_array[stat as usize] += 1 } }
 
 #[no_mangle]
 pub fn profiler_init() {
@@ -153,3 +158,13 @@ pub fn profiler_stat_get(stat: stat) -> f64 {
 
 #[no_mangle]
 pub fn profiler_is_enabled() -> bool { cfg!(feature = "profiler") }
+
+#[no_mangle]
+pub fn profiler_fpu_relaxed_hit_get() -> f64 {
+    unsafe { stat_array[stat::FPU_RELAXED_HIT as usize] as f64 }
+}
+
+#[no_mangle]
+pub fn profiler_fpu_relaxed_fallback_get() -> f64 {
+    unsafe { stat_array[stat::FPU_RELAXED_FALLBACK as usize] as f64 }
+}

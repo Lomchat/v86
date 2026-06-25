@@ -121,6 +121,30 @@ pub enum stat {
 
     FPU_RELAXED_HIT,
     FPU_RELAXED_FALLBACK,
+
+    // Block-chaining Phase 0 — dispatch characterisation (see plan/block-chaining.md).
+    // These are ALWAYS-ON counters (incremented via increment_fixed_i64 in compiled code and
+    // stat_increment_always at runtime), gated only by the jit::DISPATCH_STATS toggle so they
+    // work WITHOUT the `profiler` feature. Read them through profiler_dispatch_stat_get below
+    // (NOT profiler_stat_get, which returns 0 unless the profiler feature is compiled in).
+    //
+    //   BLOCK_EXECUTION       — every compiled basic-block execution (entry + intra-module).
+    //   MODULE_REENTRY        — every return to main_loop after a compiled module ran.
+    //   MODULE_EXIT_CHAINABLE — module exit whose successor eip is a compile-time constant
+    //                           (direct JMP / conditional JMP leaving the module). Phase-1
+    //                           tail-call chaining can target exactly these.
+    //   MODULE_EXIT_DYNAMIC   — module exit whose eip is computed at runtime by the block's
+    //                           terminating instruction (ret / int / iret / far jmp, sti).
+    //   MODULE_EXIT_INDIRECT  — indirect jmp/call (AbsoluteEip) whose target is not in this
+    //                           module. Not statically chainable.
+    //
+    // Derived in the readout: INTRA_MODULE_EDGE = BLOCK_EXECUTION - MODULE_REENTRY, and the
+    // headline number CHAINABLE_FRACTION = MODULE_EXIT_CHAINABLE / MODULE_REENTRY.
+    BLOCK_EXECUTION,
+    MODULE_REENTRY,
+    MODULE_EXIT_CHAINABLE,
+    MODULE_EXIT_DYNAMIC,
+    MODULE_EXIT_INDIRECT,
 }
 
 #[allow(non_upper_case_globals)]
@@ -167,4 +191,20 @@ pub fn profiler_fpu_relaxed_hit_get() -> f64 {
 #[no_mangle]
 pub fn profiler_fpu_relaxed_fallback_get() -> f64 {
     unsafe { stat_array[stat::FPU_RELAXED_FALLBACK as usize] as f64 }
+}
+
+// Block-chaining Phase 0 readout. Reads the dispatch-characterisation counters directly out of
+// stat_array regardless of the `profiler` feature (unlike profiler_stat_get). Index order:
+// 0=BLOCK_EXECUTION 1=MODULE_REENTRY 2=MODULE_EXIT_CHAINABLE 3=MODULE_EXIT_DYNAMIC 4=MODULE_EXIT_INDIRECT.
+#[no_mangle]
+pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
+    let stat = match index {
+        0 => stat::BLOCK_EXECUTION,
+        1 => stat::MODULE_REENTRY,
+        2 => stat::MODULE_EXIT_CHAINABLE,
+        3 => stat::MODULE_EXIT_DYNAMIC,
+        4 => stat::MODULE_EXIT_INDIRECT,
+        _ => return 0.0,
+    };
+    unsafe { stat_array[stat as usize] as f64 }
 }

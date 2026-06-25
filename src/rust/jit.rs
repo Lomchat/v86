@@ -72,6 +72,21 @@ static mut JIT_USE_LOOP_SAFETY: bool = true;
 
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
+// Block-chaining Phase 0 — dispatch characterisation toggle (see plan/block-chaining.md).
+// When enabled, the JIT emits the always-on dispatch-characterisation counters (BLOCK_EXECUTION
+// and MODULE_EXIT_*) and the runtime increments MODULE_REENTRY / MODULE_EXIT_INDIRECT. The
+// codegen-emitted counters are gated at COMPILE time, so enable this BEFORE the workload compiles
+// its hot modules (set_dispatch_stats(1) at boot, then clear the JIT cache) and read the result
+// via profiler_dispatch_stat_get. OFF by default — zero cost on the production path.
+pub static mut DISPATCH_STATS: bool = false;
+pub fn dispatch_stats_enabled() -> bool { unsafe { DISPATCH_STATS } }
+
+#[no_mangle]
+pub fn set_dispatch_stats(enabled: u32) { unsafe { DISPATCH_STATS = enabled != 0; } }
+
+#[no_mangle]
+pub fn get_dispatch_stats() -> u32 { unsafe { DISPATCH_STATS as u32 } }
+
 pub const JIT_THRESHOLD: u32 = 200 * 1000;
 
 // less branches will generate if-else, more will generate brtable
@@ -395,6 +410,12 @@ pub fn jit_find_cache_entry_in_page(
     }
 
     profiler::stat_increment(stat::INDIRECT_JUMP_NO_ENTRY);
+
+    // Block-chaining Phase 0: an indirect jmp/call (AbsoluteEip) whose target is not in this
+    // module → real exit to main_loop. eip was computed at runtime, so not statically chainable.
+    if dispatch_stats_enabled() {
+        profiler::stat_increment_always(stat::MODULE_EXIT_INDIRECT);
+    }
 
     return -1;
 }
@@ -1319,6 +1340,9 @@ fn jit_generate_module(
                         BasicBlockType::AbsoluteEip => {},
                     };
                     codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
+                    // Phase 0: STI forces a module exit (one instruction must run before handle_irqs).
+                    // Not a chainable dispatch — count as dynamic.
+                    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_DYNAMIC);
                     codegen::gen_move_registers_from_locals_to_memory(ctx);
                     codegen::gen_fn0_const(ctx.builder, "handle_irqs");
                     codegen::gen_update_instruction_counter(ctx);
@@ -1331,6 +1355,8 @@ fn jit_generate_module(
                         // Exit this function
                         codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
+                        // Phase 0: terminating instruction set eip at runtime (ret/int/iret/far jmp)
+                        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_DYNAMIC);
                         ctx.builder.br(ctx.exit_label);
                     },
                     BasicBlockType::AbsoluteEip => {
@@ -1370,6 +1396,9 @@ fn jit_generate_module(
 
                         codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
+                        // Phase 0: direct unconditional JMP whose target is outside this module —
+                        // successor eip is a compile-time constant (jump_offset). Chainable.
+                        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
                         ctx.builder.br(ctx.exit_label);
                     },
                     &BasicBlockType::Normal {
@@ -1673,6 +1702,12 @@ fn jit_generate_module(
                                 codegen::gen_profiler_stat_increment(
                                     ctx.builder,
                                     stat::CONDITIONAL_JUMP_EXIT,
+                                );
+                                // Phase 0: conditional JMP leaving the module — successor eip is a
+                                // compile-time constant (taken=jump_offset, not-taken=end_addr). Chainable.
+                                codegen::gen_dispatch_stat_increment(
+                                    ctx.builder,
+                                    stat::MODULE_EXIT_CHAINABLE,
                                 );
                                 ctx.builder.br(ctx.exit_label);
 
@@ -2024,6 +2059,11 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
     ctx.builder.const_i32(block.number_of_instructions as i32);
     ctx.builder.add_i32();
     ctx.builder.set_local(&ctx.instruction_counter);
+
+    // Block-chaining Phase 0: count every basic-block execution. INTRA_MODULE_EDGE is derived as
+    // BLOCK_EXECUTION - MODULE_REENTRY in the readout (each module run executes one entry block via
+    // dispatch; every further block it runs was reached by an in-module edge).
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::BLOCK_EXECUTION);
 
     ctx.cpu.eip = start_addr;
     ctx.current_instruction = Instruction::Other;

@@ -158,6 +158,54 @@ function print_misc_stats(cpu)
     text += "JIT_USE_LOOP_SAFETY=" + Boolean(cpu.wm.exports["get_jit_config"](2)) + "\n";
     text += "MAX_EXTRA_BASIC_BLOCKS=" + cpu.wm.exports["get_jit_config"](3) + "\n";
 
+    text += dispatch_characterisation(cpu);
+
+    return text;
+}
+
+// Block-chaining Phase 0 — dispatch characterisation (see plan/block-chaining.md). Reads the
+// always-on dispatch counters via profiler_dispatch_stat_get (works WITHOUT the profiler feature).
+// Enable with set_dispatch_stats(1) + clear the JIT cache BEFORE the workload runs (dbg.dispatchStatsEnable()).
+// The headline number is CHAINABLE FRACTION = MODULE_EXIT_CHAINABLE / MODULE_REENTRY: the share of the
+// per-module dispatch tax that a WASM tail-call (Phase 1) could remove. This is the go/no-go gate.
+function dispatch_characterisation(cpu)
+{
+    const dget = cpu.wm.exports["profiler_dispatch_stat_get"];
+    if(!dget)
+    {
+        return "";
+    }
+
+    const block_exec = dget(0);
+    const reentry = dget(1);
+    const chainable = dget(2);
+    const dynamic = dget(3);
+    const indirect = dget(4);
+
+    if(block_exec === 0 && reentry === 0)
+    {
+        return "\nDISPATCH CHARACTERISATION (block-chaining Phase 0): no samples " +
+            "(call dbg.dispatchStatsEnable() before the workload)\n";
+    }
+
+    const intra = Math.max(0, block_exec - reentry);
+    const total_edges = intra + reentry;
+    const other = Math.max(0, reentry - chainable - dynamic - indirect);
+    const pct = (n, d) => d > 0 ? (n / d * 100).toFixed(1) + "%" : "n/a";
+
+    let text = "\nDISPATCH CHARACTERISATION (block-chaining Phase 0):\n";
+    text += "  BLOCK_EXECUTION=" + block_exec + "\n";
+    text += "  MODULE_REENTRY=" + reentry + " (returns to main_loop — the dispatch tax)\n";
+    text += "  INTRA_MODULE_EDGE=" + intra + " (= BLOCK_EXECUTION - MODULE_REENTRY)\n";
+    text += "  reentry/all-edges=" + pct(reentry, total_edges) + " (lower = more already stays in-module)\n";
+    text += "  exit breakdown (of MODULE_REENTRY):\n";
+    text += "    CHAINABLE=" + chainable + " (" + pct(chainable, reentry) + ") direct/cond jmp, statically-known successor\n";
+    text += "    DYNAMIC="   + dynamic   + " (" + pct(dynamic, reentry)   + ") ret/int/iret/far/sti, runtime eip\n";
+    text += "    INDIRECT="  + indirect  + " (" + pct(indirect, reentry)  + ") indirect jmp/call, runtime eip\n";
+    text += "    OTHER="     + other     + " (" + pct(other, reentry)     + ") loop-safety / fault / page-change exits\n";
+    text += "  >>> CHAINABLE FRACTION OF DISPATCH = " + pct(chainable, reentry) +
+        " (Phase-1 tail-call ceiling; go/no-go gate)\n";
+
     return text;
 }
 

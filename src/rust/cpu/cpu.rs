@@ -434,9 +434,12 @@ pub unsafe fn ut_step_hook(initial_eip: i32) {
     let prop = ptr::read_unaligned(memory::mem8.offset(code as isize) as *const u32);
     if ut_trace_alive == 0 {
         ut_trace_alive = 1;
+        // Copy the static-mut into a local before format! — see the DBG_STEP_COUNTER note below;
+        // a shared ref to a mutable static is UB the release optimizer can weaponize.
+        let ut_eip = ut_step_eip;
         crate::dbg::console_log_to_js_console(format!(
             "[UT-TRACE] hook ALIVE @ execLocalVariable 0x{:x}: frame=0x{:x} code=0x{:x} prop=0x{:x}",
-            ut_step_eip, frame, code, prop
+            ut_eip, frame, code, prop
         ));
     }
     let i = (ut_trace_idx % 192) as usize;
@@ -534,10 +537,14 @@ pub unsafe fn dbg_on_instruction(eip: u32) {
     if DBG_STEP_REMAINING > 0 { DBG_STEP_REMAINING -= 1; }
     if DBG_STEP_COUNTER >= DBG_MAX_DUMPS { return; }
     DBG_STEP_COUNTER = DBG_STEP_COUNTER.wrapping_add(1);
+    // Copy the static-mut value into a local: passing the static directly to format! would create
+    // a shared reference to a mutable static (UB; the rustc release optimizer can use the implied
+    // no-alias assumption to miscompile unrelated functions when code layout shifts).
+    let dbg_counter = DBG_STEP_COUNTER;
     let tag = if is_bp { " <BP>" } else { "" };
     let mut s = format!(
         "[DBG] #{:<5} eip=0x{:08x}{} eax={:08x} ecx={:08x} edx={:08x} ebx={:08x} esp={:08x} ebp={:08x} esi={:08x} edi={:08x}",
-        DBG_STEP_COUNTER, eip, tag,
+        dbg_counter, eip, tag,
         read_reg32(EAX) as u32, read_reg32(ECX) as u32, read_reg32(EDX) as u32, read_reg32(EBX) as u32,
         read_reg32(ESP) as u32, read_reg32(EBP) as u32, read_reg32(ESI) as u32, read_reg32(EDI) as u32,
     );
@@ -3161,6 +3168,13 @@ pub unsafe fn cycle_internal() {
         #[cfg(debug_assertions)]
         {
             in_jit = false;
+        }
+
+        // Block-chaining Phase 0: a compiled module just returned control to the dispatch loop.
+        // This is the per-module-entry overhead Plan B targets. The breakdown of WHY it exited
+        // (chainable / dynamic / indirect) is counted at the exit sites in jit.rs.
+        if jit::dispatch_stats_enabled() {
+            profiler::stat_increment_always(stat::MODULE_REENTRY);
         }
         profiler::stat_increment_by(
             stat::RUN_FROM_CACHE_STEPS,

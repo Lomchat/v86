@@ -39,6 +39,12 @@
 //!   0x1414: hc_slab_free_count  u32 — stats: frees returned to slab
 //!   0x1418: hc_slab_fallback_count u32 — stats: fallbacks to JS
 //!   0x1420: hc_slab_freelist    [u32; 9] — per-bin free list heads (bins: 16..4096)
+//!   0x1444: hc_slab_ctl_ptr     u32 — GUEST address of the slab control block, or 0.
+//!          When nonzero the slab control fields (base/end/bump/gen/counts/freelist) live in
+//!          GUEST RAM at this address (same relative layout as the 0x1400 fields rebased to 0),
+//!          NOT in this page. Required because the inline x86 stubs can only address guest RAM
+//!          (this page is a WASM static below guest RAM, unreachable from guest code). See
+//!          plan/slab-d2-handoff.md. The 0x1400.. page fields are then vestigial (legacy mode).
 //!   0x1448: hc_event_table      [u8; 2048] — mirrored kernel event state (see EVT_* flags)
 //!   0x1C48: hc_event_starvation_counter u32 — consecutive WASM-handled SetEvent calls
 //!   0x1C4C: hc_event_starvation_limit   u32 — max consecutive before JS fallthrough
@@ -89,17 +95,50 @@ const OFF_HC_FLS_ALLOCATED: usize = 0x1100;
 const OFF_HC_FLS_VALUES: usize = 0x1184;
 const HC_FLS_SLOT_COUNT: usize = 129;
 
-// Arena slab control block (HeapAlloc/HeapFree fast path)
+// Arena slab control block (HeapAlloc/HeapFree fast path).
+// NOTE: these 0x1400-based PAGE offsets are now vestigial (legacy mode only) — the live
+// control block lives in GUEST RAM at hc_slab_ctl_ptr and is accessed via SLAB_REL_* below.
+// Kept for the documented page layout / JS-side legacy fallback. See plan/slab-d2-handoff.md.
+#[allow(dead_code)]
 const OFF_HC_SLAB_BASE: usize = 0x1400;
+#[allow(dead_code)]
 const OFF_HC_SLAB_END: usize = 0x1404;
+#[allow(dead_code)]
 const OFF_HC_SLAB_BUMP: usize = 0x1408;
 #[allow(dead_code)]
 const OFF_HC_SLAB_GENERATION: usize = 0x140C;
+#[allow(dead_code)]
 const OFF_HC_SLAB_ALLOC_COUNT: usize = 0x1410;
+#[allow(dead_code)]
 const OFF_HC_SLAB_FREE_COUNT: usize = 0x1414;
+#[allow(dead_code)]
 const OFF_HC_SLAB_FALLBACK_COUNT: usize = 0x1418;
+#[allow(dead_code)]
 const OFF_HC_SLAB_FREELIST: usize = 0x1420; // 9 × u32
+const OFF_HC_SLAB_CTL_PTR: usize = 0x1444; // guest addr of slab control block (0 = legacy page)
 const OFF_HC_EVENT_TABLE: usize = 0x1448;
+
+// Relative offsets WITHIN the slab control block (page fields rebased to 0). Used when the
+// control block lives in guest RAM (hc_slab_ctl_ptr != 0) — see plan/slab-d2-handoff.md.
+const SLAB_REL_BASE: u32 = 0x00;
+const SLAB_REL_END: u32 = 0x04;
+const SLAB_REL_BUMP: u32 = 0x08;
+const SLAB_REL_ALLOC_COUNT: u32 = 0x10;
+const SLAB_REL_FREE_COUNT: u32 = 0x14;
+const SLAB_REL_FALLBACK_COUNT: u32 = 0x18;
+const SLAB_REL_FREELIST: u32 = 0x20; // 9 × u32
+
+/// Read a u32 slab control field from the guest-RAM control block at `ctl + rel`.
+#[inline]
+unsafe fn slab_rd(ctl: u32, rel: u32) -> u32 {
+    memory::read32_no_mmap_check(ctl.wrapping_add(rel)) as u32
+}
+
+/// Write a u32 slab control field into the guest-RAM control block at `ctl + rel`.
+#[inline]
+unsafe fn slab_wr(ctl: u32, rel: u32, value: u32) {
+    memory::write32_no_mmap_or_dirty_check(ctl.wrapping_add(rel), value as i32);
+}
 const OFF_HC_EVENT_STARVATION_COUNTER: usize = 0x1C48;
 const OFF_HC_EVENT_STARVATION_LIMIT: usize = 0x1C4C;
 
@@ -111,7 +150,11 @@ const EVT_MANUAL: u8 = 0x04;
 const EVT_HAS_WAITERS: u8 = 0x08;
 const EVT_PENDING_WAKE: u8 = 0x10;
 
-const SLAB_MAGIC: u32 = 0x534C4100; // "SLA\0" with low nibble reserved for bin index
+const SLAB_MAGIC: u32 = 0x534C4100; // "SLA\0" (BUSY) — low nibble reserved for bin index
+// FREE marker ("SLF\0"). A block on the per-bin free list carries this in its header so a
+// double-free is rejected (the BUSY-only validate fails) and getSlabSizeForPtr won't report a
+// free-listed block as a live sized allocation. MUST mirror the inline stubs + TS SLAB_MAGIC_FREE.
+const SLAB_MAGIC_FREE: u32 = 0x534C4600;
 const HEAP_ZERO_MEMORY_FLAG: u32 = 0x08;
 const BIN_SIZES: [u32; 9] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
@@ -1671,7 +1714,11 @@ unsafe fn zero_block(addr: u32, size: u32) {
 /// Returns false to fall through to JS for large/zero-size/slab-exhausted cases.
 unsafe fn handle_heap_alloc() -> bool {
     let page = hp_ptr();
-    let slab_base = *(page.add(OFF_HC_SLAB_BASE) as *const u32);
+    // The slab control block lives in GUEST RAM at hc_slab_ctl_ptr (the inline x86 stubs can
+    // only address guest RAM; this page is unreachable from guest code). ctl==0 ⇒ slab off.
+    let ctl = *(page.add(OFF_HC_SLAB_CTL_PTR) as *const u32);
+    if ctl == 0 { return false; }
+    let slab_base = slab_rd(ctl, SLAB_REL_BASE);
     if slab_base == 0 { return false; } // slab not initialized
 
     let esp = read_reg32(ESP);
@@ -1685,8 +1732,7 @@ unsafe fn handle_heap_alloc() -> bool {
         Some(b) => b,
         None => {
             // >4KB — count fallback, let JS handle
-            let p = hp_mut().add(OFF_HC_SLAB_FALLBACK_COUNT) as *mut u32;
-            *p = (*p).wrapping_add(1);
+            slab_wr(ctl, SLAB_REL_FALLBACK_COUNT, slab_rd(ctl, SLAB_REL_FALLBACK_COUNT).wrapping_add(1));
             return false;
         }
     };
@@ -1694,40 +1740,41 @@ unsafe fn handle_heap_alloc() -> bool {
     let zero = (dw_flags & HEAP_ZERO_MEMORY_FLAG) != 0;
 
     // Try free list first
-    let fl_ptr = hp_mut().add(OFF_HC_SLAB_FREELIST + (bin as usize) * 4) as *mut u32;
-    let head = *fl_ptr;
+    let fl_rel = SLAB_REL_FREELIST + bin * 4;
+    let head = slab_rd(ctl, fl_rel);
     if head != 0 {
         // Pop from free list: first 4 bytes of user data = next pointer
         let next = memory::read32_no_mmap_check(head) as u32;
-        *fl_ptr = next;
+        slab_wr(ctl, fl_rel, next);
+        // Restore the BUSY marker (free() flipped it to FREE) — mirrors the inline stub's
+        // `MOV byte [EAX-3],'A'`. Without this a popped block stays FREE-marked while live,
+        // so getSlabSizeForPtr (BUSY-only) reports it as not-live and a later inline free
+        // sends it down .slow → the free is lost / the block is double-owned.
+        memory::write32_no_mmap_or_dirty_check(head - 4, (SLAB_MAGIC | bin) as i32);
         if zero { zero_block(head, size_class); }
         write_reg32(EAX, head as i32);
-        let c = hp_mut().add(OFF_HC_SLAB_ALLOC_COUNT) as *mut u32;
-        *c = (*c).wrapping_add(1);
+        slab_wr(ctl, SLAB_REL_ALLOC_COUNT, slab_rd(ctl, SLAB_REL_ALLOC_COUNT).wrapping_add(1));
         return true;
     }
 
     // Bump allocate: [bump..bump+16) = header zone, [bump+16..bump+16+size_class) = user data
-    let bump_ptr = hp_mut().add(OFF_HC_SLAB_BUMP) as *mut u32;
-    let bump = *bump_ptr;
-    let slab_end = *(page.add(OFF_HC_SLAB_END) as *const u32);
+    let bump = slab_rd(ctl, SLAB_REL_BUMP);
+    let slab_end = slab_rd(ctl, SLAB_REL_END);
     let user_ptr = bump + 16;
     let new_bump = user_ptr + size_class;
     if new_bump > slab_end {
-        let p = hp_mut().add(OFF_HC_SLAB_FALLBACK_COUNT) as *mut u32;
-        *p = (*p).wrapping_add(1);
+        slab_wr(ctl, SLAB_REL_FALLBACK_COUNT, slab_rd(ctl, SLAB_REL_FALLBACK_COUNT).wrapping_add(1));
         return false; // slab exhausted → JS allocates + can refill slab
     }
 
     // Write block header at user_ptr - 4
     memory::write32_no_mmap_or_dirty_check(user_ptr - 4, (SLAB_MAGIC | bin) as i32);
-    *bump_ptr = new_bump;
+    slab_wr(ctl, SLAB_REL_BUMP, new_bump);
 
     if zero { zero_block(user_ptr, size_class); }
 
     write_reg32(EAX, user_ptr as i32);
-    let c = hp_mut().add(OFF_HC_SLAB_ALLOC_COUNT) as *mut u32;
-    *c = (*c).wrapping_add(1);
+    slab_wr(ctl, SLAB_REL_ALLOC_COUNT, slab_rd(ctl, SLAB_REL_ALLOC_COUNT).wrapping_add(1));
     true
 }
 
@@ -1735,7 +1782,9 @@ unsafe fn handle_heap_alloc() -> bool {
 /// Fast path: push freed block onto per-bin free list if it's within slab range.
 unsafe fn handle_heap_free() -> bool {
     let page = hp_ptr();
-    let slab_base = *(page.add(OFF_HC_SLAB_BASE) as *const u32);
+    let ctl = *(page.add(OFF_HC_SLAB_CTL_PTR) as *const u32);
+    if ctl == 0 { return false; }
+    let slab_base = slab_rd(ctl, SLAB_REL_BASE);
     if slab_base == 0 { return false; }
 
     let esp = read_reg32(ESP);
@@ -1746,7 +1795,7 @@ unsafe fn handle_heap_free() -> bool {
         return true;
     }
 
-    let slab_end = *(page.add(OFF_HC_SLAB_END) as *const u32);
+    let slab_end = slab_rd(ctl, SLAB_REL_END);
     // Must be within slab with room for header
     if lp_mem < slab_base + 16 || lp_mem >= slab_end { return false; }
 
@@ -1756,14 +1805,19 @@ unsafe fn handle_heap_free() -> bool {
     let bin = header & 0x0F;
     if bin > 8 { return false; }
 
-    // Push to free list: store current head in freed block's first 4 bytes
-    let fl_ptr = hp_mut().add(OFF_HC_SLAB_FREELIST + (bin as usize) * 4) as *mut u32;
-    let old_head = *fl_ptr;
-    memory::write32_no_mmap_or_dirty_check(lp_mem, old_head as i32);
-    *fl_ptr = lp_mem;
+    // Mark the block FREE before linking it in — mirrors the inline stub's `MOV byte [EAX-3],'F'`.
+    // The BUSY-only validate above already rejected an already-FREE block, so this closes the
+    // double-free hole: a second free now fails the validate and goes .slow (JS no-op) instead
+    // of being pushed twice → free-list cycle → the same block handed to two owners.
+    memory::write32_no_mmap_or_dirty_check(lp_mem - 4, (SLAB_MAGIC_FREE | bin) as i32);
 
-    let c = hp_mut().add(OFF_HC_SLAB_FREE_COUNT) as *mut u32;
-    *c = (*c).wrapping_add(1);
+    // Push to free list: store current head in freed block's first 4 bytes
+    let fl_rel = SLAB_REL_FREELIST + bin * 4;
+    let old_head = slab_rd(ctl, fl_rel);
+    memory::write32_no_mmap_or_dirty_check(lp_mem, old_head as i32);
+    slab_wr(ctl, fl_rel, lp_mem);
+
+    slab_wr(ctl, SLAB_REL_FREE_COUNT, slab_rd(ctl, SLAB_REL_FREE_COUNT).wrapping_add(1));
     write_reg32(EAX, 1); // TRUE
     true
 }

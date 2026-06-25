@@ -2628,6 +2628,17 @@ fn gen_fpu_relaxed_stat_increment(builder: &mut WasmBuilder, stat: profiler::sta
     builder.increment_fixed_i64(addr, 1);
 }
 
+// Block-chaining Phase 0 — emit an always-on dispatch-characterisation counter increment into the
+// compiled block (gated at compile time by jit::DISPATCH_STATS so it's free unless measuring). See
+// plan/block-chaining.md and profiler::stat. Call sites pass MODULE_EXIT_* / BLOCK_EXECUTION.
+pub fn gen_dispatch_stat_increment(builder: &mut WasmBuilder, stat: profiler::stat) {
+    if !crate::jit::dispatch_stats_enabled() {
+        return;
+    }
+    let addr = unsafe { &raw mut profiler::stat_array[stat as usize] } as u32;
+    builder.increment_fixed_i64(addr, 1);
+}
+
 fn gen_fpu_relaxed_record_hit(ctx: &mut JitContext) {
     if !crate::softfloat::is_fpu_relaxed_stats() {
         return;

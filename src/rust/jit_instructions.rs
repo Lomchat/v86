@@ -4059,9 +4059,25 @@ pub fn instr_DF_3_reg_jit(ctx: &mut JitContext, r: u32) {
 }
 
 pub fn instr_DF_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    dbg_log!("fbld");
+    // FBLD m80 — mirror instr_DF_6_mem_jit (fbstp). fpu_fbld reads guest memory and can
+    // page-fault, so resolve the address, sync regs, call the helper, then bail to the exit
+    // label if a #PF was raised (the instruction re-executes after the fault is serviced).
     codegen::gen_modrm_resolve(ctx, modrm_byte);
-    codegen::gen_trigger_ud(ctx);
+
+    codegen::gen_set_previous_eip_offset_from_eip_with_low_bits(
+        ctx.builder,
+        ctx.start_of_current_instruction as i32 & 0xFFF,
+    );
+
+    codegen::gen_move_registers_from_locals_to_memory(ctx);
+    ctx.builder.call_fn1("fpu_fbld");
+    codegen::gen_move_registers_from_memory_to_locals(ctx);
+
+    codegen::gen_get_page_fault(ctx.builder);
+    ctx.builder.if_void();
+    codegen::gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+    ctx.builder.br(ctx.exit_label);
+    ctx.builder.block_end();
 }
 pub fn instr_DF_4_reg_jit(ctx: &mut JitContext, r: u32) {
     if r == 0 {

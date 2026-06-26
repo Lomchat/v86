@@ -648,6 +648,28 @@ pub unsafe fn fpu_fstp(r: i32) {
 }
 
 #[no_mangle]
+pub unsafe fn fpu_fbld(addr: i32) {
+    // FBLD (DF /4): load an 80-bit packed-BCD integer and push it onto the FPU stack.
+    // Exact inverse of fpu_fbstp: bytes [0..9) carry 18 packed decimal digits (low nibble =
+    // lower digit, high nibble = upper digit), byte[9] bit 7 = sign. Reads only — page faults
+    // are surfaced by safe_read8 and leave the FPU stack untouched (the instruction re-executes).
+    let mut value: i64 = 0;
+    let mut scale: i64 = 1;
+    for i in 0..9 {
+        let b = return_on_pagefault!(safe_read8(addr + i));
+        value += (b & 0x0F) as i64 * scale;
+        scale *= 10;
+        value += ((b >> 4) & 0x0F) as i64 * scale;
+        scale *= 10;
+    }
+    let sign = return_on_pagefault!(safe_read8(addr + 9));
+    if sign & 0x80 != 0 {
+        value = -value;
+    }
+    fpu_push(F80::of_i64(value));
+}
+
+#[no_mangle]
 pub unsafe fn fpu_fbstp(addr: i32) {
     match writable_or_pagefault(addr, 26) {
         Ok(()) => *page_fault = false,

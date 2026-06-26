@@ -558,6 +558,9 @@ pub unsafe fn fpu_fsave32(mut addr: i32) {
 
 pub unsafe fn fpu_store_m80(addr: i32, f: F80) {
     // writable_or_pagefault must have checked called by the caller!
+    // Canonicalize the relaxed f64-bits form, else 0x7FFE (RELAXED_TAG) lands in
+    // the exponent word and guest code reading the raw 80-bit image sees ~2^16383.
+    let f = f.to_true_f80();
     safe_write64(addr, f.mantissa).unwrap();
     safe_write16(addr + 8, f.sign_exponent as i32).unwrap();
 }
@@ -801,6 +804,8 @@ pub unsafe fn fpu_fxtract() {
         fpu_push(st0);
     }
     else {
+        // Canonicalize: a relaxed st0 holds f64 bits, so exponent()/mantissa are raw garbage
+        let st0 = st0.to_true_f80();
         let exp = st0.exponent();
         fpu_write_st(*fpu_stack_ptr as i32, F80::of_i32(exp.into()));
         fpu_push(F80 {
@@ -885,9 +890,10 @@ pub unsafe fn fpu_frndint() {
 }
 
 pub unsafe fn fpu_fscale() {
+    // ST0 = ST0 * 2^trunc(ST1), via exponent add (keeps the full f80 range)
     let st0 = fpu_get_st0();
-    let y = st0 * fpu_get_sti(1).trunc().two_pow();
-    fpu_write_st(*fpu_stack_ptr as i32, y);
+    let n = fpu_get_sti(1).truncate_to_i64();
+    fpu_write_st(*fpu_stack_ptr as i32, st0.scale_pow2(n));
 }
 
 pub unsafe fn fpu_fsin() {

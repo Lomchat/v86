@@ -171,6 +171,12 @@ impl F80 {
                 return F80 { mantissa: src, sign_exponent: RELAXED_TAG };
             }
         }
+        F80::of_f64_strict(src)
+    }
+
+    // Bit-exact f64 -> true 80-bit, ignoring relaxed mode (needed when a real
+    // exponent field must be produced, e.g. FSCALE / store to m80).
+    pub fn of_f64_strict(src: u64) -> F80 {
         let sign = (src >> 63) as u16;
         let exp = ((src >> 52) & 0x7FF) as i32;
         let mant = src & 0xFFFFFFFFFFFFF;
@@ -320,6 +326,40 @@ impl F80 {
         }
     }
     pub fn two_pow(self) -> F80 { F80::of_f64x(2.0f64.powf(self.to_f64x())) }
+
+    // Resolve the relaxed f64-bits form to a real 80-bit value; true F80 passes through.
+    pub fn to_true_f80(self) -> F80 {
+        if self.sign_exponent == RELAXED_TAG {
+            F80::of_f64_strict(self.mantissa)
+        } else {
+            self
+        }
+    }
+
+    // FSCALE core: self * 2^n by adding to the exponent field. Doing this as
+    // self * 2.0f64.powf(n) overflows to f64 inf for n > 1023, but the real f80
+    // range goes to 2^16383.
+    pub fn scale_pow2(self, n: i64) -> F80 {
+        let v = self.to_true_f80();
+        let sign_bit = v.sign_exponent & 0x8000;
+        let exp_field = (v.sign_exponent & 0x7FFF) as i64;
+
+        // Zero stays zero; Inf/NaN unchanged
+        if (exp_field == 0 && v.mantissa == 0) || exp_field == 0x7FFF {
+            return v;
+        }
+
+        let new_exp = exp_field + n;
+        // Overflow -> signed Inf (cap below RELAXED_TAG so the result can't alias it)
+        if new_exp >= 0x7FFE {
+            return F80 { mantissa: 0x8000000000000000, sign_exponent: sign_bit | 0x7FFF };
+        }
+        // Underflow -> signed zero
+        if new_exp <= 0 {
+            return F80 { mantissa: 0, sign_exponent: sign_bit };
+        }
+        F80 { mantissa: v.mantissa, sign_exponent: sign_bit | (new_exp as u16) }
+    }
 
     pub fn round(self) -> F80 {
         let f = self.to_f64x();

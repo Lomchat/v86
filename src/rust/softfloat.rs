@@ -3,6 +3,21 @@
 
 static mut ROUNDING_MODE: u8 = 0; // 0=NearEven, 1=Trunc, 2=Floor, 3=Ceil
 
+// x87 precision-control: PC=00 (24-bit single) rounds every arithmetic result to f32.
+// F80 is f64-backed so P64/P80 already match (53-bit); only P32 needs the extra round.
+static mut PRECISION_SINGLE: bool = false;
+
+#[inline]
+fn apply_precision(f: f64) -> f64 {
+    if unsafe { PRECISION_SINGLE } { f as f32 as f64 } else { f }
+}
+
+// Codegen reads this to skip the relaxed inline binop (raw f64) under PC=single.
+#[allow(dead_code)]
+pub fn is_precision_single() -> bool {
+    unsafe { PRECISION_SINGLE }
+}
+
 /// Relaxed FPU mode: store raw f64 bits directly in F80.mantissa with RELAXED_TAG.
 /// Eliminates the F80 biasing overhead in to_f64()/of_f64() (~8% WASM CPU for Re-Volt).
 /// Safe for games: precision difference between f80 and f64 is imperceptible.
@@ -379,7 +394,7 @@ impl F80 {
     }
 
     pub fn sqrt(self) -> F80 {
-        F80::of_f64x(self.to_f64x().sqrt())
+        F80::of_f64x(apply_precision(self.to_f64x().sqrt()))
     }
 
     pub fn is_finite(self) -> bool {
@@ -399,8 +414,13 @@ impl F80 {
             }
         };
     }
-    pub fn set_precision(_precision: Precision) {
-        // no-op: f64 is always 53-bit mantissa
+    pub fn set_precision(precision: Precision) {
+        unsafe {
+            PRECISION_SINGLE = match precision {
+                Precision::P32 => true,
+                Precision::P64 | Precision::P80 => false,
+            };
+        }
     }
 
     pub fn get_exception_flags() -> u8 { 0 }
@@ -443,24 +463,24 @@ impl std::ops::Add for F80 {
     fn add(self, other: Self) -> Self {
         // Fast path: both operands already hold raw f64 bits
         if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
-            let r = f64::from_bits(self.mantissa) + f64::from_bits(other.mantissa);
+            let r = apply_precision(f64::from_bits(self.mantissa) + f64::from_bits(other.mantissa));
             return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
         }
         let a = f64::from_bits(self.to_f64());
         let b = f64::from_bits(other.to_f64());
-        F80::of_f64((a + b).to_bits())
+        F80::of_f64(apply_precision(a + b).to_bits())
     }
 }
 impl std::ops::Sub for F80 {
     type Output = F80;
     fn sub(self, other: Self) -> Self {
         if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
-            let r = f64::from_bits(self.mantissa) - f64::from_bits(other.mantissa);
+            let r = apply_precision(f64::from_bits(self.mantissa) - f64::from_bits(other.mantissa));
             return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
         }
         let a = f64::from_bits(self.to_f64());
         let b = f64::from_bits(other.to_f64());
-        F80::of_f64((a - b).to_bits())
+        F80::of_f64(apply_precision(a - b).to_bits())
     }
 }
 impl std::ops::Neg for F80 {
@@ -480,24 +500,24 @@ impl std::ops::Mul for F80 {
     type Output = F80;
     fn mul(self, other: Self) -> Self {
         if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
-            let r = f64::from_bits(self.mantissa) * f64::from_bits(other.mantissa);
+            let r = apply_precision(f64::from_bits(self.mantissa) * f64::from_bits(other.mantissa));
             return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
         }
         let a = f64::from_bits(self.to_f64());
         let b = f64::from_bits(other.to_f64());
-        F80::of_f64((a * b).to_bits())
+        F80::of_f64(apply_precision(a * b).to_bits())
     }
 }
 impl std::ops::Div for F80 {
     type Output = F80;
     fn div(self, other: Self) -> Self {
         if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
-            let r = f64::from_bits(self.mantissa) / f64::from_bits(other.mantissa);
+            let r = apply_precision(f64::from_bits(self.mantissa) / f64::from_bits(other.mantissa));
             return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
         }
         let a = f64::from_bits(self.to_f64());
         let b = f64::from_bits(other.to_f64());
-        F80::of_f64((a / b).to_bits())
+        F80::of_f64(apply_precision(a / b).to_bits())
     }
 }
 impl std::ops::Rem for F80 {

@@ -425,7 +425,8 @@ pub fn jit_find_cache_entry_in_page(
 
 #[no_mangle]
 pub unsafe fn jit_find_cache_entry_for_chaining(state_flags: u32) -> i32 {
-    let limit = hypercall::read_cycle_limit().min(cpu::LOOP_COUNTER as u32);
+    // same quantum as do_many_cycles_native (limit==0 urgent exit and in_hlt still bail)
+    let limit = hypercall::read_cycle_limit();
     let elapsed = (*global_pointers::instruction_counter)
         .wrapping_sub(cpu::jit_cycle_start_instruction_counter);
 

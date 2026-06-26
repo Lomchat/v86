@@ -79,6 +79,8 @@ pub struct WasmBuilder {
 
     import_table_size: usize, // the current import table size (to avoid reading 2 byte leb)
     import_count: u16,        // same as above
+    function_import_count: u16,
+    import_indirect_function_table: bool,
 
     initial_static_size: usize, // size of module after initialization, rest is drained on reset
 
@@ -126,6 +128,8 @@ impl WasmBuilder {
 
             import_table_size: 2,
             import_count: 0,
+            function_import_count: 0,
+            import_indirect_function_table: false,
 
             initial_static_size: 0,
 
@@ -162,6 +166,8 @@ impl WasmBuilder {
         self.output.drain(self.initial_static_size..);
         self.set_import_table_size(2);
         self.set_import_count(0);
+        self.function_import_count = 0;
+        self.import_indirect_function_table = false;
         self.instruction_body.clear();
         self.free_locals_i32.clear();
         self.free_locals_i64.clear();
@@ -176,6 +182,9 @@ impl WasmBuilder {
         dbg_assert!(self.label_to_depth.is_empty());
         dbg_assert!(self.label_stack.is_empty());
 
+        if self.import_indirect_function_table {
+            self.write_indirect_function_table_import();
+        }
         self.write_memory_import();
         self.write_function_section();
         self.write_export_section();
@@ -496,6 +505,8 @@ impl WasmBuilder {
     }
 
     fn write_import_entry(&mut self, fn_name: &str, type_index: FunctionType) -> u16 {
+        let function_index = self.function_import_count;
+
         self.output.push(1); // length of module name
         self.output.push('e' as u8); // module name
         self.output.push(fn_name.len().safe_to_u8());
@@ -505,11 +516,31 @@ impl WasmBuilder {
 
         let new_import_count = self.import_count + 1;
         self.set_import_count(new_import_count);
+        self.function_import_count += 1;
 
         let new_table_size = self.import_table_size + 1 + 1 + 1 + fn_name.len() + 1 + 1;
         self.set_import_table_size(new_table_size);
 
-        self.import_count - 1
+        function_index
+    }
+
+    pub fn write_indirect_function_table_import(&mut self) {
+        let fn_name = "__indirect_function_table";
+
+        self.output.push(1); // length of module name
+        self.output.push('e' as u8); // module name
+        self.output.push(fn_name.len().safe_to_u8());
+        self.output.extend(fn_name.as_bytes());
+        self.output.push(op::EXT_TABLE);
+        self.output.push(op::TYPE_ANYFUNC);
+        self.output.push(0); // limits: min only
+        write_leb_u32(&mut self.output, 0);
+
+        let new_import_count = self.import_count + 1;
+        self.set_import_count(new_import_count);
+
+        let new_table_size = self.import_table_size + 1 + 1 + 1 + fn_name.len() + 1 + 1 + 1 + 1;
+        self.set_import_table_size(new_table_size);
     }
 
     pub fn write_function_section(&mut self) {
@@ -528,13 +559,12 @@ impl WasmBuilder {
         self.output.push('f' as u8); // function name
         self.output.push(op::EXT_FUNCTION);
 
-        // index of the exported function
-        // function space starts with imports. index of last import is import count - 1
-        // the last import however is a memory, so we subtract one from that
+        // index of the exported function: function index space only counts imported
+        // functions, not imported memories/tables.
         let next_op_idx = self.output.len();
         self.output.push(0);
         self.output.push(0); // add 2 bytes for writing 16 byte val
-        write_fixed_leb16_at_idx(&mut self.output, next_op_idx, self.import_count - 1);
+        write_fixed_leb16_at_idx(&mut self.output, next_op_idx, self.function_import_count);
     }
 
     fn get_fn_idx(&mut self, fn_name: &str, type_index: FunctionType) -> u16 {
@@ -1042,6 +1072,13 @@ impl WasmBuilder {
         let i = self.get_fn_idx(name, function);
         self.instruction_body.push(op::OP_CALL);
         write_leb_u32(&mut self.instruction_body, i as u32);
+    }
+
+    pub fn return_call_indirect_fn1(&mut self) {
+        self.import_indirect_function_table = true;
+        self.instruction_body.push(op::OP_RETURN_CALL_INDIRECT);
+        self.instruction_body.push(FunctionType::FN1.to_u8());
+        self.instruction_body.push(0); // table index
     }
 
     pub fn call_fn0(&mut self, name: &str) { self.call_fn(name, FunctionType::FN0) }

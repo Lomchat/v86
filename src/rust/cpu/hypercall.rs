@@ -181,8 +181,14 @@ pub fn get_hypercall_page_ptr() -> u32 {
 pub unsafe fn read_cycle_limit() -> u32 {
     let val = *(hp_ptr().add(OFF_CYCLE_LIMIT) as *const u32);
     if val == 0 {
-        // Default: match original LOOP_COUNTER when JS hasn't initialized yet
-        100_003
+        if *(hp_ptr().add(OFF_HC_ENABLED) as *const u32) == 0 {
+            // Default: match original LOOP_COUNTER when JS hasn't initialized yet.
+            100_003
+        }
+        else {
+            // JS uses 0 as an urgent-exit request for async parks / scheduler wakeups.
+            0
+        }
     } else {
         val
     }

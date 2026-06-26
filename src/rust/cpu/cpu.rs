@@ -287,6 +287,7 @@ pub const CHECK_TLB_INVARIANTS: bool = false;
 pub const DEBUG: bool = cfg!(debug_assertions);
 
 pub const LOOP_COUNTER: i32 = 100_003;
+pub static mut jit_cycle_start_instruction_counter: u32 = 0;
 
 // should probably be kept in sync with APIC_TIMER_FREQ in apic.js
 pub const TSC_RATE: f64 = 1_000_000.0;
@@ -3404,6 +3405,7 @@ pub unsafe fn main_loop() -> f64 {
 pub unsafe fn do_many_cycles_native() {
     profiler::stat_increment(stat::DO_MANY_CYCLES);
     let initial_instruction_counter = *instruction_counter;
+    jit_cycle_start_instruction_counter = initial_instruction_counter;
     let limit = hypercall::read_cycle_limit();
     while (*instruction_counter).wrapping_sub(initial_instruction_counter) < limit
         && !*in_hlt

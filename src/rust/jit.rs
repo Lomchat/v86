@@ -12,6 +12,7 @@ use crate::control_flow;
 use crate::control_flow::WasmStructure;
 use crate::cpu::cpu;
 use crate::cpu::global_pointers;
+use crate::cpu::hypercall;
 use crate::cpu::memory;
 use crate::cpu_context::CpuContext;
 use crate::jit_instructions;
@@ -69,6 +70,7 @@ static mut JIT_DISABLED: bool = false;
 static mut MAX_PAGES: u32 = 3;
 
 static mut JIT_USE_LOOP_SAFETY: bool = true;
+static mut JIT_BLOCK_CHAINING: bool = false;
 
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
@@ -80,6 +82,7 @@ pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 // via profiler_dispatch_stat_get. OFF by default — zero cost on the production path.
 pub static mut DISPATCH_STATS: bool = false;
 pub fn dispatch_stats_enabled() -> bool { unsafe { DISPATCH_STATS } }
+fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
 
 #[no_mangle]
 pub fn set_dispatch_stats(enabled: u32) { unsafe { DISPATCH_STATS = enabled != 0; } }
@@ -418,6 +421,49 @@ pub fn jit_find_cache_entry_in_page(
     }
 
     return -1;
+}
+
+#[no_mangle]
+pub unsafe fn jit_find_cache_entry_for_chaining(state_flags: u32) -> i32 {
+    let limit = hypercall::read_cycle_limit().min(cpu::LOOP_COUNTER as u32);
+    let elapsed = (*global_pointers::instruction_counter)
+        .wrapping_sub(cpu::jit_cycle_start_instruction_counter);
+
+    if limit == 0 || elapsed >= limit || *global_pointers::in_hlt {
+        if dispatch_stats_enabled() {
+            profiler::stat_increment_always(stat::MODULE_EXIT_CHAINABLE);
+            profiler::stat_increment_always(stat::MODULE_CHAIN_BUDGET_EXIT);
+        }
+        return -1;
+    }
+
+    let virt_address = *global_pointers::instruction_pointer as u32;
+    let state_flags = CachedStateFlags::of_u32(state_flags);
+
+    match cpu::tlb_code[(virt_address >> 12) as usize] {
+        None => {},
+        Some(c) => {
+            let c = c.as_ref();
+            if state_flags == c.state_flags {
+                let state = c.state_table[virt_address as usize & 0xFFF];
+                if state != u16::MAX {
+                    if dispatch_stats_enabled() {
+                        profiler::stat_increment_always(stat::MODULE_CHAINED_EDGE);
+                    }
+
+                    let table_slot =
+                        c.wasm_table_index.to_u16() as i32 + cpu::WASM_TABLE_OFFSET as i32;
+                    return table_slot << 16 | state as i32;
+                }
+            }
+        },
+    }
+
+    if dispatch_stats_enabled() {
+        profiler::stat_increment_always(stat::MODULE_EXIT_CHAINABLE);
+        profiler::stat_increment_always(stat::MODULE_CHAIN_MISS);
+    }
+    -1
 }
 
 fn jit_find_basic_blocks(
@@ -1170,6 +1216,44 @@ pub fn set_tlb_code(
     }
 }
 
+fn gen_chain_or_exit_to_known_successor(
+    ctx: &mut JitContext,
+    state_flags: CachedStateFlags,
+    last_instruction_addr: u32,
+) {
+    if !block_chaining_enabled() {
+        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+        ctx.builder.br(ctx.exit_label);
+        return;
+    }
+
+    codegen::gen_move_registers_from_locals_to_memory(ctx);
+    codegen::gen_update_instruction_counter(ctx);
+    ctx.builder.const_i32(0);
+    ctx.builder.set_local(&ctx.instruction_counter);
+
+    ctx.builder.const_i32(state_flags.to_u32() as i32);
+    ctx.builder.call_fn1_ret("jit_find_cache_entry_for_chaining");
+    let packed_target = ctx.builder.tee_new_local();
+
+    ctx.builder.get_local(&packed_target);
+    ctx.builder.const_i32(0);
+    ctx.builder.ge_i32();
+    ctx.builder.if_void();
+    ctx.builder.get_local(&packed_target);
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&packed_target);
+    ctx.builder.const_i32(16);
+    ctx.builder.shr_u_i32();
+    ctx.builder.return_call_indirect_fn1();
+    ctx.builder.block_end();
+
+    ctx.builder.free_local(packed_target);
+    codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+    ctx.builder.br(ctx.exit_label);
+}
+
 fn jit_generate_module(
     structure: Vec<WasmStructure>,
     basic_blocks: &HashMap<u32, BasicBlock>,
@@ -1394,12 +1478,14 @@ fn jit_generate_module(
                             codegen::gen_jmp_rel16(ctx.builder, jump_offset as u16);
                         }
 
-                        codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
                         // Phase 0: direct unconditional JMP whose target is outside this module —
                         // successor eip is a compile-time constant (jump_offset). Chainable.
-                        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
-                        ctx.builder.br(ctx.exit_label);
+                        gen_chain_or_exit_to_known_successor(
+                            ctx,
+                            state_flags,
+                            block.last_instruction_addr,
+                        );
                     },
                     &BasicBlockType::Normal {
                         next_block_addr: Some(next_block_addr),
@@ -1695,21 +1781,17 @@ fn jit_generate_module(
                                     );
                                 }
 
-                                codegen::gen_debug_track_jit_exit(
-                                    ctx.builder,
-                                    block.last_instruction_addr,
-                                );
                                 codegen::gen_profiler_stat_increment(
                                     ctx.builder,
                                     stat::CONDITIONAL_JUMP_EXIT,
                                 );
                                 // Phase 0: conditional JMP leaving the module — successor eip is a
                                 // compile-time constant (taken=jump_offset, not-taken=end_addr). Chainable.
-                                codegen::gen_dispatch_stat_increment(
-                                    ctx.builder,
-                                    stat::MODULE_EXIT_CHAINABLE,
+                                gen_chain_or_exit_to_known_successor(
+                                    ctx,
+                                    state_flags,
+                                    block.last_instruction_addr,
                                 );
-                                ctx.builder.br(ctx.exit_label);
 
                                 if is_first {
                                     ctx.builder.block_end();
@@ -2467,6 +2549,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         1 => MAX_PAGES = value,
         2 => JIT_USE_LOOP_SAFETY = value != 0,
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
+        4 => JIT_BLOCK_CHAINING = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -2478,6 +2561,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         1 => MAX_PAGES as u32,
         2 => JIT_USE_LOOP_SAFETY as u32,
         3 => MAX_EXTRA_BASIC_BLOCKS as u32,
+        4 => JIT_BLOCK_CHAINING as u32,
         _ => 0,
     }
 }

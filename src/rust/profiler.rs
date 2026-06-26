@@ -145,6 +145,9 @@ pub enum stat {
     MODULE_EXIT_CHAINABLE,
     MODULE_EXIT_DYNAMIC,
     MODULE_EXIT_INDIRECT,
+    MODULE_CHAINED_EDGE,
+    MODULE_CHAIN_BUDGET_EXIT,
+    MODULE_CHAIN_MISS,
 }
 
 #[allow(non_upper_case_globals)]
@@ -193,9 +196,10 @@ pub fn profiler_fpu_relaxed_fallback_get() -> f64 {
     unsafe { stat_array[stat::FPU_RELAXED_FALLBACK as usize] as f64 }
 }
 
-// Block-chaining Phase 0 readout. Reads the dispatch-characterisation counters directly out of
+// Block-chaining readout. Reads the dispatch-characterisation counters directly out of
 // stat_array regardless of the `profiler` feature (unlike profiler_stat_get). Index order:
-// 0=BLOCK_EXECUTION 1=MODULE_REENTRY 2=MODULE_EXIT_CHAINABLE 3=MODULE_EXIT_DYNAMIC 4=MODULE_EXIT_INDIRECT.
+// 0=BLOCK_EXECUTION 1=MODULE_REENTRY 2=MODULE_EXIT_CHAINABLE 3=MODULE_EXIT_DYNAMIC
+// 4=MODULE_EXIT_INDIRECT 5=MODULE_CHAINED_EDGE 6=MODULE_CHAIN_BUDGET_EXIT 7=MODULE_CHAIN_MISS.
 #[no_mangle]
 pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
     let stat = match index {
@@ -204,6 +208,9 @@ pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
         2 => stat::MODULE_EXIT_CHAINABLE,
         3 => stat::MODULE_EXIT_DYNAMIC,
         4 => stat::MODULE_EXIT_INDIRECT,
+        5 => stat::MODULE_CHAINED_EDGE,
+        6 => stat::MODULE_CHAIN_BUDGET_EXIT,
+        7 => stat::MODULE_CHAIN_MISS,
         _ => return 0.0,
     };
     unsafe { stat_array[stat as usize] as f64 }

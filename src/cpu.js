@@ -59,12 +59,48 @@ import { BusConnector } from "./bus.js";
 const DUMP_GENERATED_WASM = false;
 const DUMP_UNCOMPILED_ASSEMBLY = false;
 
+let cached_return_call_indirect_supported;
+function return_call_indirect_supported()
+{
+    if(cached_return_call_indirect_supported !== undefined)
+    {
+        return cached_return_call_indirect_supported;
+    }
+
+    // (module
+    //   (type (func (param i32)))
+    //   (table 1 funcref)
+    //   (func (type 0)
+    //     local.get 0
+    //     i32.const 0
+    //     return_call_indirect (type 0)))
+    const probe = new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x01,
+        0x0a, 0x0b, 0x01, 0x09, 0x00, 0x20, 0x00, 0x41,
+        0x00, 0x13, 0x00, 0x00, 0x0b,
+    ]);
+
+    try {
+        cached_return_call_indirect_supported = WebAssembly.validate(probe);
+    }
+    catch(e) {
+        cached_return_call_indirect_supported = false;
+    }
+    return cached_return_call_indirect_supported;
+}
+
 /** @constructor */
 export function CPU(bus, wm, stop_idling)
 {
     this.stop_idling = stop_idling;
     this.wm = wm;
     this.wasm_patch();
+    this.jit_block_chaining_supported =
+        return_call_indirect_supported() && !globalThis.DISABLE_JIT_BLOCK_CHAINING;
+    this.set_jit_config(4, this.jit_block_chaining_supported ? 1 : 0);
     this.create_jit_imports();
 
     const memory = this.wm.exports.memory;
@@ -342,6 +378,7 @@ CPU.prototype.create_jit_imports = function()
     const jit_imports = Object.create(null);
 
     jit_imports["m"] = this.wm.exports["memory"];
+    jit_imports["__indirect_function_table"] = this.wm.wasm_table;
 
     for(const name of Object.keys(this.wm.exports))
     {
@@ -377,6 +414,7 @@ CPU.prototype.wasm_patch = function()
     this.main_loop = get_import("main_loop");
 
     this.set_jit_config = get_import("set_jit_config");
+    this.get_jit_config = get_import("get_jit_config");
 
     this.read8 = get_import("read8");
     this.read16 = get_import("read16");

@@ -509,6 +509,17 @@ pub static mut DBG_MAX_DUMPS: u32 = 4000;   // hard cap so a runaway trace can't
 #[no_mangle] pub unsafe fn dbg_add_bp(eip: u32) {
     if DBG_BP_COUNT < DBG_MAX_BP { DBG_BP[DBG_BP_COUNT] = eip; DBG_BP_COUNT += 1; }
 }
+/// True if any breakpoint lies on the same 4 KiB page as `eip`. Used to keep that page
+/// interpreted (so dbg_on_instruction can fire the bp) while the rest of the guest JITs.
+pub unsafe fn page_contains_bp(eip: u32) -> bool {
+    let page = eip & !0xFFF;
+    let mut i = 0;
+    while i < DBG_BP_COUNT {
+        if (DBG_BP[i] & !0xFFF) == page { return true; }
+        i += 1;
+    }
+    false
+}
 #[no_mangle] pub unsafe fn dbg_set_step_on_bp(n: u32) { DBG_STEP_ON_BP = n; }
 #[no_mangle] pub unsafe fn dbg_arm_step(n: u32) { DBG_STEP_REMAINING = n; }
 #[no_mangle] pub unsafe fn dbg_add_watch(addr: u32) {
@@ -521,6 +532,54 @@ pub static mut DBG_MAX_DUMPS: u32 = 4000;   // hard cap so a runaway trace can't
 }
 #[no_mangle] pub unsafe fn dbg_read_u8(addr: u32) -> u32 {
     (*memory::mem8.offset(addr as isize)) as u32
+}
+
+// BottleShip memory-write watchpoint. Catches the guest EIP that writes a given
+// address — works through the interpreted write8/16/32 chokepoints (so requires
+// JIT off, where guest writes route through them; JIT fast-path writes are inlined
+// and bypass these). Records the last writer and, separately, the last writer that
+// stored ZERO into the watched dword (the case we usually hunt). Read back via the
+// dbg_write_watch_* exports.
+pub static mut DBG_WRITE_WATCH: u32 = 0; // 0 = disabled
+pub static mut DBG_WW_HITS: u32 = 0;
+pub static mut DBG_WW_LAST_EIP: u32 = 0;
+pub static mut DBG_WW_LAST_PREV: u32 = 0;
+pub static mut DBG_WW_LAST_VAL: u32 = 0;
+pub static mut DBG_WW_ZERO_EIP: u32 = 0;  // EIP of the most recent write that stored 0
+pub static mut DBG_WW_ZERO_PREV: u32 = 0;
+pub static mut DBG_WW_ZERO_HITS: u32 = 0;
+
+#[no_mangle] pub unsafe fn dbg_set_write_watch(addr: u32) {
+    DBG_WRITE_WATCH = addr; DBG_WW_HITS = 0; DBG_WW_ZERO_HITS = 0;
+    DBG_WW_LAST_EIP = 0; DBG_WW_LAST_PREV = 0; DBG_WW_LAST_VAL = 0;
+    DBG_WW_ZERO_EIP = 0; DBG_WW_ZERO_PREV = 0;
+}
+#[no_mangle] pub unsafe fn dbg_ww_hits() -> u32 { DBG_WW_HITS }
+#[no_mangle] pub unsafe fn dbg_ww_last_eip() -> u32 { DBG_WW_LAST_EIP }
+#[no_mangle] pub unsafe fn dbg_ww_last_prev() -> u32 { DBG_WW_LAST_PREV }
+#[no_mangle] pub unsafe fn dbg_ww_last_val() -> u32 { DBG_WW_LAST_VAL }
+#[no_mangle] pub unsafe fn dbg_ww_zero_eip() -> u32 { DBG_WW_ZERO_EIP }
+#[no_mangle] pub unsafe fn dbg_ww_zero_prev() -> u32 { DBG_WW_ZERO_PREV }
+#[no_mangle] pub unsafe fn dbg_ww_zero_hits() -> u32 { DBG_WW_ZERO_HITS }
+
+#[inline(always)]
+pub unsafe fn dbg_check_write(addr: u32, len: u32, value: i32) {
+    let w = DBG_WRITE_WATCH;
+    if w == 0 { return; }
+    // Does [addr, addr+len) cover the watched dword's first byte?
+    if addr <= w && w < addr.wrapping_add(len) {
+        let eip = *crate::cpu::global_pointers::instruction_pointer as u32;
+        let prev = *crate::cpu::global_pointers::previous_ip as u32;
+        DBG_WW_HITS = DBG_WW_HITS.wrapping_add(1);
+        DBG_WW_LAST_EIP = eip;
+        DBG_WW_LAST_PREV = prev;
+        DBG_WW_LAST_VAL = value as u32;
+        if value == 0 {
+            DBG_WW_ZERO_EIP = eip;
+            DBG_WW_ZERO_PREV = prev;
+            DBG_WW_ZERO_HITS = DBG_WW_ZERO_HITS.wrapping_add(1);
+        }
+    }
 }
 
 #[inline(always)]
@@ -3104,7 +3163,15 @@ pub unsafe fn cycle_internal() {
     let initial_eip = *instruction_pointer;
     // ut_step_hook(initial_eip) removed from hot path — UT99 tracer (resolved). dbg_on_instruction
     // stays: it's gated by DBG_ENABLED (off by default), the guest debugger's interpreter hook.
-    dbg_on_instruction(initial_eip as u32);
+    // BottleShip: when ONLY breakpoints are active (no step-trace), restrict the per-block hook to
+    // blocks on a breakpoint's own page. With the JIT page-gate below (page_contains_bp), that page
+    // is the only one interpreted, so a bp fires while the rest of the guest stays full-speed JIT —
+    // no global per-block overhead crawling the boot (the dbg.enable() global-JIT-off problem).
+    if DBG_ENABLED
+        && (DBG_STEP_REMAINING > 0 || DBG_BP_COUNT == 0 || page_contains_bp(initial_eip as u32))
+    {
+        dbg_on_instruction(initial_eip as u32);
+    }
     let initial_state_flags = *state_flags;
 
     match tlb_code[(initial_eip as u32 >> 12) as usize] {
@@ -3242,13 +3309,20 @@ pub unsafe fn cycle_internal() {
         let initial_instruction_counter = *instruction_counter;
         jit_run_interpreted(phys_addr);
 
-        jit::jit_increase_hotness_and_maybe_compile(
-            initial_eip,
-            phys_addr,
-            get_seg_cs() as u32,
-            initial_state_flags,
-            *instruction_counter - initial_instruction_counter,
-        );
+        // BottleShip: never JIT-compile a page that contains a breakpoint. dbg_on_instruction
+        // (the <BP> check) only runs in this interpreter path — JIT'd blocks bypass it. By keeping
+        // ONLY the bp's page interpreted (and letting everything else JIT normally), a breakpoint
+        // fires without the global JIT-off that makes the whole guest crawl (the dbg.enable() path).
+        // dbg_on_instruction is per-block-entry + early-outs when no bp matches, so this is cheap.
+        if DBG_BP_COUNT == 0 || !page_contains_bp(initial_eip as u32) {
+            jit::jit_increase_hotness_and_maybe_compile(
+                initial_eip,
+                phys_addr,
+                get_seg_cs() as u32,
+                initial_state_flags,
+                *instruction_counter - initial_instruction_counter,
+            );
+        }
 
         profiler::stat_increment_by(
             stat::RUN_INTERPRETED_STEPS,
@@ -4134,7 +4208,13 @@ pub unsafe fn read_mmx32s(r: i32) -> i32 { (*fpu_st.offset(r as isize)).mantissa
 
 pub unsafe fn read_mmx64s(r: i32) -> u64 { (*fpu_st.offset(r as isize)).mantissa }
 
-pub unsafe fn write_mmx_reg64(r: i32, data: u64) { (*fpu_st.offset(r as isize)).mantissa = data; }
+#[inline]
+pub unsafe fn mark_fpu_simd_dirty() { *fpu_simd_dirty = 1; }
+
+pub unsafe fn write_mmx_reg64(r: i32, data: u64) {
+    mark_fpu_simd_dirty();
+    (*fpu_st.offset(r as isize)).mantissa = data;
+}
 
 pub unsafe fn read_xmm_f32(r: i32) -> f32 { return (*reg_xmm.offset(r as isize)).f32[0]; }
 
@@ -4144,14 +4224,27 @@ pub unsafe fn read_xmm64s(r: i32) -> u64 { (*reg_xmm.offset(r as isize)).u64[0] 
 
 pub unsafe fn read_xmm128s(r: i32) -> reg128 { return *reg_xmm.offset(r as isize); }
 
-pub unsafe fn write_xmm_f32(r: i32, data: f32) { (*reg_xmm.offset(r as isize)).f32[0] = data; }
+pub unsafe fn write_xmm_f32(r: i32, data: f32) {
+    mark_fpu_simd_dirty();
+    (*reg_xmm.offset(r as isize)).f32[0] = data;
+}
 
-pub unsafe fn write_xmm32(r: i32, data: i32) { (*reg_xmm.offset(r as isize)).i32[0] = data; }
+pub unsafe fn write_xmm32(r: i32, data: i32) {
+    mark_fpu_simd_dirty();
+    (*reg_xmm.offset(r as isize)).i32[0] = data;
+}
 
-pub unsafe fn write_xmm64(r: i32, data: u64) { (*reg_xmm.offset(r as isize)).u64[0] = data }
-pub unsafe fn write_xmm_f64(r: i32, data: f64) { (*reg_xmm.offset(r as isize)).f64[0] = data }
+pub unsafe fn write_xmm64(r: i32, data: u64) {
+    mark_fpu_simd_dirty();
+    (*reg_xmm.offset(r as isize)).u64[0] = data
+}
+pub unsafe fn write_xmm_f64(r: i32, data: f64) {
+    mark_fpu_simd_dirty();
+    (*reg_xmm.offset(r as isize)).f64[0] = data
+}
 
 pub unsafe fn write_xmm128(r: i32, i0: i32, i1: i32, i2: i32, i3: i32) {
+    mark_fpu_simd_dirty();
     let x = reg128 {
         u32: [i0 as u32, i1 as u32, i2 as u32, i3 as u32],
     };
@@ -4159,14 +4252,19 @@ pub unsafe fn write_xmm128(r: i32, i0: i32, i1: i32, i2: i32, i3: i32) {
 }
 
 pub unsafe fn write_xmm128_2(r: i32, i0: u64, i1: u64) {
+    mark_fpu_simd_dirty();
     *reg_xmm.offset(r as isize) = reg128 { u64: [i0, i1] };
 }
 
-pub unsafe fn write_xmm_reg128(r: i32, data: reg128) { *reg_xmm.offset(r as isize) = data; }
+pub unsafe fn write_xmm_reg128(r: i32, data: reg128) {
+    mark_fpu_simd_dirty();
+    *reg_xmm.offset(r as isize) = data;
+}
 
 /// Set the fpu tag word to valid and the top-of-stack to 0 on mmx instructions
 pub fn transition_fpu_to_mmx() {
     unsafe {
+        mark_fpu_simd_dirty();
         fpu_set_tag_word(0);
         *fpu_stack_ptr = 0;
     }
@@ -4208,6 +4306,7 @@ pub unsafe fn set_mxcsr(new_mxcsr: i32) {
         );
     }
 
+    mark_fpu_simd_dirty();
     *mxcsr = new_mxcsr;
 }
 
@@ -4663,6 +4762,7 @@ pub unsafe fn reset_cpu() {
     *fpu_dp_selector = 0;
 
     *mxcsr = 0x1F80;
+    *fpu_simd_dirty = 0;
 
     full_clear_tlb();
 

@@ -24,6 +24,20 @@ pub fn gen_get_eip(builder: &mut WasmBuilder) {
     builder.load_fixed_i32(global_pointers::instruction_pointer as u32);
 }
 
+pub fn gen_mark_fpu_simd_dirty(builder: &mut WasmBuilder) {
+    builder.const_i32(global_pointers::fpu_simd_dirty as i32);
+    builder.const_i32(1);
+    builder.store_u8(0);
+}
+
+pub fn gen_mark_fpu_simd_dirty_once(ctx: &mut JitContext) {
+    if ctx.fpu_simd_dirty_marked {
+        return;
+    }
+    gen_mark_fpu_simd_dirty(ctx.builder);
+    ctx.fpu_simd_dirty_marked = true;
+}
+
 pub fn gen_set_eip_to_after_current_instruction(ctx: &mut JitContext) {
     ctx.builder
         .const_i32(global_pointers::instruction_pointer as i32);
@@ -2666,6 +2680,7 @@ fn gen_fpu_load_relaxed_f64_bits(ctx: &mut JitContext, addr: &WasmLocal) -> Wasm
 }
 
 fn gen_fpu_store_relaxed_f64(ctx: &mut JitContext, addr: &WasmLocal) {
+    gen_mark_fpu_simd_dirty_once(ctx);
     ctx.builder.reinterpret_f64_as_i64();
     let bits = ctx.builder.set_new_local_i64();
     ctx.builder.get_local(addr);
@@ -2678,6 +2693,7 @@ fn gen_fpu_store_relaxed_f64(ctx: &mut JitContext, addr: &WasmLocal) {
 }
 
 fn gen_fpu_copy_raw(ctx: &mut JitContext, src_addr: &WasmLocal, dst_addr: &WasmLocal) {
+    gen_mark_fpu_simd_dirty_once(ctx);
     ctx.builder.get_local(src_addr);
     ctx.builder.load_unaligned_i64(0);
     let lo = ctx.builder.set_new_local_i64();
@@ -2783,6 +2799,7 @@ fn gen_fpu_compare_flags(
 }
 
 fn gen_fpu_write_status_compare_flags(ctx: &mut JitContext, compare_flags: &WasmLocal) {
+    gen_mark_fpu_simd_dirty_once(ctx);
     ctx.builder
         .const_i32(global_pointers::fpu_status_word as i32);
     ctx.builder
@@ -3102,6 +3119,7 @@ pub fn gen_fpu_relaxed_binop_sti(
 }
 
 pub fn gen_fpu_relaxed_pop(ctx: &mut JitContext) {
+    gen_mark_fpu_simd_dirty_once(ctx);
     if !crate::softfloat::is_fpu_relaxed() {
         ctx.builder.call_fn0("fpu_pop");
         return;
@@ -3133,6 +3151,7 @@ pub fn gen_fpu_relaxed_pop(ctx: &mut JitContext) {
 }
 
 pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
+    gen_mark_fpu_simd_dirty_once(ctx);
     // stack: i64 mantissa, i32 tag
     if !crate::softfloat::is_fpu_relaxed() {
         ctx.builder.call_fn2_i64_i32("fpu_push");
@@ -3186,6 +3205,7 @@ pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
 }
 
 pub fn gen_fpu_relaxed_fxch(ctx: &mut JitContext, i: u32) {
+    gen_mark_fpu_simd_dirty_once(ctx);
     if !crate::softfloat::is_fpu_relaxed() {
         ctx.builder.const_i32(i as i32);
         ctx.builder.call_fn1("fpu_fxch");

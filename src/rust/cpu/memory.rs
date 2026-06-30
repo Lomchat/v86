@@ -191,6 +191,7 @@ pub unsafe fn write8(addr: u32, value: i32) {
 }
 
 pub unsafe fn write8_no_mmap_or_dirty_check(addr: u32, value: i32) {
+    crate::cpu::cpu::dbg_check_write(addr, 1, value & 0xFF);
     *mem8.offset(addr as isize) = value as u8
 }
 
@@ -205,6 +206,7 @@ pub unsafe fn write16(addr: u32, value: i32) {
     };
 }
 pub unsafe fn write16_no_mmap_or_dirty_check(addr: u32, value: i32) {
+    crate::cpu::cpu::dbg_check_write(addr, 2, value & 0xFFFF);
     ptr::write_unaligned(mem8.offset(addr as isize) as *mut u16, value as u16)
 }
 
@@ -220,6 +222,7 @@ pub unsafe fn write32(addr: u32, value: i32) {
 }
 
 pub unsafe fn write32_no_mmap_or_dirty_check(addr: u32, value: i32) {
+    crate::cpu::cpu::dbg_check_write(addr, 4, value);
     ptr::write_unaligned(mem8.offset(addr as isize) as *mut i32, value)
 }
 

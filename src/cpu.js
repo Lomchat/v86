@@ -101,6 +101,9 @@ export function CPU(bus, wm, stop_idling)
     this.jit_block_chaining_supported =
         return_call_indirect_supported() && !globalThis.DISABLE_JIT_BLOCK_CHAINING;
     this.set_jit_config(4, this.jit_block_chaining_supported ? 1 : 0);
+    // Default ON — kill-switch: globalThis.DISABLE_JIT_DEAD_FLAG_ELISION
+    this.jit_dead_flag_elision_enabled = !globalThis.DISABLE_JIT_DEAD_FLAG_ELISION;
+    this.set_jit_config(5, this.jit_dead_flag_elision_enabled ? 1 : 0);
     this.create_jit_imports();
 
     const memory = this.wm.exports.memory;
@@ -209,6 +212,8 @@ export function CPU(bus, wm, stop_idling)
     };
 
     this.instruction_counter = view(Uint32Array, memory, 664, 1);
+    this.fpu_simd_dirty = view(Uint8Array, memory, 632, 1);
+    this.fpu_simd_dirty[0] = 0;
 
     // registers
     this.reg32 = view(Int32Array, memory, 64, 8);

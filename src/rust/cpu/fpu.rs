@@ -25,6 +25,7 @@ const FPU_EX_SF: u16 = 1 << 6;
 pub fn fpu_write_st(index: i32, value: F80) {
     dbg_assert!(index >= 0 && index < 8);
     unsafe {
+        mark_fpu_simd_dirty();
         *fpu_st.offset(index as isize) = value;
     }
 }
@@ -42,16 +43,19 @@ pub unsafe fn fpu_get_st0() -> F80 {
 }
 pub unsafe fn fpu_stack_fault() {
     // TODO: Interrupt
+    mark_fpu_simd_dirty();
     *fpu_status_word |= FPU_EX_SF | FPU_EX_I;
 }
 
 pub unsafe fn fpu_zero_fault() {
     // TODO: Interrupt
+    mark_fpu_simd_dirty();
     *fpu_status_word |= FPU_EX_Z;
 }
 
 pub unsafe fn fpu_underflow_fault() {
     // TODO: Interrupt
+    mark_fpu_simd_dirty();
     *fpu_status_word |= FPU_EX_U;
 }
 
@@ -169,7 +173,10 @@ pub unsafe fn fpu_fadd(target_index: i32, val: F80) {
     fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0 + val);
     *fpu_status_word |= F80::get_exception_flags() as u16;
 }
-pub unsafe fn fpu_fclex() { *fpu_status_word = 0; }
+pub unsafe fn fpu_fclex() {
+    mark_fpu_simd_dirty();
+    *fpu_status_word = 0;
+}
 pub unsafe fn fpu_fcmovcc(condition: bool, r: i32) {
     // outside of the condition is correct: A stack fault happens even if the condition is not
     // fulfilled
@@ -187,6 +194,7 @@ pub unsafe fn fpu_fcmovcc(condition: bool, r: i32) {
 
 #[no_mangle]
 pub unsafe fn fpu_fcom(y: F80) {
+    mark_fpu_simd_dirty();
     F80::clear_exception_flags();
     let x = fpu_get_st0();
     *fpu_status_word &= !FPU_RESULT_FLAGS;
@@ -224,6 +232,7 @@ pub unsafe fn fpu_fcomip(r: i32) {
 #[no_mangle]
 pub unsafe fn fpu_pop() {
     dbg_assert!(*fpu_stack_ptr < 8);
+    mark_fpu_simd_dirty();
     *fpu_stack_empty |= 1 << *fpu_stack_ptr;
     *fpu_stack_ptr = *fpu_stack_ptr + 1 & 7;
 }
@@ -249,7 +258,10 @@ pub unsafe fn fpu_fdivr(target_index: i32, val: F80) {
     *fpu_status_word |= F80::get_exception_flags() as u16;
 }
 #[no_mangle]
-pub unsafe fn fpu_ffree(r: i32) { *fpu_stack_empty |= 1 << (*fpu_stack_ptr as i32 + r & 7); }
+pub unsafe fn fpu_ffree(r: i32) {
+    mark_fpu_simd_dirty();
+    *fpu_stack_empty |= 1 << (*fpu_stack_ptr as i32 + r & 7);
+}
 
 pub unsafe fn fpu_fildm16(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i16(addr))); }
 pub unsafe fn fpu_fildm32(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i32(addr))); }
@@ -257,6 +269,7 @@ pub unsafe fn fpu_fildm64(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i6
 
 #[no_mangle]
 pub unsafe fn fpu_push(x: F80) {
+    mark_fpu_simd_dirty();
     *fpu_stack_ptr = *fpu_stack_ptr - 1 & 7;
     if 0 != *fpu_stack_empty >> *fpu_stack_ptr & 1 {
         *fpu_status_word &= !FPU_C1;
@@ -270,6 +283,7 @@ pub unsafe fn fpu_push(x: F80) {
     };
 }
 pub unsafe fn fpu_finit() {
+    mark_fpu_simd_dirty();
     set_control_word(0x37F);
     *fpu_status_word = 0;
     *fpu_ip = 0;
@@ -281,6 +295,7 @@ pub unsafe fn fpu_finit() {
 
 #[no_mangle]
 pub unsafe fn set_control_word(cw: u16) {
+    mark_fpu_simd_dirty();
     *fpu_control_word = cw;
 
     let rc = cw >> 10 & 3;
@@ -308,7 +323,10 @@ pub unsafe fn set_control_word(cw: u16) {
     });
 }
 
-pub unsafe fn fpu_invalid_arithmetic() { *fpu_status_word |= FPU_EX_I; }
+pub unsafe fn fpu_invalid_arithmetic() {
+    mark_fpu_simd_dirty();
+    *fpu_status_word |= FPU_EX_I;
+}
 
 #[no_mangle]
 pub unsafe fn fpu_convert_to_i16(f: F80) -> i16 {
@@ -440,6 +458,7 @@ pub unsafe fn fpu_unimpl() {
     trigger_ud();
 }
 pub unsafe fn fpu_set_tag_word(tag_word: i32) {
+    mark_fpu_simd_dirty();
     *fpu_stack_empty = 0;
     for i in 0..8 {
         let empty = tag_word >> (2 * i) & 3 == 3;
@@ -447,6 +466,7 @@ pub unsafe fn fpu_set_tag_word(tag_word: i32) {
     }
 }
 pub unsafe fn fpu_set_status_word(sw: u16) {
+    mark_fpu_simd_dirty();
     *fpu_status_word = sw & !(7 << 11);
     *fpu_stack_ptr = (sw >> 11 & 7) as u8;
 }
@@ -531,6 +551,7 @@ pub unsafe fn fpu_frstor16(_addr: i32) {
 }
 pub unsafe fn fpu_frstor32(mut addr: i32) {
     return_on_pagefault!(readable_or_pagefault(addr, 28 + 8 * 10));
+    mark_fpu_simd_dirty();
     fpu_fldenv32(addr);
     addr += 28;
     for i in 0..8 {
@@ -710,6 +731,7 @@ pub unsafe fn fpu_fsubr(target_index: i32, val: F80) {
 }
 
 pub unsafe fn fpu_ftst() {
+    mark_fpu_simd_dirty();
     let x = fpu_get_st0();
     *fpu_status_word &= !FPU_RESULT_FLAGS;
     if x.is_nan() {
@@ -726,6 +748,7 @@ pub unsafe fn fpu_ftst() {
 
 #[no_mangle]
 pub unsafe fn fpu_fucom(r: i32) {
+    mark_fpu_simd_dirty();
     F80::clear_exception_flags();
     let x = fpu_get_st0();
     let y = fpu_get_sti(r);
@@ -741,6 +764,7 @@ pub unsafe fn fpu_fucom(r: i32) {
 
 #[no_mangle]
 pub unsafe fn fpu_fucomi(r: i32) {
+    mark_fpu_simd_dirty();
     F80::clear_exception_flags();
     let x = fpu_get_st0();
     let y = fpu_get_sti(r);
@@ -775,6 +799,7 @@ pub unsafe fn fpu_fucompp() {
 }
 
 pub unsafe fn fpu_fxam() {
+    mark_fpu_simd_dirty();
     let x = fpu_get_st0();
     *fpu_status_word &= !FPU_RESULT_FLAGS;
     *fpu_status_word |= (x.sign() as u16) << 9;
@@ -941,11 +966,13 @@ pub unsafe fn fpu_fcos() {
 }
 
 pub unsafe fn fpu_fdecstp() {
+    mark_fpu_simd_dirty();
     *fpu_stack_ptr = *fpu_stack_ptr - 1 & 7;
     *fpu_status_word &= !FPU_C1
 }
 
 pub unsafe fn fpu_fincstp() {
+    mark_fpu_simd_dirty();
     *fpu_stack_ptr = *fpu_stack_ptr + 1 & 7;
     *fpu_status_word &= !FPU_C1
 }

@@ -148,6 +148,13 @@ pub enum stat {
     MODULE_CHAINED_EDGE,
     MODULE_CHAIN_BUDGET_EXIT,
     MODULE_CHAIN_MISS,
+
+    // Dead-flag elision (always-on, read via profiler_dispatch_stat_get 8/9). Compile-time counts:
+    //   DEAD_FLAG_ELISION_CANDIDATE — instructions that fully overwrite flags (walk entered).
+    //   DEAD_FLAG_ELIDED            — of those, instructions whose flag writes were elided
+    //                                (flags proven dead via the intra-block non-faulting walk).
+    DEAD_FLAG_ELISION_CANDIDATE,
+    DEAD_FLAG_ELIDED,
 }
 
 #[allow(non_upper_case_globals)]
@@ -211,6 +218,8 @@ pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
         5 => stat::MODULE_CHAINED_EDGE,
         6 => stat::MODULE_CHAIN_BUDGET_EXIT,
         7 => stat::MODULE_CHAIN_MISS,
+        8 => stat::DEAD_FLAG_ELISION_CANDIDATE,
+        9 => stat::DEAD_FLAG_ELIDED,
         _ => return 0.0,
     };
     unsafe { stat_array[stat as usize] as f64 }

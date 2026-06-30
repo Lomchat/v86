@@ -397,6 +397,7 @@ pub unsafe fn fxsave(addr: i32) {
 pub unsafe fn fxrstor(addr: i32) {
     dbg_assert!(addr & 0xF == 0, "TODO: #gp");
     return_on_pagefault!(readable_or_pagefault(addr, 288));
+    mark_fpu_simd_dirty();
 
     let new_mxcsr = safe_read32s(addr + 24).unwrap();
 

@@ -158,6 +158,7 @@ function print_misc_stats(cpu)
     text += "JIT_USE_LOOP_SAFETY=" + Boolean(cpu.wm.exports["get_jit_config"](2)) + "\n";
     text += "MAX_EXTRA_BASIC_BLOCKS=" + cpu.wm.exports["get_jit_config"](3) + "\n";
     text += "JIT_BLOCK_CHAINING=" + Boolean(cpu.wm.exports["get_jit_config"](4)) + "\n";
+    text += "JIT_DEAD_FLAG_ELISION=" + Boolean(cpu.wm.exports["get_jit_config"](5)) + "\n";
 
     text += dispatch_characterisation(cpu);
 

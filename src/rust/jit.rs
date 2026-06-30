@@ -71,6 +71,7 @@ static mut MAX_PAGES: u32 = 3;
 
 static mut JIT_USE_LOOP_SAFETY: bool = true;
 static mut JIT_BLOCK_CHAINING: bool = false;
+static mut JIT_DEAD_FLAG_ELISION: bool = false;
 
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
@@ -83,6 +84,7 @@ pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 pub static mut DISPATCH_STATS: bool = false;
 pub fn dispatch_stats_enabled() -> bool { unsafe { DISPATCH_STATS } }
 fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
+fn dead_flag_elision_enabled() -> bool { unsafe { JIT_DEAD_FLAG_ELISION } }
 
 #[no_mangle]
 pub fn set_dispatch_stats(enabled: u32) { unsafe { DISPATCH_STATS = enabled != 0; } }
@@ -336,6 +338,8 @@ pub struct JitContext<'a> {
     pub exit_label: Label,
     pub current_instruction: Instruction,
     pub previous_instruction: Instruction,
+    pub fpu_simd_dirty_marked: bool,
+    pub elide_current_flags: bool,
     pub instruction_counter: WasmLocal,
 }
 impl<'a> JitContext<'a> {
@@ -354,6 +358,148 @@ pub const JIT_INSTR_BLOCK_BOUNDARY_FLAG: u32 = 1 << 0;
 
 pub fn is_near_end_of_page(address: u32) -> bool {
     address & 0xFFF >= 0x1000 - MAX_INSTRUCTION_LENGTH
+}
+
+// Classification of one x86 instruction for the dead-flag liveness walk. Safe by construction:
+// the walk only ELIDES when it can prove flags dead, so anything not provably an `Overwrite` or a
+// provably-clean `NeutralNoFault` is `Stop` — we never need to enumerate flag *readers* precisely.
+#[derive(Copy, Clone, PartialEq)]
+enum FlagClass {
+    // Fully overwrites every lazy-tracked flag (CF/PF/AF/ZF/SF/OF) before reading any.
+    // non_faulting = the instruction cannot fault before the overwrite (register-only form).
+    Overwrite { non_faulting: bool },
+    // Provably touches NO flags AND cannot fault (register-only mov/lea/movzx/movsx/nop) — safe to
+    // skip over while walking forward to the next flag-overwriter.
+    NeutralNoFault,
+    // Everything else: reads a flag (Jcc/ADC/SBB/SETcc/CMOVcc/PUSHF/LAHF/…), modifies flags
+    // partially (INC/DEC/shift/rotate/SAHF/POPF), can fault (any memory operand), or is
+    // control-flow/unrecognized. Conservatively stops the walk WITHOUT eliding.
+    Stop,
+}
+
+fn read_jit_u8(addr: u32) -> u8 { memory::read8(addr) as u8 }
+
+fn skip_instruction_prefixes(mut addr: u32) -> u32 {
+    loop {
+        match read_jit_u8(addr) {
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
+                addr += 1;
+            },
+            _ => return addr,
+        }
+    }
+}
+
+fn decode_jit_opcode(addr: u32) -> (u32, u32) {
+    let opcode_addr = skip_instruction_prefixes(addr);
+    let opcode = read_jit_u8(opcode_addr);
+    if opcode == 0x0F {
+        (0x100 | read_jit_u8(opcode_addr + 1) as u32, opcode_addr + 2)
+    }
+    else {
+        (opcode as u32, opcode_addr + 1)
+    }
+}
+
+fn group_alu_is_full_overwrite(group: u8) -> bool {
+    matches!(group, 0 | 1 | 4 | 5 | 6 | 7)
+}
+
+fn classify_flag_class(addr: u32) -> FlagClass {
+    let (opcode, operand_addr) = decode_jit_opcode(addr);
+    // Read the byte after the opcode; only meaningful for opcodes that actually have a ModRM.
+    // For no-ModRM opcodes (imm/reg-encoded/NOP) the branches below don't consult it.
+    let modrm = read_jit_u8(operand_addr);
+    let reg_only = modrm & 0xC0 == 0xC0;
+
+    match opcode {
+        // --- Full flag overwriters: ADD/OR/AND/SUB/XOR/CMP r/m<->reg, TEST r/m,reg ---
+        // Register-only forms can't fault before overwriting flags; memory forms can.
+        0x00..=0x03 | 0x08..=0x0B | 0x20..=0x23 | 0x28..=0x2B | 0x30..=0x33
+        | 0x38..=0x3B | 0x84 | 0x85 => FlagClass::Overwrite { non_faulting: reg_only },
+
+        // Accumulator-immediate ALU/TEST (no ModRM, no memory) — always non-faulting.
+        0x04 | 0x05 | 0x0C | 0x0D | 0x24 | 0x25 | 0x2C | 0x2D | 0x34 | 0x35
+        | 0x3C | 0x3D | 0xA8 | 0xA9 => FlagClass::Overwrite { non_faulting: true },
+
+        // Group 1 ALU immediates: /0 ADD /1 OR /4 AND /5 SUB /6 XOR /7 CMP overwrite;
+        // /2 ADC /3 SBB read CF → Stop.
+        0x80 | 0x81 | 0x82 | 0x83 => {
+            if group_alu_is_full_overwrite((modrm >> 3) & 7) {
+                FlagClass::Overwrite { non_faulting: reg_only }
+            }
+            else {
+                FlagClass::Stop
+            }
+        },
+
+        // Group 3 /0 TEST imm overwrites; /2 NOT doesn't touch flags but other /n
+        // (NEG/MUL/IMUL/DIV/IDIV) set them in special ways → Stop for everything but /0.
+        0xF6 | 0xF7 => {
+            if (modrm >> 3) & 7 == 0 {
+                FlagClass::Overwrite { non_faulting: reg_only }
+            }
+            else {
+                FlagClass::Stop
+            }
+        },
+
+        // --- Flag-neutral, non-faulting (register-only forms only; memory forms can #PF) ---
+        0x88 | 0x89 | 0x8A | 0x8B => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::Stop }, // MOV r/m<->reg
+        0x8D => FlagClass::NeutralNoFault,                                                               // LEA (no deref, no flags)
+        0xB0..=0xBF => FlagClass::NeutralNoFault,                                                        // MOV reg, imm
+        0xC6 | 0xC7 => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::Stop },               // MOV r/m, imm
+        0x90 => FlagClass::NeutralNoFault,                                                               // NOP
+        0x1B6 | 0x1B7 | 0x1BE | 0x1BF => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::Stop }, // MOVZX/MOVSX
+
+        _ => FlagClass::Stop,
+    }
+}
+
+fn instruction_end(cpu: &CpuContext, addr: u32) -> u32 {
+    let mut step_cpu = cpu.clone();
+    step_cpu.eip = addr;
+    analysis::analyze_step(&mut step_cpu);
+    step_cpu.eip
+}
+
+// How far to look ahead for the next flag-overwriter before giving up (bounded so compile time
+// stays predictable; pointer-chase prologues rarely have long flag-neutral runs).
+const FLAG_LIVENESS_WALK_LIMIT: u32 = 8;
+
+fn should_elide_current_flags(cpu: &CpuContext, current_addr: u32, block_end: u32) -> bool {
+    if !dead_flag_elision_enabled() {
+        return false;
+    }
+    // The current instruction must itself fully overwrite the flags — only then is there a flag
+    // computation to skip (the elision-aware emitters fire on these opcodes).
+    if !matches!(classify_flag_class(current_addr), FlagClass::Overwrite { .. }) {
+        return false;
+    }
+    profiler::stat_increment_always(stat::DEAD_FLAG_ELISION_CANDIDATE);
+
+    // Walk forward, skipping flag-neutral non-faulting instructions, until the flags are proven
+    // dead (a non-faulting full overwriter reached first) or possibly-live (a reader / partial /
+    // faulting / control-flow instruction, the block end, or the step limit).
+    let mut addr = instruction_end(cpu, current_addr);
+    let mut steps = 0;
+    while addr > current_addr && addr < block_end && steps < FLAG_LIVENESS_WALK_LIMIT {
+        match classify_flag_class(addr) {
+            // A faulting overwriter could #PF before overwriting, and the fault frame would need the
+            // (now elided) architectural flags — so only a non-faulting overwriter proves dead.
+            FlagClass::Overwrite { non_faulting: true } => {
+                profiler::stat_increment_always(stat::DEAD_FLAG_ELIDED);
+                return true;
+            },
+            FlagClass::Overwrite { non_faulting: false } => return false,
+            FlagClass::NeutralNoFault => {
+                addr = instruction_end(cpu, addr);
+                steps += 1;
+            },
+            FlagClass::Stop => return false,
+        }
+    }
+    false
 }
 
 pub fn jit_find_cache_entry(phys_address: u32, state_flags: CachedStateFlags) -> CachedCode {
@@ -1303,6 +1449,8 @@ fn jit_generate_module(
         exit_label,
         current_instruction: Instruction::Other,
         previous_instruction: Instruction::Other,
+        fpu_simd_dirty_marked: false,
+        elide_current_flags: false,
         instruction_counter,
     };
 
@@ -2151,6 +2299,8 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
     ctx.cpu.eip = start_addr;
     ctx.current_instruction = Instruction::Other;
     ctx.previous_instruction = Instruction::Other;
+    ctx.fpu_simd_dirty_marked = false;
+    ctx.elide_current_flags = false;
 
     loop {
         let mut instruction = 0;
@@ -2177,6 +2327,7 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
 
         ctx.start_of_current_instruction = ctx.cpu.eip;
         let start_eip = ctx.cpu.eip;
+        ctx.elide_current_flags = should_elide_current_flags(&*ctx.cpu, start_eip, stop_addr);
         let mut instruction_flags = 0;
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;
@@ -2551,6 +2702,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         2 => JIT_USE_LOOP_SAFETY = value != 0,
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
         4 => JIT_BLOCK_CHAINING = value != 0,
+        5 => JIT_DEAD_FLAG_ELISION = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -2563,6 +2715,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         2 => JIT_USE_LOOP_SAFETY as u32,
         3 => MAX_EXTRA_BASIC_BLOCKS as u32,
         4 => JIT_BLOCK_CHAINING as u32,
+        5 => JIT_DEAD_FLAG_ELISION as u32,
         _ => 0,
     }
 }

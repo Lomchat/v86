@@ -467,7 +467,92 @@ fn instruction_end(cpu: &CpuContext, addr: u32) -> u32 {
 // stays predictable; pointer-chase prologues rarely have long flag-neutral runs).
 const FLAG_LIVENESS_WALK_LIMIT: u32 = 8;
 
-fn should_elide_current_flags(cpu: &CpuContext, current_addr: u32, block_end: u32) -> bool {
+// Continues the flag-liveness walk from `addr_in` (inside `block`, which ends at
+// `block.end_addr`) onward. `origin_addr` is the address of the original flag-overwriting
+// instruction we're trying to elide — fixed for the whole (possibly cross-block) walk, used only
+// as a wraparound sanity guard, same as in the original single-block version.
+//
+// When the walk runs off the end of `block` still undecided, it does NOT stop there: the
+// compiled module already knows this block's successor edge(s) exactly (BasicBlockType's
+// next_block_addr / next_block_branch_taken_addr are resolved at compile time from the real CFG,
+// not profiled/speculative), so we keep walking into the sole Normal successor. Only Normal
+// reaches this point in practice: the block-discovery loop's only way to end a block WITHOUT a
+// real control-flow instruction is the artificial merge-split for Normal (jit.rs, discovery loop
+// — `basic_blocks.contains_key(&current_address)` cuts the block at a plain non-branching
+// instruction because another path already made that address a block entry). ConditionalJump has
+// no equivalent: it is only ever created from an actually-decoded Jcc (AnalysisType::Jump
+// {condition: Some(_)}), so `block.last_instruction_addr` is always that Jcc — and since Jcc
+// necessarily reads flags, classify_flag_class's Stop for it fires during the walk above, before
+// `addr` can reach `block.end_addr`. So the ConditionalJump arm below is unreachable by
+// construction, not just untested — see its comment.
+fn flags_dead_from_addr(
+    cpu: &CpuContext,
+    origin_addr: u32,
+    addr_in: u32,
+    block: &BasicBlock,
+    basic_blocks: &HashMap<u32, BasicBlock>,
+    steps: &mut u32,
+) -> bool {
+    let mut addr = addr_in;
+    while addr > origin_addr && addr < block.end_addr && *steps < FLAG_LIVENESS_WALK_LIMIT {
+        match classify_flag_class(addr) {
+            // A faulting overwriter could #PF before overwriting, and the fault frame would need the
+            // (now elided) architectural flags — so only a non-faulting overwriter proves dead.
+            FlagClass::Overwrite { non_faulting: true } => {
+                profiler::stat_increment_always(stat::DEAD_FLAG_ELIDED);
+                return true;
+            },
+            FlagClass::Overwrite { non_faulting: false } => return false,
+            FlagClass::NeutralNoFault => {
+                addr = instruction_end(cpu, addr);
+                *steps += 1;
+            },
+            FlagClass::Stop => return false,
+        }
+    }
+
+    if addr != block.end_addr || *steps >= FLAG_LIVENESS_WALK_LIMIT {
+        // Either resolved to false already (Stop / faulting overwriter) or ran out of budget.
+        return false;
+    }
+
+    match &block.ty {
+        BasicBlockType::Normal { next_block_addr: Some(next), .. } => match basic_blocks.get(next) {
+            Some(next_block) => {
+                flags_dead_from_addr(cpu, origin_addr, *next, next_block, basic_blocks, steps)
+            },
+            // Successor isn't part of this compiled module (e.g. not yet discovered) — can't
+            // prove anything about it, so don't elide.
+            None => false,
+        },
+        BasicBlockType::ConditionalJump { .. } => {
+            // Unreachable by construction (see the walk's doc comment above): a
+            // ConditionalJump block always ends on a real Jcc, and Jcc always reads flags, so
+            // the while-loop above always resolves via Stop before addr can reach
+            // block.end_addr. Canary, not a load-bearing check — debug_assert! is compiled out
+            // in release, zero cost. If block-discovery ever changes so a ConditionalJump block
+            // can end elsewhere, this fires instead of silently mis-proving flags dead across a
+            // branch we never actually evaluated.
+            dbg_assert!(
+                false,
+                "flags_dead_from_addr: ConditionalJump reached block.end_addr — should be \
+                 unreachable, its terminating Jcc always resolves via Stop first"
+            );
+            false
+        },
+        // AbsoluteEip / Exit (no statically known successor) or a partially-unresolved
+        // Normal edge (e.g. target crosses into an unmapped page): stop here, same as the
+        // original single-block behavior.
+        _ => false,
+    }
+}
+
+fn should_elide_current_flags(
+    cpu: &CpuContext,
+    current_addr: u32,
+    block: &BasicBlock,
+    basic_blocks: &HashMap<u32, BasicBlock>,
+) -> bool {
     if !dead_flag_elision_enabled() {
         return false;
     }
@@ -480,26 +565,10 @@ fn should_elide_current_flags(cpu: &CpuContext, current_addr: u32, block_end: u3
 
     // Walk forward, skipping flag-neutral non-faulting instructions, until the flags are proven
     // dead (a non-faulting full overwriter reached first) or possibly-live (a reader / partial /
-    // faulting / control-flow instruction, the block end, or the step limit).
-    let mut addr = instruction_end(cpu, current_addr);
+    // faulting / control-flow instruction, a dead end at module scope, or the step limit).
+    let addr = instruction_end(cpu, current_addr);
     let mut steps = 0;
-    while addr > current_addr && addr < block_end && steps < FLAG_LIVENESS_WALK_LIMIT {
-        match classify_flag_class(addr) {
-            // A faulting overwriter could #PF before overwriting, and the fault frame would need the
-            // (now elided) architectural flags — so only a non-faulting overwriter proves dead.
-            FlagClass::Overwrite { non_faulting: true } => {
-                profiler::stat_increment_always(stat::DEAD_FLAG_ELIDED);
-                return true;
-            },
-            FlagClass::Overwrite { non_faulting: false } => return false,
-            FlagClass::NeutralNoFault => {
-                addr = instruction_end(cpu, addr);
-                steps += 1;
-            },
-            FlagClass::Stop => return false,
-        }
-    }
-    false
+    flags_dead_from_addr(cpu, current_addr, addr, block, basic_blocks, &mut steps)
 }
 
 pub fn jit_find_cache_entry(phys_address: u32, state_flags: CachedStateFlags) -> CachedCode {
@@ -1525,7 +1594,7 @@ fn jit_generate_module(
         match block {
             Work::WasmStructure(WasmStructure::BasicBlock(addr)) => {
                 let block = basic_blocks.get(&addr).unwrap();
-                jit_generate_basic_block(ctx, block);
+                jit_generate_basic_block(ctx, block, basic_blocks);
 
                 if block.has_sti {
                     match block.ty {
@@ -2266,7 +2335,11 @@ fn jit_generate_module(
     return entries;
 }
 
-fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
+fn jit_generate_basic_block(
+    ctx: &mut JitContext,
+    block: &BasicBlock,
+    basic_blocks: &HashMap<u32, BasicBlock>,
+) {
     let needs_eip_updated = match block.ty {
         BasicBlockType::Exit => true,
         _ => false,
@@ -2327,7 +2400,8 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
 
         ctx.start_of_current_instruction = ctx.cpu.eip;
         let start_eip = ctx.cpu.eip;
-        ctx.elide_current_flags = should_elide_current_flags(&*ctx.cpu, start_eip, stop_addr);
+        ctx.elide_current_flags =
+            should_elide_current_flags(&*ctx.cpu, start_eip, block, basic_blocks);
         let mut instruction_flags = 0;
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;

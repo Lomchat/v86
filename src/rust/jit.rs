@@ -21,7 +21,8 @@ use crate::page::Page;
 use crate::profiler;
 use crate::profiler::stat;
 use crate::state_flags::CachedStateFlags;
-use crate::wasmgen::wasm_builder::{Label, WasmBuilder, WasmLocal};
+use crate::trace_profiler;
+use crate::wasmgen::wasm_builder::{Label, WasmBuilder, WasmLocal, WasmLocalI64};
 
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
 #[repr(transparent)]
@@ -72,6 +73,24 @@ static mut MAX_PAGES: u32 = 3;
 static mut JIT_USE_LOOP_SAFETY: bool = true;
 static mut JIT_BLOCK_CHAINING: bool = false;
 static mut JIT_DEAD_FLAG_ELISION: bool = false;
+static mut JIT_FASTMEM_READS: bool = false;
+static mut JIT_X87_LOCALS: bool = false;
+static mut JIT_PUSH_RUN_COALESCING: bool = false;
+
+// Tier-2R (E2b, plan/tier2-region-recompiler.md §5): grow page groups across
+// indirect edges using trace_profiler target histograms, and make hot indirect
+// targets dispatcher entries so AbsoluteEip re-dispatches stay intra-module.
+// Off by default; requires collected trace2 data to have any effect.
+static mut JIT_INDIRECT_REGIONS: bool = false;
+static mut JIT_INDIRECT_REGION_MIN_SHARE: u32 = 5; // percent of per-site hits
+const JIT_INDIRECT_REGION_MAX_TARGETS: usize = 16;
+// Page budget for region growth ACROSS INDIRECT EDGES only — kept separate from
+// the global MAX_PAGES (which caps normal direct-jump BFS at 3). Raising the
+// global cap instead bloats EVERY module via long direct-call chains and OOMs
+// V8 on NFSU (large generated functions / br_tables — v86's own warning). Here
+// only a dispatcher block that hits recorded hot targets grows, and only up to
+// this many pages, prioritising the hottest targets first.
+static mut JIT_INDIRECT_REGION_MAX_PAGES: u32 = 8;
 
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
@@ -85,6 +104,237 @@ pub static mut DISPATCH_STATS: bool = false;
 pub fn dispatch_stats_enabled() -> bool { unsafe { DISPATCH_STATS } }
 fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
 fn dead_flag_elision_enabled() -> bool { unsafe { JIT_DEAD_FLAG_ELISION } }
+
+// Indices 0/1 remain as stable stat-array slots + TS label names ('tlbFullClear',
+// 'tlbClear'); the TLB-clear sites no longer bump (see cpu.rs), so nothing emits
+// them from Rust now — kept for the stats layout and possible future use.
+#[allow(dead_code)]
+pub const FASTMEM_BUMP_TLB_FULL_CLEAR: u32 = 0;
+#[allow(dead_code)]
+pub const FASTMEM_BUMP_TLB_CLEAR: u32 = 1;
+pub const FASTMEM_BUMP_INVLPG: u32 = 2;
+#[allow(dead_code)]
+pub const FASTMEM_BUMP_ADDRESS_SPACE_PROTECT: u32 = 3;
+#[allow(dead_code)]
+pub const FASTMEM_BUMP_ADDRESS_SPACE_RELEASE: u32 = 4;
+#[allow(dead_code)]
+pub const FASTMEM_BUMP_PAGE_TABLE_DECOMMIT: u32 = 5;
+#[allow(dead_code)]
+pub const FASTMEM_BUMP_PAGE_TABLE_COMMIT: u32 = 6;
+#[allow(dead_code)]
+pub const FASTMEM_BUMP_PAGE_TABLE_PROTECT: u32 = 7;
+pub const FASTMEM_BUMP_WRITE_WATCH: u32 = 8;
+#[allow(dead_code)]
+pub const FASTMEM_BUMP_MANUAL: u32 = 9;
+const FASTMEM_BUMP_SOURCE_COUNT: usize = 10;
+
+static mut FASTMEM_BUMPS_BY_SOURCE: [u32; FASTMEM_BUMP_SOURCE_COUNT] =
+    [0; FASTMEM_BUMP_SOURCE_COUNT];
+static mut FASTMEM_SPECULATED_LOADS_COMPILED: u32 = 0;
+static mut FASTMEM_DEOPT_RECOMPILES: u32 = 0;
+static mut FASTMEM_THRASH_LATCHED: bool = false;
+
+// Coarse remap-thrash latch, using guest icount as the clock.
+static mut FASTMEM_THRASH_WINDOW_START: u32 = 0;
+static mut FASTMEM_THRASH_WINDOW_BUMPS: u32 = 0;
+// ~50M guest instructions ≈ a fraction of a second at in-game rates.
+const FASTMEM_THRASH_WINDOW_ICOUNT: u32 = 50_000_000;
+// > ~4 remaps/frame sustained across the window.
+const FASTMEM_THRASH_BUMP_LIMIT: u32 = 240;
+
+// Compile-site counters; runtime hit/fill split is not instrumented.
+static mut X87_LOCAL_CACHE_LOAD_SITES_COMPILED: u32 = 0;
+static mut X87_LOCAL_CACHE_STORES_COMPILED: u32 = 0;
+static mut X87_LOCAL_CACHE_INVALIDATES_COMPILED: u32 = 0;
+
+static mut PUSH_RUN_SITES_COMPILED: u32 = 0;
+static mut PUSH_RUN_REUSE_BRANCHES_COMPILED: u32 = 0;
+
+// Mirrors emulator-config.ts; dbg.fastmemReads asserts equality.
+pub const FASTMEM_LOW_MEM_END: u32 = 0x0010_0000;
+pub const FASTMEM_GUARD_BASE: u32 = 0x2300_0000;
+pub const FASTMEM_GUARD_SIZE: u32 = 0x0100_0000;
+
+#[no_mangle]
+pub fn fastmem_get_low_mem_end() -> u32 { FASTMEM_LOW_MEM_END }
+#[no_mangle]
+pub fn fastmem_get_guard_base() -> u32 { FASTMEM_GUARD_BASE }
+#[no_mangle]
+pub fn fastmem_get_guard_size() -> u32 { FASTMEM_GUARD_SIZE }
+
+#[inline]
+pub fn fastmem_current_generation() -> u64 {
+    unsafe { *global_pointers::fastmem_generation }
+}
+
+#[inline]
+pub fn fastmem_compile_generation(state_flags: CachedStateFlags) -> Option<u64> {
+    unsafe {
+        if !JIT_FASTMEM_READS
+            || !state_flags.is_32()
+            || !*global_pointers::protected_mode
+            || (*global_pointers::cr & cpu::CR0_PG) == 0
+            || FASTMEM_THRASH_LATCHED
+        {
+            None
+        }
+        else {
+            Some(*global_pointers::fastmem_generation)
+        }
+    }
+}
+
+#[inline]
+pub fn x87_locals_enabled() -> bool { unsafe { JIT_X87_LOCALS } }
+
+#[inline]
+pub fn push_run_coalescing_enabled() -> bool { unsafe { JIT_PUSH_RUN_COALESCING } }
+
+#[inline]
+pub fn x87_locals_note_cache_load_site_compiled() {
+    unsafe {
+        X87_LOCAL_CACHE_LOAD_SITES_COMPILED =
+            X87_LOCAL_CACHE_LOAD_SITES_COMPILED.saturating_add(1);
+    }
+}
+
+#[inline]
+pub fn x87_locals_note_cache_store_compiled() {
+    unsafe {
+        X87_LOCAL_CACHE_STORES_COMPILED =
+            X87_LOCAL_CACHE_STORES_COMPILED.saturating_add(1);
+    }
+}
+
+#[inline]
+pub fn x87_locals_note_cache_invalidate_compiled() {
+    unsafe {
+        X87_LOCAL_CACHE_INVALIDATES_COMPILED =
+            X87_LOCAL_CACHE_INVALIDATES_COMPILED.saturating_add(1);
+    }
+}
+
+#[inline]
+pub fn push_run_note_site_compiled() {
+    unsafe {
+        PUSH_RUN_SITES_COMPILED = PUSH_RUN_SITES_COMPILED.saturating_add(1);
+    }
+}
+
+#[inline]
+pub fn push_run_note_reuse_branch_compiled() {
+    unsafe {
+        PUSH_RUN_REUSE_BRANCHES_COMPILED =
+            PUSH_RUN_REUSE_BRANCHES_COMPILED.saturating_add(1);
+    }
+}
+
+#[inline]
+pub fn fastmem_note_speculated_load_compiled() {
+    unsafe {
+        FASTMEM_SPECULATED_LOADS_COMPILED =
+            FASTMEM_SPECULATED_LOADS_COMPILED.saturating_add(1);
+    }
+}
+
+#[no_mangle]
+pub fn fastmem_bump_generation(source: u32) {
+    unsafe {
+        // 0 is the non-fastmem Code sentinel.
+        *global_pointers::fastmem_generation =
+            (*global_pointers::fastmem_generation).wrapping_add(1);
+        let idx = (source as usize).min(FASTMEM_BUMP_SOURCE_COUNT - 1);
+        FASTMEM_BUMPS_BY_SOURCE[idx] = FASTMEM_BUMPS_BY_SOURCE[idx].saturating_add(1);
+
+        // Thrash auto-latch: only relevant while speculation is live.
+        if JIT_FASTMEM_READS && !FASTMEM_THRASH_LATCHED {
+            FASTMEM_THRASH_WINDOW_BUMPS = FASTMEM_THRASH_WINDOW_BUMPS.saturating_add(1);
+            let icount = *global_pointers::instruction_counter;
+            let elapsed = icount.wrapping_sub(FASTMEM_THRASH_WINDOW_START);
+            if elapsed >= FASTMEM_THRASH_WINDOW_ICOUNT {
+                if FASTMEM_THRASH_WINDOW_BUMPS >= FASTMEM_THRASH_BUMP_LIMIT {
+                    FASTMEM_THRASH_LATCHED = true;
+                    let bumps = FASTMEM_THRASH_WINDOW_BUMPS;
+                    dbg_log!("fastmem: thrash-latched off, {} bumps/window", bumps);
+                }
+                FASTMEM_THRASH_WINDOW_START = icount;
+                FASTMEM_THRASH_WINDOW_BUMPS = 0;
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub fn fastmem_get_generation() -> u32 { fastmem_current_generation() as u32 }
+
+#[no_mangle]
+pub fn fastmem_get_bump_count(source: u32) -> u32 {
+    unsafe {
+        let idx = (source as usize).min(FASTMEM_BUMP_SOURCE_COUNT - 1);
+        FASTMEM_BUMPS_BY_SOURCE[idx]
+    }
+}
+
+#[no_mangle]
+pub fn fastmem_get_speculated_loads_compiled() -> u32 {
+    unsafe { FASTMEM_SPECULATED_LOADS_COMPILED }
+}
+
+#[no_mangle]
+pub fn fastmem_get_deopt_recompiles() -> u32 { unsafe { FASTMEM_DEOPT_RECOMPILES } }
+
+#[no_mangle]
+pub fn fastmem_get_thrash_latched() -> u32 { unsafe { FASTMEM_THRASH_LATCHED as u32 } }
+
+#[no_mangle]
+pub fn fastmem_reset_stats() {
+    unsafe {
+        FASTMEM_BUMPS_BY_SOURCE = [0; FASTMEM_BUMP_SOURCE_COUNT];
+        FASTMEM_SPECULATED_LOADS_COMPILED = 0;
+        FASTMEM_DEOPT_RECOMPILES = 0;
+        FASTMEM_THRASH_LATCHED = false;
+        FASTMEM_THRASH_WINDOW_START = *global_pointers::instruction_counter;
+        FASTMEM_THRASH_WINDOW_BUMPS = 0;
+    }
+}
+
+#[no_mangle]
+pub fn x87_locals_get_cache_load_sites_compiled() -> u32 {
+    unsafe { X87_LOCAL_CACHE_LOAD_SITES_COMPILED }
+}
+
+#[no_mangle]
+pub fn x87_locals_get_cache_stores_compiled() -> u32 { unsafe { X87_LOCAL_CACHE_STORES_COMPILED } }
+
+#[no_mangle]
+pub fn x87_locals_get_cache_invalidates_compiled() -> u32 {
+    unsafe { X87_LOCAL_CACHE_INVALIDATES_COMPILED }
+}
+
+#[no_mangle]
+pub fn x87_locals_reset_stats() {
+    unsafe {
+        X87_LOCAL_CACHE_LOAD_SITES_COMPILED = 0;
+        X87_LOCAL_CACHE_STORES_COMPILED = 0;
+        X87_LOCAL_CACHE_INVALIDATES_COMPILED = 0;
+    }
+}
+
+#[no_mangle]
+pub fn push_run_get_sites_compiled() -> u32 { unsafe { PUSH_RUN_SITES_COMPILED } }
+
+#[no_mangle]
+pub fn push_run_get_reuse_branches_compiled() -> u32 {
+    unsafe { PUSH_RUN_REUSE_BRANCHES_COMPILED }
+}
+
+#[no_mangle]
+pub fn push_run_reset_stats() {
+    unsafe {
+        PUSH_RUN_SITES_COMPILED = 0;
+        PUSH_RUN_REUSE_BRANCHES_COMPILED = 0;
+    }
+}
 
 #[no_mangle]
 pub fn set_dispatch_stats(enabled: u32) { unsafe { DISPATCH_STATS = enabled != 0; } }
@@ -138,6 +388,7 @@ struct PageInfo {
     hidden_wasm_table_indices: Vec<WasmTableIndex>,
     entry_points: Vec<(u16, u16)>,
     state_flags: CachedStateFlags,
+    fastmem_generation: u64,
 }
 
 enum CompilingPageState {
@@ -341,7 +592,31 @@ pub struct JitContext<'a> {
     pub fpu_simd_dirty_marked: bool,
     pub elide_current_flags: bool,
     pub instruction_counter: WasmLocal,
+    pub fastmem_generation: Option<u64>,
+    pub x87_local_cache: [Option<X87LocalCacheSlot>; 8],
+    pub push32_write_cache: Option<Push32WriteCache>,
+    /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
+    /// cache coherent (it either updated the touched slot or invalidated all
+    /// slots). Reset to false before each instruction; if an x87 opcode
+    /// (D8–DF) is compiled through a raw-helper path that did NOT set this, the
+    /// emission loop invalidates the cache so a later relaxed op re-reads memory
+    /// and re-checks the tag. Without this, helper-dispatched FPU ops (FISTP m64
+    /// aka _ftol, FSQRT/FSIN/FCOS, FINCSTP/FDECSTP, FLD m80, FIADD-family, …)
+    /// silently mutate the FPU stack / shift TOP behind stale cached values.
+    pub x87_cache_kept: bool,
 }
+
+pub struct X87LocalCacheSlot {
+    pub bits: WasmLocalI64,
+    pub valid: WasmLocal,
+}
+
+pub struct Push32WriteCache {
+    pub page: WasmLocal,
+    pub entry: WasmLocal,
+    pub valid: WasmLocal,
+}
+
 impl<'a> JitContext<'a> {
     pub fn reg(&self, i: u32) -> WasmLocal {
         match self.register_locals.get(i as usize) {
@@ -582,6 +857,7 @@ pub fn jit_find_cache_entry(phys_address: u32, state_flags: CachedStateFlags) ->
             state_flags: s,
             entry_points,
             hidden_wasm_table_indices: _,
+            fastmem_generation: _,
         }) => {
             if *s == state_flags {
                 let page_offset = phys_address as u16 & 0xFFF;
@@ -617,11 +893,21 @@ pub fn jit_find_cache_entry_in_page(
             None => {},
             Some(c) => {
                 let c = c.as_ref();
-                if state_flags == c.state_flags && wasm_table_index == c.wasm_table_index {
-                    let state = c.state_table[virt_address as usize & 0xFFF];
-                    if state != u16::MAX {
-                        return state.into();
-                    }
+                // Copy out before any deopt (which frees this unit's Box).
+                let unit_generation = c.fastmem_generation;
+                let unit_index = c.wasm_table_index;
+                let matches = state_flags == c.state_flags && wasm_table_index == unit_index;
+                let unit_state = if matches {
+                    c.state_table[virt_address as usize & 0xFFF]
+                }
+                else {
+                    u16::MAX
+                };
+                if unit_generation != 0 && unit_generation != fastmem_current_generation() {
+                    fastmem_deopt_jit_unit(unit_index.to_u16() as u32);
+                }
+                else if matches && unit_state != u16::MAX {
+                    return unit_state.into();
                 }
             },
         }
@@ -660,17 +946,26 @@ pub unsafe fn jit_find_cache_entry_for_chaining(state_flags: u32) -> i32 {
         None => {},
         Some(c) => {
             let c = c.as_ref();
-            if state_flags == c.state_flags {
-                let state = c.state_table[virt_address as usize & 0xFFF];
-                if state != u16::MAX {
-                    if dispatch_stats_enabled() {
-                        profiler::stat_increment_always(stat::MODULE_CHAINED_EDGE);
-                    }
-
-                    let table_slot =
-                        c.wasm_table_index.to_u16() as i32 + cpu::WASM_TABLE_OFFSET as i32;
-                    return table_slot << 16 | state as i32;
+            // Copy out before any deopt (which frees this unit's Box).
+            let unit_generation = c.fastmem_generation;
+            let unit_index = c.wasm_table_index;
+            let matches = state_flags == c.state_flags;
+            let unit_state = if matches {
+                c.state_table[virt_address as usize & 0xFFF]
+            }
+            else {
+                u16::MAX
+            };
+            if unit_generation != 0 && unit_generation != fastmem_current_generation() {
+                fastmem_deopt_jit_unit(unit_index.to_u16() as u32);
+            }
+            else if matches && unit_state != u16::MAX {
+                if dispatch_stats_enabled() {
+                    profiler::stat_increment_always(stat::MODULE_CHAINED_EDGE);
                 }
+
+                let table_slot = unit_index.to_u16() as i32 + cpu::WASM_TABLE_OFFSET as i32;
+                return table_slot << 16 | unit_state as i32;
             }
         },
     }
@@ -709,7 +1004,10 @@ fn jit_find_basic_blocks(
 
         let phys_page = Page::page_of(phys_target);
 
-        if !pages.contains(&phys_page) && pages.len() as u32 == max_pages
+        // `>=` (not `==`): a proper ceiling. Equivalent to the original for the
+        // single-cap default path (growth is monotonic), but required so the cap
+        // holds when region formation seeds the page set above the base cap.
+        if !pages.contains(&phys_page) && pages.len() as u32 >= max_pages
             || page_blacklist.contains(&phys_page)
         {
             return None;
@@ -769,7 +1067,19 @@ fn jit_find_basic_blocks(
     let mut page_blacklist = HashSet::new();
 
     // 16-bit doesn't work correctly, most likely due to instruction pointer wrap-around
-    let max_pages = if cpu.state_flags.is_32() { unsafe { MAX_PAGES } } else { 1 };
+    // When indirect regions are on, use the (larger) region page budget as the
+    // compilation-wide cap so dispatchers can absorb hot targets. Non-dispatcher
+    // modules rarely reach it (hot direct-jump chains are short); it stays far
+    // below the global-MAX_PAGES=48 setting that OOM'd V8.
+    let max_pages = if cpu.state_flags.is_32() {
+        if unsafe { JIT_INDIRECT_REGIONS } {
+            unsafe { MAX_PAGES.max(JIT_INDIRECT_REGION_MAX_PAGES) }
+        } else {
+            unsafe { MAX_PAGES }
+        }
+    } else {
+        1
+    };
 
     for virt_addr in entry_points {
         let ok = follow_jump(
@@ -971,6 +1281,38 @@ fn jit_find_basic_blocks(
 
                     if analysis.absolute_jump {
                         current_block.ty = BasicBlockType::AbsoluteEip;
+
+                        // Tier-2R (E2b): grow the region across this indirect
+                        // edge using profiled targets. Targets that join the
+                        // region are marked as entries so the runtime
+                        // jit_find_cache_entry_in_page re-dispatch stays
+                        // intra-module instead of exiting to main_loop.
+                        if unsafe { JIT_INDIRECT_REGIONS } {
+                            let targets = trace_profiler::hot_indirect_targets(
+                                addr_before_instruction,
+                                JIT_INDIRECT_REGION_MAX_TARGETS,
+                                unsafe { JIT_INDIRECT_REGION_MIN_SHARE } as u64,
+                            );
+                            // max_pages already carries the region budget (set at
+                            // the top of jit_find_basic_blocks when regions are on).
+                            // Targets are hottest-first, so the cap keeps the
+                            // most-executed cases when it binds.
+                            for target in targets {
+                                if follow_jump(
+                                    target as i32,
+                                    ctx,
+                                    &mut pages,
+                                    &mut page_blacklist,
+                                    max_pages,
+                                    &mut marked_as_entry,
+                                    &mut to_visit_stack,
+                                )
+                                .is_some()
+                                {
+                                    marked_as_entry.insert(target as i32);
+                                }
+                            }
+                        }
                     }
 
                     break;
@@ -1243,6 +1585,8 @@ fn jit_analyze_and_generate(
     let basic_block_by_addr: HashMap<u32, BasicBlock> =
         basic_blocks.into_iter().map(|b| (b.addr, b)).collect();
 
+    let fastmem_generation = fastmem_compile_generation(state_flags);
+
     let entries = jit_generate_module(
         structure,
         &basic_block_by_addr,
@@ -1250,6 +1594,7 @@ fn jit_analyze_and_generate(
         &mut ctx.wasm_builder,
         wasm_table_index,
         state_flags,
+        fastmem_generation,
     );
     dbg_assert!(!entries.is_empty());
 
@@ -1260,6 +1605,7 @@ fn jit_analyze_and_generate(
             .or_insert_with(|| PageInfo {
                 wasm_table_index,
                 state_flags,
+                fastmem_generation: fastmem_generation.unwrap_or(0),
                 entry_points: Vec::new(),
                 hidden_wasm_table_indices: Vec::new(),
             });
@@ -1348,6 +1694,7 @@ pub fn codegen_finalize_finished(
                     wasm_table_index,
                     &info.entry_points,
                     state_flags,
+                    info.fastmem_generation,
                 );
             }
         }
@@ -1393,7 +1740,14 @@ pub fn update_tlb_code(virt_page: Page, phys_page: Page) {
             entry_points,
             state_flags,
             hidden_wasm_table_indices: _,
-        }) => set_tlb_code(virt_page, *wasm_table_index, entry_points, *state_flags),
+            fastmem_generation,
+        }) => set_tlb_code(
+            virt_page,
+            *wasm_table_index,
+            entry_points,
+            *state_flags,
+            *fastmem_generation,
+        ),
         None => cpu::clear_tlb_code(phys_page.to_u32() as i32),
     };
 }
@@ -1403,6 +1757,7 @@ pub fn set_tlb_code(
     wasm_table_index: WasmTableIndex,
     entries: &Vec<(u16, u16)>,
     state_flags: CachedStateFlags,
+    fastmem_generation: u64,
 ) {
     let c = match unsafe { cpu::tlb_code[virt_page.to_u32() as usize] } {
         None => {
@@ -1411,6 +1766,7 @@ pub fn set_tlb_code(
                 let mut c = NonNull::new_unchecked(Box::into_raw(Box::new(cpu::Code {
                     wasm_table_index,
                     state_flags,
+                    fastmem_generation,
                     state_table,
                 })));
                 cpu::tlb_code[virt_page.to_u32() as usize] = Some(c);
@@ -1422,6 +1778,7 @@ pub fn set_tlb_code(
             c.state_table.fill(u16::MAX);
             c.state_flags = state_flags;
             c.wasm_table_index = wasm_table_index;
+            c.fastmem_generation = fastmem_generation;
             c
         },
     };
@@ -1477,6 +1834,7 @@ fn jit_generate_module(
     builder: &mut WasmBuilder,
     wasm_table_index: WasmTableIndex,
     state_flags: CachedStateFlags,
+    fastmem_generation: Option<u64>,
 ) -> Vec<(u32, u16)> {
     builder.reset();
 
@@ -1493,6 +1851,16 @@ fn jit_generate_module(
     let exit_label = builder.block_void();
     let exit_with_fault_label = builder.block_void();
     let main_loop_label = builder.loop_void();
+    if let Some(compiled_generation) = fastmem_generation {
+        builder.load_fixed_i64(global_pointers::fastmem_generation as u32);
+        builder.const_i64(compiled_generation as i64);
+        builder.ne_i64();
+        builder.if_void();
+        builder.const_i32(wasm_table_index.to_u16() as i32);
+        builder.call_fn1("fastmem_deopt_jit_unit");
+        builder.br(exit_label);
+        builder.block_end();
+    }
     if unsafe { JIT_USE_LOOP_SAFETY } {
         builder.get_local(&instruction_counter);
         builder.const_i32(cpu::LOOP_COUNTER);
@@ -1521,6 +1889,10 @@ fn jit_generate_module(
         fpu_simd_dirty_marked: false,
         elide_current_flags: false,
         instruction_counter,
+        fastmem_generation,
+        x87_local_cache: std::array::from_fn(|_| None),
+        push32_write_cache: None,
+        x87_cache_kept: false,
     };
 
     let entry_blocks = {
@@ -1662,6 +2034,14 @@ fn jit_generate_module(
                         ctx.builder.br(ctx.exit_label);
                     },
                     BasicBlockType::AbsoluteEip => {
+                        // Tier-2 Phase 0: indirect-target histogram for watched pages.
+                        // Records (terminal instruction addr, runtime eip) via an import
+                        // into the generated module; emitted only when the page is watched.
+                        if trace_profiler::is_page_watched(Page::page_of(block.addr)) {
+                            ctx.builder.const_i32(block.last_instruction_addr as i32);
+                            codegen::gen_get_eip(ctx.builder);
+                            ctx.builder.call_fn2("trace2_record_indirect");
+                        }
                         // Check if we can stay in this module, if not exit
                         codegen::gen_get_eip(ctx.builder);
                         ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
@@ -2335,6 +2715,20 @@ fn jit_generate_module(
     return entries;
 }
 
+/// True if the instruction at `eip` is an x87 escape, after prefixes.
+fn opcode_is_x87(eip: u32) -> bool {
+    let mut addr = eip;
+    for _ in 0..4 {
+        match read_jit_u8(addr) {
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
+                addr = addr.wrapping_add(1);
+            },
+            op => return (0xD8..=0xDF).contains(&op),
+        }
+    }
+    false
+}
+
 fn jit_generate_basic_block(
     ctx: &mut JitContext,
     block: &BasicBlock,
@@ -2369,6 +2763,44 @@ fn jit_generate_basic_block(
     // dispatch; every further block it runs was reached by an in-module edge).
     codegen::gen_dispatch_stat_increment(ctx.builder, stat::BLOCK_EXECUTION);
 
+    // Tier-2 trace-compiler Phase 0 (plan/tier2-trace-compiler.md Step B): per-block exec
+    // counter + CFG registration for watched pages. Emits one fixed-address u64 increment;
+    // nothing is emitted for unwatched pages (zero cost when profiling is off).
+    if trace_profiler::is_enabled() && trace_profiler::is_page_watched(Page::page_of(block.addr)) {
+        let (kind, condition, succ_fallthrough, succ_taken) = match block.ty {
+            BasicBlockType::Normal { next_block_addr, .. } => {
+                (trace_profiler::KIND_NORMAL, 0u8, next_block_addr.unwrap_or(0), 0)
+            },
+            BasicBlockType::ConditionalJump {
+                next_block_addr,
+                next_block_branch_taken_addr,
+                condition,
+                ..
+            } => (
+                trace_profiler::KIND_CONDITIONAL,
+                condition,
+                next_block_addr.unwrap_or(0),
+                next_block_branch_taken_addr.unwrap_or(0),
+            ),
+            BasicBlockType::AbsoluteEip => (trace_profiler::KIND_ABSOLUTE_EIP, 0, 0, 0),
+            BasicBlockType::Exit => (trace_profiler::KIND_EXIT, 0, 0, 0),
+        };
+        if let Some(counter_addr) = trace_profiler::register_block(trace_profiler::BlockRecord {
+            addr: block.addr,
+            last_instruction_addr: block.last_instruction_addr,
+            end_addr: block.end_addr,
+            kind,
+            condition,
+            succ_fallthrough,
+            succ_taken,
+            number_of_instructions: block.number_of_instructions,
+            is_entry_block: block.is_entry_block,
+            slot: u32::MAX,
+        }) {
+            ctx.builder.increment_fixed_i64(counter_addr, 1);
+        }
+    }
+
     ctx.cpu.eip = start_addr;
     ctx.current_instruction = Instruction::Other;
     ctx.previous_instruction = Instruction::Other;
@@ -2402,9 +2834,19 @@ fn jit_generate_basic_block(
         let start_eip = ctx.cpu.eip;
         ctx.elide_current_flags =
             should_elide_current_flags(&*ctx.cpu, start_eip, block, basic_blocks);
+        // Relaxed x87 wrappers set this when they keep the st cache coherent.
+        ctx.x87_cache_kept = false;
         let mut instruction_flags = 0;
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;
+
+        // Raw x87 helpers mutate TOP/st memory behind the local cache.
+        if !ctx.x87_cache_kept
+            && ctx.x87_local_cache.iter().any(|s| s.is_some())
+            && opcode_is_x87(start_eip)
+        {
+            codegen::gen_x87_local_cache_invalidate_all_runtime(ctx);
+        }
 
         let instruction_length = end_eip - start_eip;
         let was_block_boundary = instruction_flags & JIT_INSTR_BLOCK_BOUNDARY_FLAG != 0;
@@ -2420,6 +2862,8 @@ fn jit_generate_basic_block(
         if end_addr == stop_addr {
             // no page was crossed
             dbg_assert!(Page::page_of(end_addr) == Page::page_of(start_addr));
+            codegen::gen_x87_local_cache_free_all(ctx);
+            codegen::gen_push32_write_cache_free(ctx);
             break;
         }
 
@@ -2433,6 +2877,8 @@ fn jit_generate_basic_block(
                 is_near_end_of_page(end_addr)
             );
             dbg_assert!(false);
+            codegen::gen_x87_local_cache_free_all(ctx);
+            codegen::gen_push32_write_cache_free(ctx);
             break;
         }
 
@@ -2525,6 +2971,70 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
     jit_clear_func(wasm_table_index);
 }
 
+fn free_wasm_module(ctx: &mut JitState, wasm_table_index: WasmTableIndex) -> Vec<WasmTableIndex> {
+    for i in 0..unsafe { cpu::valid_tlb_entries_count } {
+        let page = unsafe { cpu::valid_tlb_entries[i as usize] };
+        let entry = unsafe { cpu::tlb_data[page as usize] };
+        if 0 != entry {
+            let tlb_physical_page = Page::of_u32(
+                (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
+            );
+            match unsafe { cpu::tlb_code[page as usize] } {
+                None => {},
+                Some(c) => unsafe {
+                    let w = c.as_ref().wasm_table_index;
+                    if wasm_table_index == w {
+                        drop(Box::from_raw(c.as_ptr()));
+                        cpu::tlb_code[page as usize] = None;
+                        if !ctx.entry_points.contains_key(&tlb_physical_page) {
+                            // XXX
+                            cpu::tlb_data[page as usize] &= !cpu::TLB_HAS_CODE;
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    let mut hidden_to_free = Vec::new();
+    ctx.pages.retain(
+        |_,
+         PageInfo {
+             wasm_table_index: w,
+             hidden_wasm_table_indices,
+             ..
+         }| {
+            if *w == wasm_table_index {
+                hidden_to_free.extend(hidden_wasm_table_indices.iter().copied());
+                false
+            }
+            else {
+                true
+            }
+        },
+    );
+
+    for info in ctx.pages.values_mut() {
+        info.hidden_wasm_table_indices
+            .retain(|&w| w != wasm_table_index)
+    }
+
+    free_wasm_table_index(ctx, wasm_table_index);
+    hidden_to_free
+}
+
+fn free_wasm_module_tree(ctx: &mut JitState, root: WasmTableIndex) {
+    // Hidden entries cannot be promoted; free them with the removed primary.
+    let mut seen = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(index) = stack.pop() {
+        if !seen.insert(index) {
+            continue;
+        }
+        stack.extend(free_wasm_module(ctx, index));
+    }
+}
+
 /// Register a write in this page: Delete all present code
 fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     let mut did_have_code = false;
@@ -2534,55 +3044,15 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
         hidden_wasm_table_indices,
         state_flags: _,
         entry_points: _,
+        fastmem_generation: _,
     }) = ctx.pages.remove(&page)
     {
         profiler::stat_increment(stat::INVALIDATE_PAGE_HAD_CODE);
         did_have_code = true;
 
-        free(ctx, wasm_table_index);
+        free_wasm_module_tree(ctx, wasm_table_index);
         for wasm_table_index in hidden_wasm_table_indices {
-            free(ctx, wasm_table_index);
-        }
-
-        fn free(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
-            for i in 0..unsafe { cpu::valid_tlb_entries_count } {
-                let page = unsafe { cpu::valid_tlb_entries[i as usize] };
-                let entry = unsafe { cpu::tlb_data[page as usize] };
-                if 0 != entry {
-                    let tlb_physical_page = Page::of_u32(
-                        (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
-                    );
-                    match unsafe { cpu::tlb_code[page as usize] } {
-                        None => {},
-                        Some(c) => unsafe {
-                            let w = c.as_ref().wasm_table_index;
-                            if wasm_table_index == w {
-                                drop(Box::from_raw(c.as_ptr()));
-                                cpu::tlb_code[page as usize] = None;
-                                if !ctx.entry_points.contains_key(&tlb_physical_page) {
-                                    // XXX
-                                    cpu::tlb_data[page as usize] &= !cpu::TLB_HAS_CODE;
-                                }
-                            }
-                        },
-                    }
-                }
-            }
-
-            ctx.pages.retain(
-                |_,
-                 &mut PageInfo {
-                     wasm_table_index: w,
-                     ..
-                 }| w != wasm_table_index,
-            );
-
-            for info in ctx.pages.values_mut() {
-                info.hidden_wasm_table_indices
-                    .retain(|&w| w != wasm_table_index)
-            }
-
-            free_wasm_table_index(ctx, wasm_table_index);
+            free_wasm_module_tree(ctx, wasm_table_index);
         }
     }
 
@@ -2637,6 +3107,24 @@ pub fn jit_dirty_cache(start_addr: u32, end_addr: u32) {
 
 #[no_mangle]
 pub fn jit_dirty_page(page: Page) { jit_dirty_page_ctx(&mut get_jit_state(), page) }
+
+#[no_mangle]
+pub fn fastmem_deopt_jit_unit(wasm_table_index: u32) {
+    let target = WasmTableIndex(wasm_table_index as u16);
+    let mut ctx = get_jit_state();
+
+    let present = ctx.pages.values().any(|info| {
+        info.wasm_table_index == target || info.hidden_wasm_table_indices.contains(&target)
+    });
+    if !present {
+        return;
+    }
+
+    unsafe {
+        FASTMEM_DEOPT_RECOMPILES = FASTMEM_DEOPT_RECOMPILES.saturating_add(1);
+    }
+    free_wasm_module_tree(&mut ctx, target);
+}
 
 /// dirty pages in the range of start_addr and end_addr, which must span at most two pages
 pub fn jit_dirty_cache_small(start_addr: u32, end_addr: u32) {
@@ -2701,6 +3189,42 @@ pub fn jit_get_cache_size() -> u32 {
     else {
         0
     }
+}
+
+// Ungated JIT-table diagnostics for slot pressure / hidden-index pile-up.
+#[no_mangle]
+pub fn jit_debug_free_slots() -> u32 {
+    get_jit_state().wasm_table_index_free_list.len() as u32
+}
+#[no_mangle]
+pub fn jit_debug_module_count() -> u32 {
+    let ctx = get_jit_state();
+    let mut set = HashSet::new();
+    for info in ctx.pages.values() {
+        set.insert(info.wasm_table_index);
+    }
+    set.len() as u32
+}
+#[no_mangle]
+pub fn jit_debug_page_count() -> u32 {
+    get_jit_state().pages.len() as u32
+}
+#[no_mangle]
+pub fn jit_debug_hidden_count() -> u32 {
+    get_jit_state()
+        .pages
+        .values()
+        .map(|p| p.hidden_wasm_table_indices.len() as u32)
+        .sum()
+}
+#[no_mangle]
+pub fn jit_debug_max_region_pages() -> u32 {
+    let ctx = get_jit_state();
+    let mut per_index: HashMap<WasmTableIndex, u32> = HashMap::new();
+    for info in ctx.pages.values() {
+        *per_index.entry(info.wasm_table_index).or_insert(0) += 1;
+    }
+    per_index.values().copied().max().unwrap_or(0)
 }
 
 #[cfg(feature = "profiler")]
@@ -2777,6 +3301,12 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
         4 => JIT_BLOCK_CHAINING = value != 0,
         5 => JIT_DEAD_FLAG_ELISION = value != 0,
+        6 => JIT_INDIRECT_REGIONS = value != 0,
+        7 => JIT_INDIRECT_REGION_MIN_SHARE = value,
+        8 => JIT_INDIRECT_REGION_MAX_PAGES = value,
+        9 => JIT_FASTMEM_READS = value != 0,
+        10 => JIT_X87_LOCALS = value != 0,
+        11 => JIT_PUSH_RUN_COALESCING = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -2790,6 +3320,12 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         3 => MAX_EXTRA_BASIC_BLOCKS as u32,
         4 => JIT_BLOCK_CHAINING as u32,
         5 => JIT_DEAD_FLAG_ELISION as u32,
+        6 => JIT_INDIRECT_REGIONS as u32,
+        7 => JIT_INDIRECT_REGION_MIN_SHARE,
+        8 => JIT_INDIRECT_REGION_MAX_PAGES,
+        9 => JIT_FASTMEM_READS as u32,
+        10 => JIT_X87_LOCALS as u32,
+        11 => JIT_PUSH_RUN_COALESCING as u32,
         _ => 0,
     }
 }

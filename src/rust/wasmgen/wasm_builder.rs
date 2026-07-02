@@ -107,6 +107,8 @@ impl WasmLocal {
 pub struct WasmLocalI64(u8);
 impl WasmLocalI64 {
     pub fn idx(&self) -> u8 { self.0 }
+    /// Unsafe: ownership stays with the cache entry.
+    pub fn unsafe_clone(&self) -> WasmLocalI64 { WasmLocalI64(self.0) }
 }
 
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
@@ -674,6 +676,14 @@ impl WasmBuilder {
     }
     pub fn get_local_i64(&mut self, local: &WasmLocalI64) {
         self.instruction_body.push(op::OP_GETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+    pub fn set_local_i64(&mut self, local: &WasmLocalI64) {
+        self.instruction_body.push(op::OP_SETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+    pub fn tee_local_i64(&mut self, local: &WasmLocalI64) {
+        self.instruction_body.push(op::OP_TEELOCAL);
         self.instruction_body.push(local.idx());
     }
 

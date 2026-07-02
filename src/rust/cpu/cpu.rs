@@ -320,6 +320,7 @@ pub static mut tsc_offset: u64 = 0;
 pub struct Code {
     pub wasm_table_index: jit::WasmTableIndex,
     pub state_flags: CachedStateFlags,
+    pub fastmem_generation: u64,
     pub state_table: [u16; 0x1000],
 }
 
@@ -550,6 +551,7 @@ pub static mut DBG_WW_ZERO_PREV: u32 = 0;
 pub static mut DBG_WW_ZERO_HITS: u32 = 0;
 
 #[no_mangle] pub unsafe fn dbg_set_write_watch(addr: u32) {
+    crate::jit::fastmem_bump_generation(crate::jit::FASTMEM_BUMP_WRITE_WATCH);
     DBG_WRITE_WATCH = addr; DBG_WW_HITS = 0; DBG_WW_ZERO_HITS = 0;
     DBG_WW_LAST_EIP = 0; DBG_WW_LAST_PREV = 0; DBG_WW_LAST_VAL = 0;
     DBG_WW_ZERO_EIP = 0; DBG_WW_ZERO_PREV = 0;
@@ -2411,6 +2413,7 @@ pub unsafe fn do_page_walk(
 #[no_mangle]
 pub unsafe fn full_clear_tlb() {
     profiler::stat_increment(stat::FULL_CLEAR_TLB);
+    // TLB flush only; mapping/protect sites bump fastmem_generation.
     // clear tlb including global pages
     *last_virt_eip = -1;
     for i in 0..valid_tlb_entries_count {
@@ -2431,6 +2434,7 @@ pub unsafe fn full_clear_tlb() {
 #[no_mangle]
 pub unsafe fn clear_tlb() {
     profiler::stat_increment(stat::CLEAR_TLB);
+    // Software TLB eviction only; no fastmem_generation bump.
     // clear tlb excluding global pages
     *last_virt_eip = -1;
     let mut global_page_offset = 0;
@@ -3178,11 +3182,25 @@ pub unsafe fn cycle_internal() {
         None => {},
         Some(c) => {
             let c = c.as_ref();
+            // Deopt can free c; copy its fields first.
+            let unit_generation = c.fastmem_generation;
+            let unit_index = c.wasm_table_index;
+            let unit_state_flags = c.state_flags;
+            let unit_state = if initial_state_flags == unit_state_flags {
+                c.state_table[initial_eip as usize & 0xFFF]
+            }
+            else {
+                u16::MAX
+            };
 
-            if initial_state_flags == c.state_flags {
-                let state = c.state_table[initial_eip as usize & 0xFFF];
-                if state != u16::MAX {
-                    jit_entry = Some((c.wasm_table_index.to_u16(), state));
+            if unit_generation != 0
+                && unit_generation != jit::fastmem_current_generation()
+            {
+                jit::fastmem_deopt_jit_unit(unit_index.to_u16() as u32);
+            }
+            else if initial_state_flags == unit_state_flags {
+                if unit_state != u16::MAX {
+                    jit_entry = Some((unit_index.to_u16(), unit_state));
                 }
                 else {
                     profiler::stat_increment(if is_near_end_of_page(initial_eip as u32) {
@@ -3196,16 +3214,16 @@ pub unsafe fn cycle_internal() {
             else {
                 profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE);
                 let s = *state_flags;
-                if c.state_flags.cpl3() != s.cpl3() {
+                if unit_state_flags.cpl3() != s.cpl3() {
                     profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_CPL3);
                 }
-                if c.state_flags.has_flat_segmentation() != s.has_flat_segmentation() {
+                if unit_state_flags.has_flat_segmentation() != s.has_flat_segmentation() {
                     profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_FLAT);
                 }
-                if c.state_flags.is_32() != s.is_32() {
+                if unit_state_flags.is_32() != s.is_32() {
                     profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_IS32);
                 }
-                if c.state_flags.ssize_32() != s.ssize_32() {
+                if unit_state_flags.ssize_32() != s.ssize_32() {
                     profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_SS32);
                 }
             }
@@ -4519,6 +4537,7 @@ pub fn clear_tlb_code(page: i32) {
 }
 
 pub unsafe fn invlpg(addr: i32) {
+    jit::fastmem_bump_generation(jit::FASTMEM_BUMP_INVLPG);
     let page = (addr as u32 >> 12) as i32;
     // Note: Doesn't remove this page from valid_tlb_entries: This isn't
     // necessary, because when valid_tlb_entries grows too large, it will be
@@ -4763,6 +4782,7 @@ pub unsafe fn reset_cpu() {
 
     *mxcsr = 0x1F80;
     *fpu_simd_dirty = 0;
+    *fastmem_generation = 1;
 
     full_clear_tlb();
 

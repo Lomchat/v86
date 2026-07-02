@@ -467,7 +467,7 @@ function build_image(bodyName)
     return buf;
 }
 
-function run(bodyName, { jit, relaxed })
+function run(bodyName, { jit, relaxed, x87Locals = false })
 {
     return new Promise((resolve) => {
         const img = build_image(bodyName);
@@ -499,6 +499,10 @@ function run(bodyName, { jit, relaxed })
             cpu.load_multiboot(img.buffer);
             setRelaxed(relaxed ? 1 : 0);   // re-assert in case reset touched it
             cpu.wm?.exports?.set_fpu_relaxed_stats?.(1);
+            // Phase 2: JIT_X87_LOCALS = config idx 10. Engages the block-scoped st
+            // read-through local cache. The central invalidation in jit.rs must keep
+            // it coherent across helper-path x87 ops (fld m80 / fild / fsqrt / etc.).
+            cpu.wm?.exports?.set_jit_config?.(10, (jit && relaxed && x87Locals) ? 1 : 0);
             cpu.wm?.exports?.profiler_init?.();
             timer = setTimeout(() => { if(!halted) finish("HANG"); }, TIMEOUT_MS);
             emulator.run();
@@ -538,6 +542,25 @@ for(const relaxed of [true, false]) {
         if(relaxed && stickyVariants.includes(v) && !stickyCountersOk) {
             console.log(`${"".padEnd(14)}       expected ${v} to stay fully relaxed (hit>0 fallback=0)`);
         }
+    }
+}
+// Phase 2 pass: JIT + relaxed + x87 locals vs the interpreter oracle. This is the
+// stale-cache regression guard — the mixed kernels (tl_mix, m80_*, fiarith,
+// fist_round, fcom_mem) interleave helper-path FPU ops that mutate the stack /
+// shift TOP behind the local cache; without central invalidation they diverge.
+console.log(`\n===== x87-locals(1) [jit+relaxed] =====`);
+for(const v of variants) {
+    const oracle  = await run(v, { jit:false, relaxed:true });
+    const suspect = await run(v, { jit:true,  relaxed:true, x87Locals:true });
+    const bothHalted = oracle.status === "halt" && suspect.status === "halt";
+    const same = bothHalted
+              && oracle.eax === suspect.eax && oracle.ebx === suspect.ebx
+              && oracle.ecx === suspect.ecx && oracle.edx === suspect.edx;
+    if(!same) anyDiverged = true;
+    console.log(`${v.padEnd(14)} interp: ${fmt(oracle)}`);
+    console.log(`${"".padEnd(14)} x87loc: ${fmt(suspect)}  ${same ? "OK" : "<<< DIVERGED"}`);
+    if(!bothHalted) {
+        console.log(`${"".padEnd(14)}       non-halt (hang/crash): interp=${oracle.status}@${oracle.eip.toString(16)} jit=${suspect.status}@${suspect.eip.toString(16)}`);
     }
 }
 console.log(anyDiverged ? "\nVERDICT: inline fast path DIVERGES from helpers" : "\nVERDICT: all variants match");

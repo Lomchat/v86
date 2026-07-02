@@ -25,5 +25,6 @@ mod prefix;
 mod regs;
 mod softfloat;
 mod state_flags;
+pub mod trace_profiler;
 mod wasmgen;
 mod zstd;

@@ -286,6 +286,11 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         70 => handle_heap_alloc(),
         71 => handle_heap_free(),
         72 => handle_set_event(),
+        // Tier 1/3 additions: current-thread-id (pure page read) + narrow ANSI string leaves.
+        73 => handle_get_current_thread_id(),
+        74 => handle_strnicmp(),
+        75 => handle_strstr(),
+        76 => handle_atoi(),
         _ => false,
     };
 
@@ -396,6 +401,18 @@ unsafe fn handle_qpf() -> bool {
 unsafe fn handle_get_last_error() -> bool {
     let err = *(hp_ptr().add(OFF_HC_LAST_ERROR) as *const u32);
     write_reg32(EAX, err as i32);
+    true
+}
+
+/// GetCurrentThreadId — stdcall(0). Returns the current thread ID from the shared page,
+/// which JS republishes on every context switch (syncThreadData → OFF_HC_CURRENT_THREAD_ID).
+/// Games flood this from the CRT's per-thread-data lookup (_getptd) inside malloc/strtok/etc.;
+/// serving it here removes the JS round-trip entirely. tid==0 means JS hasn't populated thread
+/// info yet → fall through so the JS thunk answers (and seeds the page on the next switch).
+unsafe fn handle_get_current_thread_id() -> bool {
+    let tid = *(hp_ptr().add(OFF_HC_CURRENT_THREAD_ID) as *const u32);
+    if tid == 0 { return false; }
+    write_reg32(EAX, tid as i32);
     true
 }
 
@@ -1525,6 +1542,163 @@ unsafe fn handle_memcmp() -> bool {
         i += 1;
     }
     write_reg32(EAX, 0);
+    true
+}
+
+/// _strnicmp(char* s1, char* s2, size_t count): case-insensitive ANSI compare up to count.
+/// Mirrors the NARROW JS strnicmp (msvcrt.ts): count==0 → 0 ("compare zero chars → equal").
+/// This is the OPPOSITE of the wide _wcsnicmp fast-path convention (count==0 → whole string,
+/// see handle_wcsnicmp) — keep the two distinct or config/name branches flip. Same tolower
+/// difference convention as handle_stricmp, just bounded by count.
+unsafe fn handle_strnicmp() -> bool {
+    let esp = read_reg32(ESP);
+    let s1 = match safe_read32s(esp + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let s2 = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let count = match safe_read32s(esp + 12) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if count == 0 {
+        write_reg32(EAX, 0);
+        return true;
+    }
+    let mut i: u32 = 0;
+    let result = loop {
+        if i >= count { break 0i32; }
+        let c1 = match hc_safe_read8(s1 + i as i32) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        let c2 = match hc_safe_read8(s2 + i as i32) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        let l1 = if c1 >= 0x41 && c1 <= 0x5A { c1 + 0x20 } else { c1 };
+        let l2 = if c2 >= 0x41 && c2 <= 0x5A { c2 + 0x20 } else { c2 };
+        if l1 != l2 { break (l1 as i32) - (l2 as i32); }
+        if c1 == 0 { break 0i32; }
+        i += 1;
+    };
+    write_reg32(EAX, result);
+    true
+}
+
+/// strstr(char* haystack, char* needle): substring search, return ptr into haystack or NULL.
+/// Byte-wise analogue of handle_wcsstr; mirrors the JS strstr (crt-string.ts): null haystack
+/// OR null needle → 0, empty needle → haystack. Naive O(n*m), matching MSVCRT / the JS impl.
+unsafe fn handle_strstr() -> bool {
+    let esp = read_reg32(ESP);
+    let haystack = match safe_read32s(esp + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let needle = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if haystack == 0 || needle == 0 {
+        write_reg32(EAX, 0);
+        return true;
+    }
+    // Empty needle → return haystack (matches JS `sub.length === 0`).
+    let first = match hc_safe_read8(needle) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if first == 0 {
+        write_reg32(EAX, haystack);
+        return true;
+    }
+    let mut i: u32 = 0;
+    loop {
+        let hc = match hc_safe_read8(haystack + i as i32) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if hc == 0 { break; }
+        if hc == first {
+            let mut j: u32 = 1;
+            let matched = loop {
+                let nc = match hc_safe_read8(needle + j as i32) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if nc == 0 { break true; }
+                let h2 = match hc_safe_read8(haystack + (i + j) as i32) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if h2 != nc { break false; }
+                j += 1;
+                if j > 0x100000 { break false; }
+            };
+            if matched {
+                write_reg32(EAX, haystack + i as i32);
+                return true;
+            }
+        }
+        i += 1;
+        if i > 0x100000 { break; }
+    }
+    write_reg32(EAX, 0);
+    true
+}
+
+/// atoi/atol(char* str): parse a leading optional-signed decimal integer (C semantics).
+/// Mirrors the JS atoi (msvcrt.ts): readCString.trim() then parseInt(...,10), result truncated
+/// to i32 (`parsed | 0`). Skips ASCII whitespace, one optional +/- sign, then decimal digits;
+/// stops at the first non-digit. Digit runs > 15 are deferred to JS: an exact i64 accumulator
+/// past 2^53 would diverge from JS's double-precision parseInt, so we let JS own those (rare).
+unsafe fn handle_atoi() -> bool {
+    let esp = read_reg32(ESP);
+    let mut p = match safe_read32s(esp + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if p == 0 {
+        write_reg32(EAX, 0);
+        return true;
+    }
+    // Skip leading ASCII whitespace: ' ' (0x20) and \t\n\v\f\r (0x09..=0x0D).
+    loop {
+        let c = match hc_safe_read8(p) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        if c == 0x20 || (c >= 0x09 && c <= 0x0D) { p += 1; } else { break; }
+    }
+    // Optional sign.
+    let mut neg = false;
+    let c = match hc_safe_read8(p) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if c == '+' as u32 || c == '-' as u32 {
+        neg = c == '-' as u32;
+        p += 1;
+    }
+    // Decimal digits.
+    let mut acc: i64 = 0;
+    let mut digits: u32 = 0;
+    loop {
+        let d = match hc_safe_read8(p) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        if d < '0' as u32 || d > '9' as u32 { break; }
+        digits += 1;
+        if digits > 15 { return false; } // stays exact in f64 → matches JS parseInt|0; longer → JS
+        acc = acc * 10 + (d - '0' as u32) as i64;
+        p += 1;
+    }
+    let val = if neg { -acc } else { acc };
+    write_reg32(EAX, val as i32);
     true
 }
 

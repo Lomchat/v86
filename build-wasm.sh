@@ -3,6 +3,9 @@
 # Requirements: Rust (wasm32-unknown-unknown target), clang, Node.js, Java
 set -euo pipefail
 
+# Prefer rustup over Homebrew Rust (Homebrew doesn't have wasm32 target)
+export PATH="$HOME/.cargo/bin:$PATH"
+
 cd "$(dirname "$0")"
 
 # Auto-detect LLVM on Windows (winget installs to "C:/Program Files/LLVM/bin")

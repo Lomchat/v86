@@ -6,6 +6,7 @@ pub mod d3d9_arena;
 pub mod fpu;
 pub mod global_pointers;
 pub mod hypercall;
+pub mod hypercall_rtti;
 pub mod instructions;
 pub mod instructions_0f;
 pub mod ioapic;

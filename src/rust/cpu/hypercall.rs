@@ -55,6 +55,7 @@ use crate::cpu::memory;
 use crate::cpu::cpu::{
     read_reg32, safe_read32s, safe_write32, write_reg32, EAX, EDX, ESP,
 };
+use crate::cpu::hypercall_rtti::{rt_dynamic_cast, RtDynamicCastResult};
 use crate::cpu::fpu::{fpu_get_st0, fpu_get_sti, fpu_pop, fpu_push, fpu_write_st};
 use crate::cpu::global_pointers::{fpu_stack_ptr, instruction_counter};
 use crate::softfloat::F80;
@@ -291,6 +292,7 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         74 => handle_strnicmp(),
         75 => handle_strstr(),
         76 => handle_atoi(),
+        77 => handle_rt_dynamic_cast(),
         _ => false,
     };
 
@@ -2000,5 +2002,44 @@ unsafe fn handle_heap_free() -> bool {
     slab_wr(ctl, SLAB_REL_FREE_COUNT, slab_rd(ctl, SLAB_REL_FREE_COUNT).wrapping_add(1));
     write_reg32(EAX, 1); // TRUE
     true
+}
+
+/// __RTDynamicCast(void* inptr, int vfDelta, void* srcType, void* targetType, int isReference)
+/// — cdecl, 5 args. Primary RTTI cast path; falls through to JS only for bad_cast (reference
+/// cast failure on a non-null pointer, which must throw via terminateProcess).
+unsafe fn handle_rt_dynamic_cast() -> bool {
+    let esp = read_reg32(ESP);
+    let inptr = match safe_read32s(esp + 4) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let vf_delta = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let src_type = match safe_read32s(esp + 12) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let target_type = match safe_read32s(esp + 16) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let is_reference = match safe_read32s(esp + 20) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    match rt_dynamic_cast(inptr, vf_delta, src_type, target_type, is_reference) {
+        RtDynamicCastResult::Success(addr) => {
+            write_reg32(EAX, addr as i32);
+            true
+        }
+        RtDynamicCastResult::FailNull => {
+            write_reg32(EAX, 0);
+            true
+        }
+        RtDynamicCastResult::FailBadCast => false,
+    }
 }
 

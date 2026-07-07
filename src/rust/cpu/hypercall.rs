@@ -305,6 +305,10 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         75 => handle_strstr(),
         76 => handle_atoi(),
         77 => handle_rt_dynamic_cast(),
+        // Page-probe pointer validation (IsBadReadPtr/IsBadWritePtr share one probe).
+        78 => handle_is_bad_ptr(),
+        79 => handle_is_bad_ptr(),
+        // Uncontended mutex fast paths (see mutex mirror table @ OFF_HC_MUTEX_MIRROR_PTR).
         80 => handle_release_mutex(),
         81 => handle_wait_for_single_object(),
         _ => false,
@@ -1715,6 +1719,55 @@ unsafe fn handle_atoi() -> bool {
     }
     let val = if neg { -acc } else { acc };
     write_reg32(EAX, val as i32);
+    true
+}
+
+/// IsBadReadPtr(lp, ucb) / IsBadWritePtr(lp, ucb) — stdcall(2), BOOL: 0 = accessible.
+/// Faithful mechanism: like real Windows, PROBE the pages (one safe read per 4KB page)
+/// instead of consulting an allocator-side list. Decommitted pages (MEM_DECOMMIT clears
+/// the PTE Present bit — page-table-manager.ts) fail the probe. Any probe fault falls
+/// through to the JS handler (return false), which distinguishes decommit from CoW /
+/// other #PF causes — WASM only answers the hot all-pages-present case. The JS impl
+/// checks read-access only for both variants (write perms are not modelled there), so
+/// one probe routine serves both entry points; JS stays the source of truth.
+unsafe fn handle_is_bad_ptr() -> bool {
+    let esp = read_reg32(ESP);
+    let lp = match safe_read32s(esp + 4) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let ucb = match safe_read32s(esp + 8) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    // NULL with zero size is valid per Windows docs; NULL with size is bad.
+    if ucb == 0 {
+        write_reg32(EAX, 0);
+        return true;
+    }
+    if lp == 0 {
+        write_reg32(EAX, 1);
+        return true;
+    }
+    // Out of guest RAM bounds (matches the JS `lp + ucb > mem.length` check).
+    let mem_size = *crate::cpu::global_pointers::memory_size as u64;
+    if lp as u64 + ucb as u64 > mem_size {
+        write_reg32(EAX, 1);
+        return true;
+    }
+    // Probe the first byte of every touched 4KB page. All present → accessible.
+    let first_page = lp >> 12;
+    let last_page = (lp + ucb - 1) >> 12;
+    let mut page = first_page;
+    while page <= last_page {
+        let probe_addr = if page == first_page { lp } else { page << 12 };
+        if hc_safe_read8(probe_addr as i32).is_err() {
+            // Fault: decommit vs CoW vs other — let JS decide.
+            return false;
+        }
+        page += 1;
+    }
+    write_reg32(EAX, 0);
     true
 }
 

@@ -117,9 +117,46 @@ fn ret_cache_flush() {
 // cap bounds runaway promotion (compile-storm guard — once full, no new promotions).
 static mut JIT_TIER2_THRESHOLD: u32 = 300_000;
 static mut JIT_TIER2_RET_SPEC_MAX_INSTR: u32 = 96;
-const TIER2_MAX_PAGES: u32 = 8;
+// Runtime-tunable (set_jit_config idx 17) so the tier-2 module-size budget can be
+// A/B'd in-race without a rebuild; 8 was never tuned. Raising it grows only PROMOTED
+// modules (cold code keeps the global MAX_PAGES), so the V8 large-function OOM risk
+// that forbids raising the global cap doesn't apply at moderate values.
+static mut TIER2_MAX_PAGES: u32 = 8;
 const TIER2_PAGE_SET_CAP: usize = 256;
 static mut MODULE_EXEC_COUNTS: [u32; 0x10000] = [0; 0x10000];
+
+// Tier-2 observability (read via dbg.tier2Stats()): without these there is no way to
+// tell "promotions landed" apart from "promotions starved by the page-set cap" — the
+// exact ambiguity that made the in-race B3 A/B unreadable (threshold changes showed
+// zero FPS delta because the cap, not the threshold, was the limiter candidate).
+static mut TIER2_PROMOTIONS: u32 = 0;
+static mut TIER2_BLOCKED_BY_CAP: u32 = 0;
+
+#[no_mangle]
+pub fn jit_get_tier2_page_count() -> u32 {
+    get_jit_state().tier2_pages.len() as u32
+}
+#[no_mangle]
+pub fn jit_get_tier2_promotions() -> u32 {
+    unsafe { TIER2_PROMOTIONS }
+}
+#[no_mangle]
+pub fn jit_get_tier2_blocked_by_cap() -> u32 {
+    unsafe { TIER2_BLOCKED_BY_CAP }
+}
+/// i-th tier-2 page address (page<<12), 0 when i >= count. Iteration order is the
+/// HashSet's (arbitrary but stable between mutations) — callers use this to feed
+/// trace2_watch_page with known-hot pages (tier-2 membership == crossed the re-entry
+/// threshold), closing the "which pages should Tier-2R watch" loop without an EIP
+/// sampler (which only sees idle/yield EIPs — JS timers can't fire mid-cycle-slice).
+#[no_mangle]
+pub fn jit_get_tier2_page_at(i: u32) -> u32 {
+    let ctx = get_jit_state();
+    match ctx.tier2_pages.iter().nth(i as usize) {
+        Some(p) => p.to_address(),
+        None => 0,
+    }
+}
 
 /// Called from cycle_internal on every compiled-module entry. Returns true when the
 /// module was just promoted to tier-2 AND freed — the caller must not dispatch into it
@@ -156,11 +193,13 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
         return false;
     }
     if ctx.tier2_pages.len() + pages.len() > TIER2_PAGE_SET_CAP {
+        unsafe { TIER2_BLOCKED_BY_CAP += 1 };
         return false;
     }
     for p in &pages {
         ctx.tier2_pages.insert(*p);
     }
+    unsafe { TIER2_PROMOTIONS += 1 };
     free_wasm_module_tree(&mut ctx, index);
     true
 }
@@ -1279,7 +1318,7 @@ fn jit_find_basic_blocks(
         } else {
             unsafe { MAX_PAGES }
         };
-        if tier2 { base.max(TIER2_MAX_PAGES) } else { base }
+        if tier2 { base.max(unsafe { TIER2_MAX_PAGES }) } else { base }
     } else {
         1
     };
@@ -3702,6 +3741,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         14 => JIT_RET_SPEC_MAX_INSTR = value,
         15 => JIT_TIER2_THRESHOLD = value,
         16 => JIT_TIER2_RET_SPEC_MAX_INSTR = value,
+        17 => TIER2_MAX_PAGES = value,
         _ => dbg_assert!(false),
     }
 }
@@ -3726,6 +3766,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         14 => JIT_RET_SPEC_MAX_INSTR,
         15 => JIT_TIER2_THRESHOLD,
         16 => JIT_TIER2_RET_SPEC_MAX_INSTR,
+        17 => TIER2_MAX_PAGES,
         _ => 0,
     }
 }

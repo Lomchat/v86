@@ -108,6 +108,12 @@ unsafe fn get_complete_object_locator(inptr: u32) -> Option<u32> {
 
 unsafe fn find_complete_object(inptr: u32) -> Option<u32> {
     let locator_ptr = get_complete_object_locator(inptr)?;
+    // Mirror the JS fallback's low-pointer guard (crt-rtti.ts): a corrupt vtable with a
+    // COL pointer in (0, 0x1000) must fail deterministically, not walk low guest memory
+    // as if it were RTTI.
+    if locator_ptr < 0x1000 {
+        return None;
+    }
     let offset = rd32(locator_ptr + 4)?;
     let cd_offset = rd32(locator_ptr + 8)?;
     let mut complete_object = inptr.wrapping_sub(offset);

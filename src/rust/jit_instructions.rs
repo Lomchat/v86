@@ -4186,6 +4186,11 @@ pub fn instr_DF_4_reg_jit(ctx: &mut JitContext, r: u32) {
         ctx.builder.shl_i32();
         ctx.builder.or_i32();
         codegen::gen_set_reg16(ctx, regs::AX);
+        // Reads status word + TOP only; no st register is touched, so the local
+        // st cache stays coherent — without this the emission loop appends a
+        // spurious runtime invalidate-all after every FNSTSW (fcom;fnstsw;sahf
+        // multi-compare runs would drop their cached STs for nothing).
+        ctx.x87_cache_kept = true;
     }
     else {
         codegen::gen_trigger_ud(ctx);

@@ -4540,6 +4540,11 @@ pub fn clear_tlb_code(page: i32) {
     unsafe {
         if let Some(c) = tlb_code[page as usize] {
             drop(Box::from_raw(c.as_ptr()));
+            // A code-TLB eviction invalidates dispatch targets the stock resolvers
+            // would re-derive from tlb_code on the next probe; the B1b ret-target
+            // memo must not outlive it (see RET_CACHE in jit.rs). Bump only when an
+            // entry was actually dropped — data-page evictions don't affect the memo.
+            jit::ret_cache_invalidate_all();
         }
         tlb_code[page as usize] = None;
     }

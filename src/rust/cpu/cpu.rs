@@ -3200,7 +3200,16 @@ pub unsafe fn cycle_internal() {
             }
             else if initial_state_flags == unit_state_flags {
                 if unit_state != u16::MAX {
-                    jit_entry = Some((unit_index.to_u16(), unit_state));
+                    // B3 hotness tiering: returns true when this module just crossed the
+                    // tier-2 threshold and was freed — don't dispatch into it; run
+                    // interpreted this slice and let hotness recompile it with the
+                    // tier-2 budget.
+                    if jit::jit_tier2_note_execution(unit_index.to_u16()) {
+                        profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_CODE);
+                    }
+                    else {
+                        jit_entry = Some((unit_index.to_u16(), unit_state));
+                    }
                 }
                 else {
                     profiler::stat_increment(if is_near_end_of_page(initial_eip as u32) {

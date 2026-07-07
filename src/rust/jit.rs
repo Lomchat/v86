@@ -88,6 +88,82 @@ static mut JIT_RET_CHAINING: bool = false;
 static mut JIT_RET_SPECULATION: bool = false;
 static mut JIT_RET_SPEC_MAX_INSTR: u32 = 24;
 const RET_SPEC_MAX_CANDIDATES: usize = 4;
+
+// B1b: direct-mapped memo in front of the dynamic-chaining tlb_code walk
+// (measured 1.5% self + part of the 7% indirect-jump bucket, NFSU in-race).
+// Entries are (virt eip, state_flags, packed target); packed < 0 = empty. The cache
+// holds MODULE-LIFETIME data (a packed wasm-table slot + dispatcher state), so it is
+// flushed in free_wasm_module — the single funnel every module free goes through
+// (dirty page, clear cache, fastmem deopt) — a stale hit could tail-call into a
+// freed/reused table slot. No per-thread state: entries are eip-keyed, and the
+// budget/in_hlt guard still runs before every probe.
+const RET_CACHE_SIZE: usize = 512;
+static mut RET_CACHE: [(u32, u32, i32); RET_CACHE_SIZE] = [(0, 0, -1); RET_CACHE_SIZE];
+
+fn ret_cache_flush() {
+    unsafe {
+        for e in (*std::ptr::addr_of_mut!(RET_CACHE)).iter_mut() {
+            *e = (0, 0, -1);
+        }
+    }
+}
+
+// B3 hotness tiering: a module whose RE-ENTRY count (bumped per cycle_internal entry —
+// the cheapest per-module execution proxy that needs no codegen) crosses the threshold
+// gets its pages marked tier-2 and is freed; the ordinary hotness path recompiles it,
+// and jit_find_basic_blocks sees the tier-2 marking and compiles with expanded budgets
+// (more pages per module + a deeper RET-speculation window). Cold code never pays for
+// the expensive compilation. Threshold 0 disables (set_jit_config idx 15); the page-set
+// cap bounds runaway promotion (compile-storm guard — once full, no new promotions).
+static mut JIT_TIER2_THRESHOLD: u32 = 300_000;
+static mut JIT_TIER2_RET_SPEC_MAX_INSTR: u32 = 96;
+const TIER2_MAX_PAGES: u32 = 8;
+const TIER2_PAGE_SET_CAP: usize = 256;
+static mut MODULE_EXEC_COUNTS: [u32; 0x10000] = [0; 0x10000];
+
+/// Called from cycle_internal on every compiled-module entry. Returns true when the
+/// module was just promoted to tier-2 AND freed — the caller must not dispatch into it
+/// (run interpreted this slice; hotness recompiles it with the tier-2 budget).
+#[no_mangle]
+pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
+    let threshold = unsafe { JIT_TIER2_THRESHOLD };
+    if threshold == 0 {
+        return false;
+    }
+    let count = unsafe {
+        let c = &mut (*std::ptr::addr_of_mut!(MODULE_EXEC_COUNTS))[wasm_table_index as usize];
+        *c += 1;
+        *c
+    };
+    if count < threshold {
+        return false;
+    }
+    unsafe { MODULE_EXEC_COUNTS[wasm_table_index as usize] = 0 };
+
+    let mut ctx = get_jit_state();
+    let index = WasmTableIndex(wasm_table_index);
+    let pages: Vec<Page> = ctx
+        .pages
+        .iter()
+        .filter(|(_, info)| info.wasm_table_index == index)
+        .map(|(p, _)| *p)
+        .collect();
+    if pages.is_empty() {
+        return false;
+    }
+    // Already fully tier-2? Nothing to gain from another free/recompile churn.
+    if pages.iter().all(|p| ctx.tier2_pages.contains(p)) {
+        return false;
+    }
+    if ctx.tier2_pages.len() + pages.len() > TIER2_PAGE_SET_CAP {
+        return false;
+    }
+    for p in &pages {
+        ctx.tier2_pages.insert(*p);
+    }
+    free_wasm_module_tree(&mut ctx, index);
+    true
+}
 static mut JIT_DEAD_FLAG_ELISION: bool = false;
 static mut JIT_FASTMEM_READS: bool = false;
 static mut JIT_X87_LOCALS: bool = false;
@@ -427,6 +503,11 @@ struct JitState {
     pages: HashMap<Page, PageInfo>,
     wasm_table_index_free_list: Vec<WasmTableIndex>,
     compiling: Option<(WasmTableIndex, CompilingPageState)>,
+    // B3 hotness tiering: pages promoted to tier-2 (jit_tier2_note_execution) — modules
+    // whose entries land on these pages compile with the expanded tier-2 budgets.
+    // Survives jit_clear_cache (the pages are still the hot ones); dies with the wasm
+    // instance (per game load).
+    tier2_pages: HashSet<Page>,
 }
 
 fn check_jit_state_invariants(ctx: &mut JitState) {
@@ -491,6 +572,7 @@ impl JitState {
 
             wasm_table_index_free_list: Vec::from_iter(wasm_table_indices),
             compiling: None,
+            tier2_pages: HashSet::new(),
         }
     }
 }
@@ -1032,6 +1114,18 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     }
 
     let virt_address = *global_pointers::instruction_pointer as u32;
+
+    // B1b: direct-mapped memo probe (flushed on every module free — see RET_CACHE).
+    let cache_idx = (virt_address >> 2) as usize & (RET_CACHE_SIZE - 1);
+    let cached = RET_CACHE[cache_idx];
+    if cached.0 == virt_address && cached.1 == state_flags && cached.2 >= 0 {
+        if dispatch_stats_enabled() {
+            profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+        }
+        return cached.2;
+    }
+
+    let raw_state_flags = state_flags;
     let state_flags = CachedStateFlags::of_u32(state_flags);
 
     match cpu::tlb_code[(virt_address >> 12) as usize] {
@@ -1057,7 +1151,14 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
                 }
 
                 let table_slot = unit_index.to_u16() as i32 + cpu::WASM_TABLE_OFFSET as i32;
-                return table_slot << 16 | unit_state as i32;
+                let packed = table_slot << 16 | unit_state as i32;
+                // Only cache generation-0 units: a fastmem-tracked unit (generation != 0)
+                // must re-run the generation check on every dispatch, which the memo
+                // would skip.
+                if unit_generation == 0 {
+                    RET_CACHE[cache_idx] = (virt_address, raw_state_flags, packed);
+                }
+                return packed;
             }
         },
     }
@@ -1157,17 +1258,28 @@ fn jit_find_basic_blocks(
     let mut pages: HashSet<Page> = HashSet::new();
     let mut page_blacklist = HashSet::new();
 
+    // B3 hotness tiering: a compilation whose entry lands on a tier-2-promoted page
+    // gets the expanded budgets (more pages per module + deeper RET-speculation).
+    let tier2 = ctx.tier2_pages.len() > 0
+        && entry_points.iter().any(|&virt| {
+            match cpu::translate_address_read_no_side_effects(virt) {
+                Ok(phys) => ctx.tier2_pages.contains(&Page::page_of(phys)),
+                Err(()) => false,
+            }
+        });
+
     // 16-bit doesn't work correctly, most likely due to instruction pointer wrap-around
     // When indirect regions are on, use the (larger) region page budget as the
     // compilation-wide cap so dispatchers can absorb hot targets. Non-dispatcher
     // modules rarely reach it (hot direct-jump chains are short); it stays far
     // below the global-MAX_PAGES=48 setting that OOM'd V8.
     let max_pages = if cpu.state_flags.is_32() {
-        if unsafe { JIT_INDIRECT_REGIONS } {
+        let base = if unsafe { JIT_INDIRECT_REGIONS } {
             unsafe { MAX_PAGES.max(JIT_INDIRECT_REGION_MAX_PAGES) }
         } else {
             unsafe { MAX_PAGES }
-        }
+        };
+        if tier2 { base.max(TIER2_MAX_PAGES) } else { base }
     } else {
         1
     };
@@ -1488,7 +1600,9 @@ fn jit_find_basic_blocks(
         for &(callee, ret_virt, ret_phys) in &call_sites {
             let mut visited: HashSet<u32> = HashSet::new();
             let mut stack = vec![callee];
-            let mut instr_budget = unsafe { JIT_RET_SPEC_MAX_INSTR };
+            let mut instr_budget = unsafe {
+                if tier2 { JIT_TIER2_RET_SPEC_MAX_INSTR } else { JIT_RET_SPEC_MAX_INSTR }
+            };
             let mut rets: Vec<u32> = Vec::new();
             let mut ok = true;
             while let Some(addr) = stack.pop() {
@@ -3242,6 +3356,12 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
 }
 
 fn free_wasm_module(ctx: &mut JitState, wasm_table_index: WasmTableIndex) -> Vec<WasmTableIndex> {
+    // The freed module's table slot may be reused — drop every memoized chain target
+    // (B1b) and reset the tier-2 execution counter for the recycled index (B3). This is
+    // the single funnel all frees go through (dirty page, clear cache, fastmem deopt),
+    // so no other flush site is needed.
+    ret_cache_flush();
+    unsafe { MODULE_EXEC_COUNTS[wasm_table_index.to_u16() as usize] = 0 };
     for i in 0..unsafe { cpu::valid_tlb_entries_count } {
         let page = unsafe { cpu::valid_tlb_entries[i as usize] };
         let entry = unsafe { cpu::tlb_data[page as usize] };
@@ -3580,6 +3700,8 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         12 => JIT_RET_CHAINING = value != 0,
         13 => JIT_RET_SPECULATION = value != 0,
         14 => JIT_RET_SPEC_MAX_INSTR = value,
+        15 => JIT_TIER2_THRESHOLD = value,
+        16 => JIT_TIER2_RET_SPEC_MAX_INSTR = value,
         _ => dbg_assert!(false),
     }
 }
@@ -3602,6 +3724,8 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         12 => JIT_RET_CHAINING as u32,
         13 => JIT_RET_SPECULATION as u32,
         14 => JIT_RET_SPEC_MAX_INSTR,
+        15 => JIT_TIER2_THRESHOLD,
+        16 => JIT_TIER2_RET_SPEC_MAX_INSTR,
         _ => 0,
     }
 }

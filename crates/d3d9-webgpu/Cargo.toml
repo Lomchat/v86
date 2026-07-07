@@ -1,0 +1,10 @@
+[package]
+name = "d3d9-webgpu"
+version = "0.1.0"
+publish = false
+edition = "2021"
+
+# Plain rlib linked into the v86 cdylib. No dependencies by design: this crate is the
+# seed of a standalone D3D9->WebGPU translation layer ("DXVK for WebGPU") usable by any
+# browser emulator — all host coupling (guest-memory access) is injected via guest_mem.
+[lib]

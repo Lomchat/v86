@@ -155,6 +155,17 @@ pub enum stat {
     //                                (flags proven dead via the intra-block non-faulting walk).
     DEAD_FLAG_ELISION_CANDIDATE,
     DEAD_FLAG_ELIDED,
+
+    // RET/AbsoluteEip dynamic chaining (always-on, read via profiler_dispatch_stat_get 10-12,
+    // gated by jit::DISPATCH_STATS like the block-chaining counters above).
+    //   ABSEIP_DISPATCH — every jit_find_cache_entry_in_page call (the in-module AbsoluteEip
+    //                     re-dispatch). The vision doc's gate-1 rate ("RET-dispatch pressure"):
+    //                     if this is low in-race, RET chaining has a small ceiling.
+    //   RET_CHAIN_HIT   — AbsoluteEip exit chained via tail-call (JIT_RET_CHAINING).
+    //   RET_CHAIN_MISS  — AbsoluteEip exit that fell back to main_loop after a chain attempt.
+    ABSEIP_DISPATCH,
+    RET_CHAIN_HIT,
+    RET_CHAIN_MISS,
 }
 
 #[allow(non_upper_case_globals)]
@@ -220,6 +231,9 @@ pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
         7 => stat::MODULE_CHAIN_MISS,
         8 => stat::DEAD_FLAG_ELISION_CANDIDATE,
         9 => stat::DEAD_FLAG_ELIDED,
+        10 => stat::ABSEIP_DISPATCH,
+        11 => stat::RET_CHAIN_HIT,
+        12 => stat::RET_CHAIN_MISS,
         _ => return 0.0,
     };
     unsafe { stat_array[stat as usize] as f64 }

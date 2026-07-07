@@ -12,6 +12,7 @@ pub mod profiler;
 mod analysis;
 mod codegen;
 mod config;
+mod d3d9_glue;
 mod control_flow;
 mod cpu_context;
 mod gen;

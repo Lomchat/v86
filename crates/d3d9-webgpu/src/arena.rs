@@ -50,7 +50,7 @@
 
 use std::ptr::{addr_of, addr_of_mut};
 
-use crate::cpu::cpu::{safe_read32s, safe_read8};
+use crate::guest_mem::guest_mem;
 
 // ---------------------------------------------------------------------------
 // Layout constants
@@ -730,24 +730,18 @@ pub unsafe fn d3d9_record_draw_indexed_up(
     }
 }
 
-/// Bulk-copy `len` bytes from a GUEST address (bounds/mmap-checked) into the arena at
-/// `dst_off` (our own static memory — no guest-address validation needed for the
-/// destination). Mirrors handle_memcpy's tail-byte handling (hypercall.rs:1305-1343).
+/// Bulk-copy `len` bytes from a GUEST address into the arena at `dst_off` (our own
+/// static memory — no guest-address validation needed for the destination). Guest-side
+/// bounds/mmap checking lives in the host's injected read_block (see guest_mem.rs).
 unsafe fn copy_guest_bytes(guest_src: i32, dst_off: usize, len: u32) -> Result<(), ()> {
     if guest_src == 0 || len == 0 {
         return Ok(());
     }
+    let gm = guest_mem().ok_or(())?;
     let dst = arena_ptr().add(dst_off);
-    let mut i: u32 = 0;
-    while i + 4 <= len {
-        let val = safe_read32s(guest_src + i as i32).map_err(|_| ())?;
-        *(dst.add(i as usize) as *mut i32) = val;
-        i += 4;
+    if (gm.read_block)(guest_src, dst, len) {
+        Ok(())
+    } else {
+        Err(())
     }
-    while i < len {
-        let byte = safe_read8(guest_src + i as i32).map_err(|_| ())?;
-        *dst.add(i as usize) = byte as u8;
-        i += 1;
-    }
-    Ok(())
 }

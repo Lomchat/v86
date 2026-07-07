@@ -56,6 +56,10 @@ cargo rustc --release \
 cp build/wasm32-unknown-unknown/release/v86.wasm build/v86.wasm
 echo "  → build/v86.wasm ($(du -h build/v86.wasm | cut -f1))"
 
+# Tripwire: #[no_mangle] exports contributed by workspace crates (crates/d3d9-webgpu)
+# must survive LTO/linking into the final cdylib. Fails the build if any went missing.
+node tools/check-wasm-exports.mjs build/v86.wasm
+
 # BottleShip: Vite serves v86.wasm from public/ (dev) and dist/ (prod build).
 # Keeping them in sync with vendor/v86/build/v86.wasm is easy to forget and
 # manifests as "Missing import: <name>" at worker startup when the built

@@ -2,7 +2,6 @@ pub mod apic;
 pub mod arith;
 pub mod call_indirect;
 pub mod cpu;
-pub mod d3d9_arena;
 pub mod fpu;
 pub mod global_pointers;
 pub mod hypercall;

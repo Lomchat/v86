@@ -72,6 +72,22 @@ static mut MAX_PAGES: u32 = 3;
 
 static mut JIT_USE_LOOP_SAFETY: bool = true;
 static mut JIT_BLOCK_CHAINING: bool = false;
+// RET/AbsoluteEip dynamic chaining (Block B mechanism 1, see
+// plan/stateblock-arena-and-superblocks-vision.md): when the in-module AbsoluteEip
+// re-dispatch misses, attempt a cross-module tail-call at the runtime eip instead of
+// exiting to main_loop. Gated at COMPILE time (like JIT_BLOCK_CHAINING) — toggle via
+// set_jit_config(12) and clear the JIT cache.
+static mut JIT_RET_CHAINING: bool = false;
+// RET-target speculation (Block B mechanism 2, superblock lite): annotate the RET of a
+// small module-local leaf with its call sites' return addresses and emit inline
+// eip-compare + direct dispatcher re-entry, skipping the jit_find_cache_entry_in_page
+// helper on the hot return path. Same-page CALL discovery already splices the callee's
+// blocks into the caller's module (follow_jump), so no new SMC surface: the callee's
+// page is already in the module's page set. set_jit_config(13); budget idx 14 caps the
+// callee's total instruction count (leaf qualification).
+static mut JIT_RET_SPECULATION: bool = false;
+static mut JIT_RET_SPEC_MAX_INSTR: u32 = 24;
+const RET_SPEC_MAX_CANDIDATES: usize = 4;
 static mut JIT_DEAD_FLAG_ELISION: bool = false;
 static mut JIT_FASTMEM_READS: bool = false;
 static mut JIT_X87_LOCALS: bool = false;
@@ -103,6 +119,8 @@ pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 pub static mut DISPATCH_STATS: bool = false;
 pub fn dispatch_stats_enabled() -> bool { unsafe { DISPATCH_STATS } }
 fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
+fn ret_chaining_enabled() -> bool { unsafe { JIT_RET_CHAINING } }
+fn ret_speculation_enabled() -> bool { unsafe { JIT_RET_SPECULATION } }
 fn dead_flag_elision_enabled() -> bool { unsafe { JIT_DEAD_FLAG_ELISION } }
 
 // Indices 0/1 remain as stable stat-array slots + TS label names ('tlbFullClear',
@@ -376,6 +394,8 @@ pub fn rust_init() {
         .unwrap()
         .write(JitState::create_and_initialise());
 
+    crate::d3d9_glue::init();
+
     use std::panic;
 
     panic::set_hook(Box::new(|panic_info| {
@@ -503,6 +523,16 @@ pub struct BasicBlock {
     pub ty: BasicBlockType,
     pub has_sti: bool,
     pub number_of_instructions: u32,
+    /// RET-target speculation (Block B mechanism 2, superblock lite): for an AbsoluteEip
+    /// block that is a genuine RET of a small leaf function called from within this
+    /// module, the (virt, phys) return addresses of its module-local call sites. The
+    /// emitter turns each into `if eip == virt { target_block = <dispatcher idx>;
+    /// br main_loop }` ahead of the jit_find_cache_entry_in_page helper call, so a
+    /// leaf's return stays intra-module without the dispatch helper. Filled by the
+    /// post-pass in jit_find_basic_blocks when JIT_RET_SPECULATION is on; empty
+    /// otherwise. The compare guards correctness — a stale/wrong candidate simply
+    /// falls through to the existing dispatch.
+    pub ret_speculation: Vec<(i32, u32)>,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -885,6 +915,9 @@ pub fn jit_find_cache_entry_in_page(
 ) -> i32 {
     // TODO: generate code for this
     profiler::stat_increment(stat::INDIRECT_JUMP);
+    if dispatch_stats_enabled() {
+        profiler::stat_increment_always(stat::ABSEIP_DISPATCH);
+    }
 
     let state_flags = CachedStateFlags::of_u32(state_flags);
 
@@ -973,6 +1006,64 @@ pub unsafe fn jit_find_cache_entry_for_chaining(state_flags: u32) -> i32 {
     if dispatch_stats_enabled() {
         profiler::stat_increment_always(stat::MODULE_EXIT_CHAINABLE);
         profiler::stat_increment_always(stat::MODULE_CHAIN_MISS);
+    }
+    -1
+}
+
+/// RET/AbsoluteEip variant of jit_find_cache_entry_for_chaining (same budget guard, same
+/// tlb_code lookup at the runtime eip, same packed return convention) with its own
+/// RET_CHAIN_HIT/RET_CHAIN_MISS stats — kept separate so the Phase-0 dispatch
+/// characterisation (MODULE_EXIT_CHAINABLE/MODULE_CHAIN_*) keeps meaning "statically
+/// chainable direct-jump exits" and isn't polluted by dynamic-eip exits.
+#[no_mangle]
+pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32 {
+    // same quantum as do_many_cycles_native (limit==0 urgent exit and in_hlt still bail) —
+    // this is what keeps the async-park/spin-loop invariant (CLAUDE.md §3.5): an urgent
+    // exit request zeroes the budget, so we never chain past it.
+    let limit = hypercall::read_cycle_limit();
+    let elapsed = (*global_pointers::instruction_counter)
+        .wrapping_sub(cpu::jit_cycle_start_instruction_counter);
+
+    if limit == 0 || elapsed >= limit || *global_pointers::in_hlt {
+        if dispatch_stats_enabled() {
+            profiler::stat_increment_always(stat::RET_CHAIN_MISS);
+        }
+        return -1;
+    }
+
+    let virt_address = *global_pointers::instruction_pointer as u32;
+    let state_flags = CachedStateFlags::of_u32(state_flags);
+
+    match cpu::tlb_code[(virt_address >> 12) as usize] {
+        None => {},
+        Some(c) => {
+            let c = c.as_ref();
+            // Copy out before any deopt (which frees this unit's Box).
+            let unit_generation = c.fastmem_generation;
+            let unit_index = c.wasm_table_index;
+            let matches = state_flags == c.state_flags;
+            let unit_state = if matches {
+                c.state_table[virt_address as usize & 0xFFF]
+            }
+            else {
+                u16::MAX
+            };
+            if unit_generation != 0 && unit_generation != fastmem_current_generation() {
+                fastmem_deopt_jit_unit(unit_index.to_u16() as u32);
+            }
+            else if matches && unit_state != u16::MAX {
+                if dispatch_stats_enabled() {
+                    profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+                }
+
+                let table_slot = unit_index.to_u16() as i32 + cpu::WASM_TABLE_OFFSET as i32;
+                return table_slot << 16 | unit_state as i32;
+            }
+        },
+    }
+
+    if dispatch_stats_enabled() {
+        profiler::stat_increment_always(stat::RET_CHAIN_MISS);
     }
     -1
 }
@@ -1124,6 +1215,7 @@ fn jit_find_basic_blocks(
             is_entry_block: false,
             has_sti: false,
             number_of_instructions: 0,
+            ret_speculation: Vec::new(),
         };
         loop {
             let addr_before_instruction = current_address;
@@ -1362,6 +1454,123 @@ fn jit_find_basic_blocks(
     for block in basic_blocks.values_mut() {
         if marked_as_entry.contains(&block.virt_addr) {
             block.is_entry_block = true;
+        }
+    }
+
+    // RET-target speculation post-pass (Block B mechanism 2). For every module-local
+    // call site (a Normal block whose jump target isn't its fall-through AND whose
+    // fall-through was registered as an entry — the CALL discovery shape at the
+    // Jump{condition:None} arm above), walk the callee's blocks within a bounded
+    // instruction budget. If every path ends in a genuine RET (opcode C3/C2 — an
+    // AbsoluteEip block can also be jmp/call r/m, which must NOT be speculated as a
+    // return) with no nested calls/STI/module-exits, annotate those RET blocks with
+    // the call site's return address. Wrong or stale candidates are harmless: the
+    // emitter guards each with an eip compare and falls through to the normal
+    // dispatch. A page dirtied under this module frees the whole module (multi-page
+    // sweep in free_wasm_module), annotations included — no new SMC surface.
+    if ret_speculation_enabled() {
+        let fall_through_virt =
+            |b: &BasicBlock| b.virt_addr & !0xFFF | b.end_addr as i32 & 0xFFF;
+
+        let mut call_sites: Vec<(u32, i32, u32)> = Vec::new();
+        for block in basic_blocks.values() {
+            if let BasicBlockType::Normal { next_block_addr: Some(target), .. } = block.ty {
+                if target != block.end_addr
+                    && marked_as_entry.contains(&fall_through_virt(block))
+                    && basic_blocks.contains_key(&block.end_addr)
+                {
+                    call_sites.push((target, fall_through_virt(block), block.end_addr));
+                }
+            }
+        }
+
+        let mut annotations: Vec<(u32, (i32, u32))> = Vec::new();
+        for &(callee, ret_virt, ret_phys) in &call_sites {
+            let mut visited: HashSet<u32> = HashSet::new();
+            let mut stack = vec![callee];
+            let mut instr_budget = unsafe { JIT_RET_SPEC_MAX_INSTR };
+            let mut rets: Vec<u32> = Vec::new();
+            let mut ok = true;
+            while let Some(addr) = stack.pop() {
+                if !visited.insert(addr) {
+                    continue;
+                }
+                let b = match basic_blocks.get(&addr) {
+                    Some(b) => b,
+                    None => {
+                        ok = false;
+                        break;
+                    },
+                };
+                if b.has_sti {
+                    ok = false;
+                    break;
+                }
+                match instr_budget.checked_sub(b.number_of_instructions) {
+                    Some(rest) => instr_budget = rest,
+                    None => {
+                        ok = false;
+                        break;
+                    },
+                }
+                match &b.ty {
+                    BasicBlockType::AbsoluteEip => {
+                        let opcode = memory::read8(b.last_instruction_addr) as u8;
+                        if opcode == 0xC3 || opcode == 0xC2 {
+                            rets.push(b.addr);
+                        }
+                        else {
+                            ok = false;
+                            break;
+                        }
+                    },
+                    BasicBlockType::Normal { next_block_addr: Some(t), .. } => {
+                        // A nested call returns INTO the callee, not to our site —
+                        // its RETs must not be annotated with our return address.
+                        if *t != b.end_addr && marked_as_entry.contains(&fall_through_virt(b)) {
+                            ok = false;
+                            break;
+                        }
+                        stack.push(*t);
+                    },
+                    BasicBlockType::Normal { next_block_addr: None, .. }
+                    | BasicBlockType::Exit => {
+                        ok = false;
+                        break;
+                    },
+                    BasicBlockType::ConditionalJump {
+                        next_block_addr,
+                        next_block_branch_taken_addr,
+                        ..
+                    } => {
+                        match (next_block_addr, next_block_branch_taken_addr) {
+                            (Some(n), Some(t)) => {
+                                stack.push(*n);
+                                stack.push(*t);
+                            },
+                            _ => {
+                                ok = false;
+                                break;
+                            },
+                        }
+                    },
+                }
+            }
+            if ok {
+                for ret_addr in rets {
+                    annotations.push((ret_addr, (ret_virt, ret_phys)));
+                }
+            }
+        }
+
+        for (ret_addr, cand) in annotations {
+            if let Some(b) = basic_blocks.get_mut(&ret_addr) {
+                if b.ret_speculation.len() < RET_SPEC_MAX_CANDIDATES
+                    && !b.ret_speculation.contains(&cand)
+                {
+                    b.ret_speculation.push(cand);
+                }
+            }
         }
     }
 
@@ -2042,6 +2251,28 @@ fn jit_generate_module(
                             codegen::gen_get_eip(ctx.builder);
                             ctx.builder.call_fn2("trace2_record_indirect");
                         }
+                        // RET-target speculation (Block B mechanism 2): a leaf's RET
+                        // whose module-local call sites are known compares the runtime
+                        // eip against each return address and re-enters the module
+                        // dispatcher directly, skipping the helper call below. Return
+                        // addresses were marked_as_entry at their CALLs, so they are
+                        // top-dispatcher entries (index < entry_blocks.len()); anything
+                        // else is skipped defensively.
+                        for &(cand_virt, cand_phys) in &block.ret_speculation {
+                            if let Some(&idx) = index_for_addr.get(&cand_phys) {
+                                if (idx as usize) < entry_blocks.len() {
+                                    codegen::gen_get_eip(ctx.builder);
+                                    ctx.builder.const_i32(cand_virt);
+                                    ctx.builder.eq_i32();
+                                    ctx.builder.if_void();
+                                    ctx.builder.const_i32(idx.into());
+                                    ctx.builder.set_local(target_block);
+                                    ctx.builder.br(main_loop_label);
+                                    ctx.builder.block_end();
+                                }
+                            }
+                        }
+
                         // Check if we can stay in this module, if not exit
                         codegen::gen_get_eip(ctx.builder);
                         ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
@@ -2052,6 +2283,40 @@ fn jit_generate_module(
                         ctx.builder.ge_i32();
                         // TODO: Could make this unconditional by including exit_label in the main br_table
                         ctx.builder.br_if(main_loop_label);
+
+                        // RET/indirect dynamic chaining (Block B mechanism 1): the in-module
+                        // re-dispatch missed, but the runtime eip may hit ANOTHER compiled
+                        // module — tail-call straight into it instead of round-tripping
+                        // through main_loop. Same flush + packed-slot convention as
+                        // gen_chain_or_exit_to_known_successor; on a chain miss we fall
+                        // through to the plain module exit (the register flush is idempotent
+                        // and the instruction counter was zeroed after flushing, so the
+                        // epilogue's second flush/add is harmless).
+                        if ret_chaining_enabled() {
+                            codegen::gen_move_registers_from_locals_to_memory(ctx);
+                            codegen::gen_update_instruction_counter(ctx);
+                            ctx.builder.const_i32(0);
+                            ctx.builder.set_local(&ctx.instruction_counter);
+
+                            ctx.builder.const_i32(state_flags.to_u32() as i32);
+                            ctx.builder
+                                .call_fn1_ret("jit_find_cache_entry_for_dynamic_chaining");
+                            let packed_target = ctx.builder.tee_new_local();
+
+                            ctx.builder.get_local(&packed_target);
+                            ctx.builder.const_i32(0);
+                            ctx.builder.ge_i32();
+                            ctx.builder.if_void();
+                            ctx.builder.get_local(&packed_target);
+                            ctx.builder.const_i32(0xFFFF);
+                            ctx.builder.and_i32();
+                            ctx.builder.get_local(&packed_target);
+                            ctx.builder.const_i32(16);
+                            ctx.builder.shr_u_i32();
+                            ctx.builder.return_call_indirect_fn1();
+                            ctx.builder.block_end();
+                            ctx.builder.free_local(packed_target);
+                        }
 
                         codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                         ctx.builder.br(ctx.exit_label);
@@ -3307,6 +3572,9 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         9 => JIT_FASTMEM_READS = value != 0,
         10 => JIT_X87_LOCALS = value != 0,
         11 => JIT_PUSH_RUN_COALESCING = value != 0,
+        12 => JIT_RET_CHAINING = value != 0,
+        13 => JIT_RET_SPECULATION = value != 0,
+        14 => JIT_RET_SPEC_MAX_INSTR = value,
         _ => dbg_assert!(false),
     }
 }
@@ -3326,6 +3594,9 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         9 => JIT_FASTMEM_READS as u32,
         10 => JIT_X87_LOCALS as u32,
         11 => JIT_PUSH_RUN_COALESCING as u32,
+        12 => JIT_RET_CHAINING as u32,
+        13 => JIT_RET_SPECULATION as u32,
+        14 => JIT_RET_SPEC_MAX_INSTR,
         _ => 0,
     }
 }

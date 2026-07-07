@@ -89,7 +89,7 @@ BROWSER_FILES=screen.js keyboard.js mouse.js speaker.js serial.js \
 	      inbrowser_network.js fake_network.js wisp_network.js fetch_network.js \
           print_stats.js filestorage.js
 
-RUST_FILES=$(shell find src/rust/ -name '*.rs') \
+RUST_FILES=$(shell find src/rust/ crates/ -name '*.rs') \
 	   src/rust/gen/interpreter.rs src/rust/gen/interpreter0f.rs \
 	   src/rust/gen/jit.rs src/rust/gen/jit0f.rs \
 	   src/rust/gen/analyzer.rs src/rust/gen/analyzer0f.rs
@@ -211,6 +211,7 @@ build/v86.wasm: $(RUST_FILES) build/zstddeclib.o Cargo.toml
 	cargo rustc --release $(CARGO_FLAGS)
 	cp build/wasm32-unknown-unknown/release/v86.wasm build/v86.wasm
 	-$(WASM_OPT) && wasm-opt -O2 --strip-debug build/v86.wasm -o build/v86.wasm
+	node tools/check-wasm-exports.mjs build/v86.wasm
 	BLOCK_SIZE=K ls -l build/v86.wasm
 
 build/v86-debug.wasm: $(RUST_FILES) build/zstddeclib.o Cargo.toml

@@ -91,20 +91,32 @@ const RET_SPEC_MAX_CANDIDATES: usize = 4;
 
 // B1b: direct-mapped memo in front of the dynamic-chaining tlb_code walk
 // (measured 1.5% self + part of the 7% indirect-jump bucket, NFSU in-race).
-// Entries are (virt eip, state_flags, packed target); packed < 0 = empty. The cache
-// holds MODULE-LIFETIME data (a packed wasm-table slot + dispatcher state), so it is
-// flushed in free_wasm_module — the single funnel every module free goes through
-// (dirty page, clear cache, fastmem deopt) — a stale hit could tail-call into a
-// freed/reused table slot. No per-thread state: entries are eip-keyed, and the
-// budget/in_hlt guard still runs before every probe.
+// Entries are (virt eip, state_flags, packed target, epoch); packed < 0 = empty.
+// The cache holds MODULE-LIFETIME data (a packed wasm-table slot + dispatcher state),
+// so every event that could invalidate a dispatch target the stock per-dispatch
+// re-validation would have caught MUST bump RET_CACHE_EPOCH (O(1) invalidate-all;
+// entries stamped with an older epoch miss on probe). Bump sites:
+//   - free_wasm_table_index — the ONLY place a wasm-table slot is nulled
+//     (jit_clear_func). NOT free_wasm_module: codegen_finalize_finished's
+//     module-overwrite path (INVALIDATE_MODULE_UNUSED_AFTER_OVERWRITE) frees the
+//     replaced module's index WITHOUT going through free_wasm_module — that was the
+//     null-function crash of the first landing (docs/v86-403a4ee-null-function-
+//     rootcause.md, Mechanism 0).
+//   - clear_tlb_code, when it actually drops a Code entry — the stock resolver
+//     re-derived liveness from tlb_code on every dispatch; after an eviction/remap
+//     a memo hit would dispatch a stale-but-live module the resolver would have
+//     rejected (Mechanism 1: wrong-code execution, not a trap).
+// Fastmem-tracked units (generation != 0) are never cached — their per-dispatch
+// generation check cannot be memoized. No per-thread state: entries are eip-keyed,
+// and the budget/in_hlt guard still runs before every probe.
 const RET_CACHE_SIZE: usize = 512;
-static mut RET_CACHE: [(u32, u32, i32); RET_CACHE_SIZE] = [(0, 0, -1); RET_CACHE_SIZE];
+static mut RET_CACHE: [(u32, u32, i32, u64); RET_CACHE_SIZE] = [(0, 0, -1, 0); RET_CACHE_SIZE];
+// Starts at 1 so zero-initialized entries can never match before their first fill.
+static mut RET_CACHE_EPOCH: u64 = 1;
 
-fn ret_cache_flush() {
+pub fn ret_cache_invalidate_all() {
     unsafe {
-        for e in (*std::ptr::addr_of_mut!(RET_CACHE)).iter_mut() {
-            *e = (0, 0, -1);
-        }
+        RET_CACHE_EPOCH += 1;
     }
 }
 
@@ -1115,10 +1127,16 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
 
     let virt_address = *global_pointers::instruction_pointer as u32;
 
-    // B1b: direct-mapped memo probe (flushed on every module free — see RET_CACHE).
+    // B1b: direct-mapped memo probe. An entry is valid only if its epoch is current —
+    // any table-slot free or code-TLB eviction since the fill bumps the epoch and
+    // invalidates everything (see RET_CACHE).
     let cache_idx = (virt_address >> 2) as usize & (RET_CACHE_SIZE - 1);
     let cached = RET_CACHE[cache_idx];
-    if cached.0 == virt_address && cached.1 == state_flags && cached.2 >= 0 {
+    if cached.0 == virt_address
+        && cached.1 == state_flags
+        && cached.2 >= 0
+        && cached.3 == RET_CACHE_EPOCH
+    {
         if dispatch_stats_enabled() {
             profiler::stat_increment_always(stat::RET_CHAIN_HIT);
         }
@@ -1156,7 +1174,8 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
                 // must re-run the generation check on every dispatch, which the memo
                 // would skip.
                 if unit_generation == 0 {
-                    RET_CACHE[cache_idx] = (virt_address, raw_state_flags, packed);
+                    RET_CACHE[cache_idx] =
+                        (virt_address, raw_state_flags, packed, RET_CACHE_EPOCH);
                 }
                 return packed;
             }
@@ -3113,6 +3132,32 @@ fn opcode_is_x87(eip: u32) -> bool {
     false
 }
 
+/// True if the instruction at `eip` MAY be an MMX op (0F-escape into the MMX opcode
+/// ranges, incl. EMMS 0F 77), after prefixes. MMX registers alias fpu_st storage
+/// (get_reg_mmx_offset), so these mutate st memory behind the x87 local cache exactly
+/// like raw x87 helpers do — the emission loop must invalidate live slots after them.
+/// Deliberately conservative: prefixed SSE forms of the same opcodes (66/F2/F3) match
+/// too, costing only a spurious runtime invalidate when x87 slots happen to be live.
+fn opcode_is_mmx(eip: u32) -> bool {
+    let mut addr = eip;
+    for _ in 0..4 {
+        match read_jit_u8(addr) {
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
+                addr = addr.wrapping_add(1);
+            },
+            0x0F => {
+                let op = read_jit_u8(addr.wrapping_add(1));
+                return (0x60..=0x77).contains(&op)
+                    || op == 0x7E
+                    || op == 0x7F
+                    || (0xD1..=0xFE).contains(&op);
+            },
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn jit_generate_basic_block(
     ctx: &mut JitContext,
     block: &BasicBlock,
@@ -3224,10 +3269,11 @@ fn jit_generate_basic_block(
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;
 
-        // Raw x87 helpers mutate TOP/st memory behind the local cache.
+        // Raw x87 helpers mutate TOP/st memory behind the local cache; MMX ops
+        // (incl. EMMS) alias the same fpu_st storage and must invalidate too.
         if !ctx.x87_cache_kept
             && ctx.x87_local_cache.iter().any(|s| s.is_some())
-            && opcode_is_x87(start_eip)
+            && (opcode_is_x87(start_eip) || opcode_is_mmx(start_eip))
         {
             codegen::gen_x87_local_cache_invalidate_all_runtime(ctx);
         }
@@ -3350,18 +3396,23 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
 
     ctx.wasm_table_index_free_list.push(wasm_table_index);
 
+    // This is the ONLY place a table slot is nulled — invalidate the B1b ret-target
+    // memo HERE, not in free_wasm_module: codegen_finalize_finished's module-overwrite
+    // path frees replaced indices without going through free_wasm_module (that gap was
+    // the null-function crash of the first landing — see the RET_CACHE comment). Also
+    // reset the tier-2 execution counter for the recycled index (B3).
+    ret_cache_invalidate_all();
+    unsafe { MODULE_EXEC_COUNTS[wasm_table_index.to_u16() as usize] = 0 };
+
     // It is not strictly necessary to clear the function, but it will fail more predictably if we
     // accidentally use the function and may garbage collect unused modules earlier
     jit_clear_func(wasm_table_index);
 }
 
 fn free_wasm_module(ctx: &mut JitState, wasm_table_index: WasmTableIndex) -> Vec<WasmTableIndex> {
-    // The freed module's table slot may be reused — drop every memoized chain target
-    // (B1b) and reset the tier-2 execution counter for the recycled index (B3). This is
-    // the single funnel all frees go through (dirty page, clear cache, fastmem deopt),
-    // so no other flush site is needed.
-    ret_cache_flush();
-    unsafe { MODULE_EXEC_COUNTS[wasm_table_index.to_u16() as usize] = 0 };
+    // B1b memo invalidation lives in free_wasm_table_index (reached below), the one
+    // true funnel — this function is NOT on every free path (module-overwrite frees
+    // bypass it).
     for i in 0..unsafe { cpu::valid_tlb_entries_count } {
         let page = unsafe { cpu::valid_tlb_entries[i as usize] };
         let entry = unsafe { cpu::tlb_data[page as usize] };

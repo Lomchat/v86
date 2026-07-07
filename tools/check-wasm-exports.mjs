@@ -15,6 +15,8 @@ const REQUIRED = [
     'd3d9_record_draw_indexed',
     'd3d9_record_draw_up',
     'd3d9_record_draw_indexed_up',
+    'd3d9_block_capture',
+    'd3d9_block_apply',
 ];
 
 const wasmPath = process.argv[2];

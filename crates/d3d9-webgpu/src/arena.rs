@@ -109,7 +109,49 @@ const OFF_OVERFLOW_COUNT: usize = OFF_ARENA_HIGH_WATER + 4;
 const OFF_FFP_FALLBACK_COUNT: usize = OFF_OVERFLOW_COUNT + 4;
 const OFF_MISMATCH_COUNT: usize = OFF_FFP_FALLBACK_COUNT + 4;
 
-const ARENA_SIZE: usize = OFF_MISMATCH_COUNT + 4;
+// ---------------------------------------------------------------------------
+// State-block slots (Block A, plan/stateblock-arena-and-superblocks-vision.md).
+// A slot is the arena-resident image of one "arena-coverable" IDirect3DStateBlock9:
+// bitmasks/ranges say WHICH states the block recorded; the value arrays hold the
+// block's captured values. JS writes masks/ranges/initial values through views at
+// End/CreateStateBlock; d3d9_block_capture refreshes the values from the live mirror
+// (Capture's refresh-only semantics); d3d9_block_apply diffs the slot against the
+// mirror and emits a compact changed-list JS replays through the ordinary device
+// setters (which themselves keep the mirror + JS trackers + setter shadows coherent —
+// the arena never writes the mirror on Apply).
+//
+// Per-slot layout (offsets published via LAYOUT_TABLE; JS never hardcodes them):
+//   maskRenderStates u32[8]        which of renderStates[256] the block recorded
+//   maskSampler0     u32           which of samplerStage0[16]
+//   vsConstRanges    {u16 startReg, u16 floatCount}[4]  (count=0 = unused)
+//   psConstRanges    {u16 startReg, u16 floatCount}[4]
+//   (pad to 72)
+//   rsValues         i32[256]
+//   sampValues       i32[16]
+//   constPool        f32[512]      vs ranges' data in order, then ps ranges' data
+// Handle-shaped entries (texture/vs/ps/decl/fvf — a handful per block, and their
+// values are COM pointers only JS can resolve) stay on the JS entry path.
+const BLOCK_SLOT_COUNT: usize = 128;
+const BLOCK_MASK_RS: usize = 0;
+const BLOCK_MASK_SAMP: usize = 32;
+const BLOCK_VS_RANGES: usize = 36;
+const BLOCK_PS_RANGES: usize = 52;
+const BLOCK_RS_VALUES: usize = 72;
+const BLOCK_SAMP_VALUES: usize = BLOCK_RS_VALUES + RENDER_STATE_COUNT * 4;
+const BLOCK_CONST_POOL: usize = BLOCK_SAMP_VALUES + SAMPLER_STAGE0_COUNT * 4;
+const BLOCK_CONST_POOL_FLOATS: usize = 512;
+const BLOCK_SLOT_SIZE: usize = (BLOCK_CONST_POOL + BLOCK_CONST_POOL_FLOATS * 4 + 15) & !15;
+const BLOCK_RANGE_COUNT: usize = 4;
+/// Changed-list entry = (kind<<16 | index, value) u32 pair. Kinds: 0=renderState
+/// (index=state, value=new value), 1=sampler0 (index=type), 2=vsConstRange /
+/// 3=psConstRange (index=range idx, value=pool float offset — JS reads the floats
+/// from the slot's constPool view).
+const BLOCK_CHANGED_CAP: usize = 512;
+
+const OFF_BLOCK_SLOTS: usize = (OFF_MISMATCH_COUNT + 4 + 15) & !15;
+const OFF_BLOCK_CHANGED: usize = OFF_BLOCK_SLOTS + BLOCK_SLOT_COUNT * BLOCK_SLOT_SIZE;
+
+const ARENA_SIZE: usize = OFF_BLOCK_CHANGED + BLOCK_CHANGED_CAP * 8;
 
 // RenderFrame::RenderCommandType (render-frame.ts) — 1-6 kept numerically identical so
 // the executor adapter can share dispatch code with the legacy RenderFrame consumer.
@@ -140,7 +182,7 @@ const CMD_DRAW_INDEXED_UP: u32 = 8;
 // once did (see memory: slab-hpbase-guest-unreachable). Order here IS the contract —
 // the TS-side LAYOUT_IDX_* constants must list the same names in the same order.
 // ---------------------------------------------------------------------------
-const LAYOUT_LEN: usize = 32;
+const LAYOUT_LEN: usize = 44;
 const LAYOUT_TABLE: [u32; LAYOUT_LEN] = [
     OFF_RENDER_STATES as u32,      // 0
     OFF_SAMPLER_STAGE0 as u32,     // 1
@@ -174,6 +216,18 @@ const LAYOUT_TABLE: [u32; LAYOUT_LEN] = [
     OFF_MISMATCH_COUNT as u32,     // 29
     CMD_CAP as u32,                // 30 — capacity, not an offset
     ARENA_SIZE as u32,             // 31 — total size, not an offset
+    OFF_BLOCK_SLOTS as u32,        // 32
+    BLOCK_SLOT_SIZE as u32,        // 33 — stride, not an offset
+    BLOCK_SLOT_COUNT as u32,       // 34 — capacity, not an offset
+    OFF_BLOCK_CHANGED as u32,      // 35
+    BLOCK_CHANGED_CAP as u32,      // 36 — capacity (u32 pairs), not an offset
+    BLOCK_MASK_RS as u32,          // 37 — intra-slot offsets from here down
+    BLOCK_MASK_SAMP as u32,        // 38
+    BLOCK_VS_RANGES as u32,        // 39
+    BLOCK_PS_RANGES as u32,        // 40
+    BLOCK_RS_VALUES as u32,        // 41
+    BLOCK_SAMP_VALUES as u32,      // 42
+    BLOCK_CONST_POOL as u32,       // 43
 ];
 
 #[no_mangle]
@@ -728,6 +782,132 @@ pub unsafe fn d3d9_record_draw_indexed_up(
         }
         None => -1,
     }
+}
+
+// ---------------------------------------------------------------------------
+// State-block Capture/Apply (Block A) — see the slot layout comment above.
+// ---------------------------------------------------------------------------
+
+#[inline(always)]
+unsafe fn block_slot_off(slot: u32) -> Option<usize> {
+    if (slot as usize) < BLOCK_SLOT_COUNT {
+        Some(OFF_BLOCK_SLOTS + slot as usize * BLOCK_SLOT_SIZE)
+    }
+    else {
+        None
+    }
+}
+
+/// Iterate the slot's const ranges (vs then ps, in order), calling `f(kind, range_idx,
+/// pool_float_off, mirror_byte_off, float_count)` for each used range. Pool packing is
+/// cumulative in range order — the SAME order JS packed the initial values in, so both
+/// sides agree on each range's pool offset without storing it.
+unsafe fn block_for_each_const_range(s: usize, mut f: impl FnMut(u32, usize, usize, usize, usize)) {
+    let mut pool = 0usize;
+    for (kind, ranges_off, mirror_off, mirror_floats) in [
+        (2u32, BLOCK_VS_RANGES, OFF_VS_CONSTANTS, VS_CONST_FLOATS),
+        (3u32, BLOCK_PS_RANGES, OFF_PS_CONSTANTS, PS_CONST_FLOATS),
+    ] {
+        for r in 0..BLOCK_RANGE_COUNT {
+            let start_reg = rd_u16(s + ranges_off + r * 4) as usize;
+            let count = rd_u16(s + ranges_off + r * 4 + 2) as usize;
+            if count == 0 {
+                continue;
+            }
+            let start_float = start_reg * 4;
+            if start_float + count > mirror_floats || pool + count > BLOCK_CONST_POOL_FLOATS {
+                // Malformed range (JS classification should prevent this) — stop rather
+                // than read/write out of bounds.
+                return;
+            }
+            f(kind, r, pool, mirror_off + start_float * 4, count);
+            pool += count;
+        }
+    }
+}
+
+/// Capture = refresh the slot's recorded values from the live mirror (matches
+/// captureStateBlockData's refresh-only semantics). Copying the full rs/sampler value
+/// arrays (masked entries are the only ones ever read back) is simpler and faster than
+/// a bit walk. Handle-shaped entries are refreshed on the JS side.
+#[no_mangle]
+pub unsafe fn d3d9_block_capture(slot: u32) {
+    let s = match block_slot_off(slot) {
+        Some(s) => s,
+        None => return,
+    };
+    std::ptr::copy_nonoverlapping(
+        arena_ptr().add(OFF_RENDER_STATES),
+        arena_ptr().add(s + BLOCK_RS_VALUES),
+        RENDER_STATE_COUNT * 4,
+    );
+    std::ptr::copy_nonoverlapping(
+        arena_ptr().add(OFF_SAMPLER_STAGE0),
+        arena_ptr().add(s + BLOCK_SAMP_VALUES),
+        SAMPLER_STAGE0_COUNT * 4,
+    );
+    block_for_each_const_range(s, |_kind, _r, pool_off, mirror_byte_off, count| {
+        std::ptr::copy_nonoverlapping(
+            arena_ptr().add(mirror_byte_off),
+            arena_ptr().add(s + BLOCK_CONST_POOL + pool_off * 4),
+            count * 4,
+        );
+    });
+}
+
+/// Apply = diff the slot against the live mirror and emit a compact changed-list
+/// (u32 pairs at OFF_BLOCK_CHANGED, count returned). The mirror is NOT written here —
+/// JS replays each delta through the ordinary device setter, which updates the mirror,
+/// the JS state tracker, and the setter shadow through the one existing write path.
+#[no_mangle]
+pub unsafe fn d3d9_block_apply(slot: u32) -> u32 {
+    let s = match block_slot_off(slot) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let ch = arena_ptr().add(OFF_BLOCK_CHANGED) as *mut u32;
+    let mut n = 0usize;
+    let mut push = |kind_idx: u32, value: u32| {
+        if n < BLOCK_CHANGED_CAP {
+            *ch.add(n * 2) = kind_idx;
+            *ch.add(n * 2 + 1) = value;
+            n += 1;
+        }
+    };
+
+    for w in 0..RENDER_STATE_COUNT / 32 {
+        let mut m = rd_u32(s + BLOCK_MASK_RS + w * 4);
+        while m != 0 {
+            let bit = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let state = w * 32 + bit;
+            let bv = rd_i32(s + BLOCK_RS_VALUES + state * 4);
+            if bv != rd_i32(OFF_RENDER_STATES + state * 4) {
+                push(state as u32, bv as u32); // kind 0
+            }
+        }
+    }
+
+    let mut m = rd_u32(s + BLOCK_MASK_SAMP);
+    while m != 0 {
+        let ty = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let bv = rd_i32(s + BLOCK_SAMP_VALUES + ty * 4);
+        if bv != rd_i32(OFF_SAMPLER_STAGE0 + ty * 4) {
+            push(1 << 16 | ty as u32, bv as u32);
+        }
+    }
+
+    block_for_each_const_range(s, |kind, r, pool_off, mirror_byte_off, count| {
+        let block_bytes =
+            std::slice::from_raw_parts(arena_ptr().add(s + BLOCK_CONST_POOL + pool_off * 4), count * 4);
+        let mirror_bytes = std::slice::from_raw_parts(arena_ptr().add(mirror_byte_off), count * 4);
+        if block_bytes != mirror_bytes {
+            push(kind << 16 | r as u32, pool_off as u32);
+        }
+    });
+
+    n as u32
 }
 
 /// Bulk-copy `len` bytes from a GUEST address into the arena at `dst_off` (our own

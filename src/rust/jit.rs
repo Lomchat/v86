@@ -2281,7 +2281,12 @@ fn jit_generate_module(
                         ctx.builder.tee_local(target_block);
                         ctx.builder.const_i32(0);
                         ctx.builder.ge_i32();
-                        // TODO: Could make this unconditional by including exit_label in the main br_table
+                        // The branch stays conditional by design: the miss path below is no
+                        // longer a plain exit — it attempts a cross-module tail-call (RET
+                        // dynamic chaining), which must run between the in-page miss and the
+                        // module exit. Folding the miss into the dispatcher br_table (the old
+                        // idea here) would lose that attempt for the price of one predictable
+                        // branch on the hit path.
                         ctx.builder.br_if(main_loop_label);
 
                         // RET/indirect dynamic chaining (Block B mechanism 1): the in-module

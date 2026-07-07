@@ -424,6 +424,21 @@ function build_image(bodyName)
             emit(0xDA, 0x3D); imm32(COUNTER);  // FIDIVR m32
             fstp64(ACC);
         },
+        // FNSTSW AX with a non-trivial TOP (stack_ptr) value. The inline codegen for
+        // DF /4 rebuilds the status word as *sw & !(7<<11) | (stack_ptr&7)<<11; this pins
+        // TOP=5 (three pushes from a fninit'd stack) so a botched shift/mask in the TOP
+        // field diverges from the helper oracle. eax (zeroed first) captures the raw SW.
+        fnstsw_top() {
+            fld1();                        // TOP=7
+            fld1();                        // TOP=6
+            fld64(C64);                    // TOP=5, st0=0.75
+            emit(0x31, 0xC0);              // xor eax,eax (zero high bits)
+            fnstsw_ax();                   // AX = status word, TOP field = 5
+            movMemEax(ACC);                // ACC = raw SW -> eax/ebx compared
+            fstp64(LAST);                  // drain 0.75  -> TOP=6
+            fstp32(LAST);                  // drain       -> TOP=7
+            fstp32(LAST);                  // drain       -> TOP=0 (empty)
+        },
         // FIADD/FIMUL/FISUB/FIDIV m16int (DE group) — same f80-format requirement.
         fiarith16() {
             fild32(COUNTER);
@@ -515,7 +530,7 @@ const fmt = (r) => `${r.status} acc=${r.ebx.toString(16).padStart(8,"0")}:${r.ea
 const variants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_sti", "m80_mem", "m80_pop", "m80_nopop", "tag_pop", "full", "fxch_sticky", "fcom_sticky", "consts_sign", "fist_round", "fist_round_neg", "fcomi_flags",
     // newly-covered families (previously untested, where Bug #2 is hypothesised to live)
     "fcom_mem", "fst_reg", "fild_widths", "fist16_round", "consts_all", "fcomi_more", "tl_mix",
-    "fiarith32", "fiarith16"];
+    "fnstsw_top", "fiarith32", "fiarith16"];
 // FCOM/FXCH between two relaxed values must not fall back to the helper (that re-poisons
 // the slot). Only meaningful in relaxed(1).
 const stickyVariants = ["fxch_sticky", "fcom_sticky"];

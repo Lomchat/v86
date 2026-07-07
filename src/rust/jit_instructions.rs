@@ -4169,7 +4169,22 @@ pub fn instr_DF_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 pub fn instr_DF_4_reg_jit(ctx: &mut JitContext, r: u32) {
     if r == 0 {
-        ctx.builder.call_fn0_ret("fpu_load_status_word");
+        // FNSTSW AX. Inline fpu_load_status_word (fpu.rs) instead of an out-of-line call:
+        //   *fpu_status_word & !(7 << 11) | (*fpu_stack_ptr & 7) << 11
+        // The MSVC compare idiom (fcomp; fnstsw ax; test ah,imm; jcc) hits this on every
+        // x87 branch; killing the call frame is a generic win across x87-heavy titles.
+        // Bit-exact with the helper under the fpu_stack_ptr < 8 invariant.
+        ctx.builder
+            .load_fixed_u16(global_pointers::fpu_status_word as u32);
+        ctx.builder.const_i32(!(7 << 11));
+        ctx.builder.and_i32();
+        ctx.builder
+            .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+        ctx.builder.const_i32(7);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(11);
+        ctx.builder.shl_i32();
+        ctx.builder.or_i32();
         codegen::gen_set_reg16(ctx, regs::AX);
     }
     else {

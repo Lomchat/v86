@@ -48,6 +48,8 @@
 //!   0x1448: hc_event_table      [u8; 2048] — mirrored kernel event state (see EVT_* flags)
 //!   0x1C48: hc_event_starvation_counter u32 — consecutive WASM-handled SetEvent calls
 //!   0x1C4C: hc_event_starvation_limit   u32 — max consecutive before JS fallthrough
+//!   0x1C50: hc_mutex_mirror_ptr         u32 — guest addr of mutex mirror table (2048×u32)
+//!     Mutex mirror word: MUX_VALID | MUX_HAS_WAITERS | MUX_ABANDONED | owner:16 | rec:8
 
 use std::ptr::{addr_of, addr_of_mut};
 
@@ -142,6 +144,7 @@ unsafe fn slab_wr(ctl: u32, rel: u32, value: u32) {
 }
 const OFF_HC_EVENT_STARVATION_COUNTER: usize = 0x1C48;
 const OFF_HC_EVENT_STARVATION_LIMIT: usize = 0x1C4C;
+const OFF_HC_MUTEX_MIRROR_PTR: usize = 0x1C50;
 
 const KERNEL_HANDLE_BASE: u32 = 0x30000;
 const EVENT_TABLE_SLOTS: u32 = 2048;
@@ -150,6 +153,15 @@ const EVT_SIGNALED: u8 = 0x02;
 const EVT_MANUAL: u8 = 0x04;
 const EVT_HAS_WAITERS: u8 = 0x08;
 const EVT_PENDING_WAKE: u8 = 0x10;
+
+const MUX_VALID: u32 = 0x8000_0000;
+const MUX_HAS_WAITERS: u32 = 0x4000_0000;
+const MUX_ABANDONED: u32 = 0x2000_0000;
+const MUX_OWNER_MASK: u32 = 0x0000_FFFF;
+const MUX_REC_MASK: u32 = 0x00FF_0000;
+const MUX_REC_SHIFT: u32 = 16;
+const MUX_REC_MAX: u32 = 0xFF;
+const WAIT_TIMEOUT: i32 = 0x102;
 
 const SLAB_MAGIC: u32 = 0x534C4100; // "SLA\0" (BUSY) — low nibble reserved for bin index
 // FREE marker ("SLF\0"). A block on the per-bin free list carries this in its header so a
@@ -293,6 +305,8 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         75 => handle_strstr(),
         76 => handle_atoi(),
         77 => handle_rt_dynamic_cast(),
+        80 => handle_release_mutex(),
+        81 => handle_wait_for_single_object(),
         _ => false,
     };
 
@@ -1753,6 +1767,157 @@ unsafe fn handle_set_event() -> bool {
 
     write_reg32(EAX, 1);
     true
+}
+
+#[inline]
+unsafe fn kernel_handle_slot(handle: u32) -> Option<u32> {
+    if handle < KERNEL_HANDLE_BASE {
+        return None;
+    }
+    let slot = (handle - KERNEL_HANDLE_BASE) >> 2;
+    if slot >= EVENT_TABLE_SLOTS {
+        return None;
+    }
+    Some(slot)
+}
+
+#[inline]
+unsafe fn mutex_mirror_base() -> u32 {
+    *(hp_ptr().add(OFF_HC_MUTEX_MIRROR_PTR) as *const u32)
+}
+
+#[inline]
+unsafe fn read_mutex_mirror(slot: u32) -> u32 {
+    let base = mutex_mirror_base();
+    if base == 0 {
+        return 0;
+    }
+    memory::read32_no_mmap_check(base + slot * 4) as u32
+}
+
+#[inline]
+unsafe fn write_mutex_mirror(slot: u32, value: u32) {
+    let base = mutex_mirror_base();
+    if base == 0 {
+        return;
+    }
+    memory::write32_no_mmap_or_dirty_check(base + slot * 4, value as i32);
+}
+
+/// ReleaseMutex(hMutex) — uncontended, no waiters. Mirrors sync-objects release.
+unsafe fn handle_release_mutex() -> bool {
+    let esp = read_reg32(ESP);
+    let handle = match safe_read32s(esp + 4) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let slot = match kernel_handle_slot(handle) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let current = *(hp_ptr().add(OFF_HC_CURRENT_THREAD_ID) as *const u32);
+    if current == 0 || current > MUX_OWNER_MASK {
+        return false;
+    }
+
+    let mux = read_mutex_mirror(slot);
+    if mux & MUX_VALID == 0 {
+        return false;
+    }
+    if mux & MUX_HAS_WAITERS != 0 {
+        return false;
+    }
+    if mux & MUX_ABANDONED != 0 {
+        return false;
+    }
+
+    let owner = mux & MUX_OWNER_MASK;
+    if owner != current {
+        return false;
+    }
+
+    let rec = (mux & MUX_REC_MASK) >> MUX_REC_SHIFT;
+    if rec > 1 {
+        write_mutex_mirror(slot, (mux & !MUX_REC_MASK) | ((rec - 1) << MUX_REC_SHIFT));
+    } else {
+        write_mutex_mirror(slot, mux & !(MUX_OWNER_MASK | MUX_REC_MASK));
+    }
+    write_reg32(EAX, 1);
+    true
+}
+
+/// WaitForSingleObject(h, ms) — immediate acquire for free/recursive mutex or signaled auto-reset event.
+unsafe fn handle_wait_for_single_object() -> bool {
+    let esp = read_reg32(ESP);
+    let handle = match safe_read32s(esp + 4) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let timeout = match safe_read32s(esp + 8) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let slot = match kernel_handle_slot(handle) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let current = *(hp_ptr().add(OFF_HC_CURRENT_THREAD_ID) as *const u32);
+    if current == 0 || current > MUX_OWNER_MASK {
+        return false;
+    }
+
+    let evt = *hp_ptr().add(OFF_HC_EVENT_TABLE + slot as usize);
+    if evt & EVT_VALID != 0 {
+        if evt & EVT_MANUAL != 0 || evt & EVT_PENDING_WAKE != 0 {
+            return false;
+        }
+        if evt & EVT_SIGNALED != 0 {
+            *hp_mut().add(OFF_HC_EVENT_TABLE + slot as usize) = evt & !EVT_SIGNALED;
+            write_reg32(EAX, 0);
+            return true;
+        }
+        if timeout == 0 {
+            write_reg32(EAX, WAIT_TIMEOUT);
+            return true;
+        }
+        return false;
+    }
+
+    let mux = read_mutex_mirror(slot);
+    if mux & MUX_VALID == 0 {
+        return false;
+    }
+    if mux & MUX_HAS_WAITERS != 0 {
+        return false;
+    }
+    if mux & MUX_ABANDONED != 0 {
+        return false;
+    }
+
+    let owner = mux & MUX_OWNER_MASK;
+    if owner == 0 || owner == current {
+        let rec = (mux & MUX_REC_MASK) >> MUX_REC_SHIFT;
+        if owner == current && rec >= MUX_REC_MAX {
+            return false;
+        }
+        let new_owner = if owner == 0 { current } else { owner };
+        let new_rec = if owner == 0 { 1 } else { rec + 1 };
+        if new_rec > MUX_REC_MAX {
+            return false;
+        }
+        let new_mux = MUX_VALID | new_owner | (new_rec << MUX_REC_SHIFT);
+        write_mutex_mirror(slot, new_mux);
+        write_reg32(EAX, 0);
+        return true;
+    }
+
+    if timeout == 0 {
+        write_reg32(EAX, WAIT_TIMEOUT);
+        return true;
+    }
+    false
 }
 
 /// Sleep(dwMilliseconds) — stdcall(1).

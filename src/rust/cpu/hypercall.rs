@@ -189,6 +189,30 @@ pub fn get_hypercall_page_ptr() -> u32 {
     unsafe { hp_ptr() as u32 }
 }
 
+/// Interpolated guest-virtual time in MICROSECONDS — the exact same base + interpolation
+/// the QPC hypercall (handle_qpc) serves to the guest: JS-written perf counter snapshot
+/// plus instructions-retired-since-snapshot / mips. Used by read_tsc so RDTSC and
+/// QPC/GetTickCount are derived from ONE clock (constant ratio 2^32 ticks : 1e6 µs) —
+/// guest cross-clock calibration (UE1 GSecondsPerCycle et al.) then measures the true
+/// ratio no matter how far virtual time lags wall during boot.
+/// Returns None until the unified clock is live (page disabled or time fields unset).
+#[inline(always)]
+pub unsafe fn virtual_time_us() -> Option<u64> {
+    let page = hp_ptr();
+    if *(page.add(OFF_HC_ENABLED) as *const u32) == 0 {
+        return None;
+    }
+    let mips_est = *(page.add(OFF_HC_MIPS_ESTIMATE) as *const u32);
+    if mips_est == 0 {
+        return None;
+    }
+    let base_lo = *(page.add(OFF_HC_PERF_COUNTER_LO) as *const u32);
+    let base_hi = *(page.add(OFF_HC_PERF_COUNTER_HI) as *const u32);
+    let insn_at_update = *(page.add(OFF_HC_INSN_AT_TIME_UPDATE) as *const u32);
+    let delta_insn = (*instruction_counter).wrapping_sub(insn_at_update);
+    Some((base_lo as u64 | (base_hi as u64) << 32) + (delta_insn / mips_est) as u64)
+}
+
 /// Read the cycle limit from shared page. Used by do_many_cycles_native().
 #[inline(always)]
 pub unsafe fn read_cycle_limit() -> u32 {

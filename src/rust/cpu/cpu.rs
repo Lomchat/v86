@@ -4469,26 +4469,41 @@ pub unsafe fn set_tsc(low: u32, high: u32) {
 // 2^32 ticks per second = 4_294_967_296 / 1000 ticks per millisecond.
 const TSC_TICKS_PER_MS: f64 = 4_294_967.296;
 
+// 2^32 ticks per second = 4_294.967296 ticks per microsecond (the unit of the unified
+// virtual clock that QPC/GetTickCount interpolate from).
+const TSC_TICKS_PER_US: f64 = 4_294.967296;
+
 #[no_mangle]
 pub unsafe fn read_tsc() -> u64 {
-    // WALL-ANCHORED TSC (BottleShip, post-SESSION-6 correction). RDTSC is a free-running ~4.29 GHz
-    // (2^32 ticks/sec) counter derived DIRECTLY from wall clock (performance.now), DECOUPLED from the
-    // instruction-virtual page clock that QPC/GetTickCount use. Rationale (validated against the live
-    // HP freeze + two independent emulator-dev reviews):
+    // VIRTUAL-CLOCK TSC (BottleShip). RDTSC is a ~4.29 GHz (2^32 ticks/sec) counter derived from
+    // the SAME interpolated virtual-time base the QPC/GetTickCount hypercalls serve (JS-written
+    // µs snapshot + retired-instructions/mips interpolation within a tick).
     //
-    //  * DeltaTime needs ELAPSED REAL TIME, not retired-instruction count. An instruction-interpolated
-    //    RDTSC freezes during async Flip parks (the bulk of an idle UE1 front-end frame: no guest
-    //    instructions retire, the idle-pump is gated off for async waits) and PLATEAUS under the
-    //    MAX_AHEAD wall-clamp + monotonic guard (measured: ~49% of calls guard-pinned). Both made the
-    //    two RDTSC reads bracketing a frame identical -> DeltaTime==0 -> the EA-splash countdown froze.
-    //  * 2^32 ticks/sec is SELF-CONSISTENT with UE1's GSecondsPerCycle == 2^-32 (= 1/2^32): a guest
-    //    calibrating RDTSC against QPC(1 MHz) measures the ratio 4295 and derives 2^-32 naturally, and
-    //    the uncalibrated fallback also assumes ~4.29 GHz — so NO engine-memory patch is needed and
-    //    DeltaTime = rdtsc_delta * 2^-32 = real seconds (4294967.296 tick/ms * 2^-32 sec/tick = 1e-3).
-    //  * On real hardware RDTSC (free-running ~GHz TSC) and QPC (PMC/HPET, MHz) are DIFFERENT clocks;
-    //    the game calibrates the ratio. Forcing them equal at 1 MHz (the SESSION-6 "unified clock")
-    //    broke resolution and calibration. They are intentionally decoupled again here.
-    let value = (js::microtick() * TSC_TICKS_PER_MS) as u64;
+    // Why one base (and not wall-anchored, the previous revision): on real hardware TSC and
+    // QPC/timeGetTime are derived from one physical time — their RATIO is a constant. Engines
+    // with boot-time CPU-speed detection (UE1: GSecondsPerCycle = seconds/rdtsc-cycle, measured
+    // ONCE against QPC/timeGetTime) bake that ratio in. A wall-anchored RDTSC against an
+    // instruction-virtual QPC made the ratio load-dependent: during a slow boot virtual lags
+    // wall, UE1 measured "5.6 GHz", GSecondsPerCycle came out < 2^-32, and the game ran in
+    // permanent slow motion (HP demo: 0.76x) even after the clocks healed. Deriving both from
+    // the virtual base makes every cross-clock calibration exact by construction, and dt then
+    // follows game-virtual time consistently with all other timers (audio pump, timer wheel).
+    //
+    // The failure the OLD unified clock (SESSION-6, 1 MHz) had — DeltaTime==0 freezing the
+    // EA-splash countdown during async Flip parks — was a virtual-clock stall (idle pump gated
+    // off for async waits), since fixed: async-thunk completion credits the wall deficit
+    // (thunk-dispatcher notifySchedulerBoundary) and sole-runnable Sleep credits via
+    // creditIdleMs; live-measured virtual rate is 1.00x wall in gameplay AND front-end. The
+    // 2^32 rate (vs 1 MHz then) also keeps the uncalibrated-guest assumption (~4.29 GHz CPU)
+    // and UE1's derived GSecondsPerCycle at the float-exact 2^-32.
+    //
+    // Fallback: before the hypercall page is live (early boot, reset_cpu re-zeroing it),
+    // wall-anchored as before. Continuity: TimeService seeds virtual time from
+    // performance.now(), the same epoch microtick() reads, so the switchover doesn't step.
+    let value = match hypercall::virtual_time_us() {
+        Some(us) => (us as f64 * TSC_TICKS_PER_US) as u64,
+        None => (js::microtick() * TSC_TICKS_PER_MS) as u64,
+    };
     let value = value.wrapping_sub(tsc_offset);
     // Monotonic floor + sub-sample forward progress: never return <= the previous value. When wall
     // clock hasn't advanced since the last call (performance.now resolution / tight RDTSC loops in

@@ -1603,6 +1603,34 @@ fn jit_find_basic_blocks(
                                     // OUT traps must never join a guest superblock.
                                     continue;
                                 }
+                                // Profiled eips are RAW runtime values: they can be
+                                // stale (recorded before the page was overwritten) or
+                                // land mid-instruction relative to the CURRENT bytes.
+                                // Seeding such an offset as a dispatcher entry makes
+                                // the runtime dispatch ENTER a misdecoded block —
+                                // wrong ModRM/base → stores through garbage/NULL
+                                // pointers at random guest sites (retail NFSU died
+                                // in-race within minutes, 2026-07-08). Direct edges
+                                // only ever mark interpreter-registered boundaries;
+                                // hold profiled targets to the same standard: the
+                                // exact offset must be a registered entry point of
+                                // its page (hot indirect targets are, via the
+                                // module-exit hotness path). Conservative: an
+                                // unregistered target just doesn't grow the region.
+                                let registered = cpu::translate_address_read_no_side_effects(
+                                    target as i32,
+                                )
+                                .ok()
+                                .map_or(false, |phys| {
+                                    ctx.entry_points
+                                        .get(&Page::page_of(phys))
+                                        .map_or(false, |(_, eps)| {
+                                            eps.contains(&(phys as u16 & 0xFFF))
+                                        })
+                                });
+                                if !registered {
+                                    continue;
+                                }
                                 if follow_jump(
                                     target as i32,
                                     ctx,
@@ -2004,7 +2032,17 @@ fn jit_analyze_and_generate(
     dbg_assert!(wasm_table_index != WasmTableIndex(0));
 
     dbg_assert!(!pages.is_empty());
-    dbg_assert!(pages.len() <= unsafe { MAX_PAGES } as usize);
+    // The effective cap can exceed the global MAX_PAGES when indirect regions or
+    // tier-2 budgets are active (see max_pages in jit_find_basic_blocks) — assert
+    // against the widest configured budget, not the base knob.
+    dbg_assert!(
+        pages.len()
+            <= unsafe {
+                MAX_PAGES
+                    .max(JIT_INDIRECT_REGION_MAX_PAGES)
+                    .max(TIER2_MAX_PAGES)
+            } as usize
+    );
 
     let basic_block_by_addr: HashMap<u32, BasicBlock> =
         basic_blocks.into_iter().map(|b| (b.addr, b)).collect();
@@ -2034,6 +2072,22 @@ fn jit_analyze_and_generate(
                 hidden_wasm_table_indices: Vec::new(),
             });
         code.entry_points.push((addr as u16 & 0xFFF, state));
+    }
+    // Invalidation completeness: EVERY page the module compiled code from must be
+    // findable by jit_dirty_page, or a write to it leaves a STALE module running old
+    // code. page_info above only covers pages that materialized a dispatcher entry;
+    // entry blocks can be dropped by overlap elimination or near-end-of-page cutoffs
+    // while non-entry blocks from the page remain. Register the rest with an empty
+    // entry list — set_tlb_code leaves their state_table all-miss (u16::MAX), so the
+    // only effect is that free_wasm_module's page sweep covers them.
+    for &p in &pages {
+        page_info.entry(p).or_insert_with(|| PageInfo {
+            wasm_table_index,
+            state_flags,
+            fastmem_generation: fastmem_generation.unwrap_or(0),
+            entry_points: Vec::new(),
+            hidden_wasm_table_indices: Vec::new(),
+        });
     }
 
     profiler::stat_increment_by(
@@ -3150,7 +3204,16 @@ fn jit_generate_module(
 
     {
         ctx.builder.block_end(); // default case for the brtable
-        ctx.builder.unreachable();
+        // A dispatch index with no matching case is a STALE dispatch — a recycled
+        // wasm_table_index whose old tlb_code state_table wasn't swept yet, or a
+        // racing invalidation mid-slice. Every path that can land here (module
+        // entry, in-page re-dispatch, ret-speculation) has already materialized
+        // the runtime instruction_pointer, so the recoverable move is a clean
+        // module exit: the interpreter re-resolves the eip through the normal
+        // cache path (worst case: recompile). `unreachable` turned this race
+        // into a fatal wasm trap (retail NFSU mid-race with indirect regions,
+        // 2026-07-08). Debug builds still flag it via check_dispatcher_target.
+        ctx.builder.br(ctx.exit_label);
     }
     {
         ctx.builder.block_end(); // main loop

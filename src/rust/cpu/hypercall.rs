@@ -207,6 +207,25 @@ pub unsafe fn read_cycle_limit() -> u32 {
     }
 }
 
+/// Async-park spin-loop address (virtual EIP of the JMP $ parking slot). Set once by
+/// JS at boot via set_park_eip(); 0 = unknown (check disabled). The cycle loop exits
+/// the slice when EIP lands EXACTLY here — the address is a parking slot, not code,
+/// so honestly executing it burns the slice budget for nothing (see
+/// do_many_cycles_native). Strict equality: SEH stubs at +2/+4/+0x200 must keep running.
+static mut PARK_EIP: u32 = 0;
+
+/// JS boot hook: tell the cycle loop where the async-park spin loop lives.
+#[no_mangle]
+pub unsafe fn set_park_eip(addr: u32) {
+    PARK_EIP = addr;
+}
+
+/// True when `eip` is parked on the spin-loop base (exact match).
+#[inline(always)]
+pub unsafe fn eip_at_park(eip: u32) -> bool {
+    PARK_EIP != 0 && eip == PARK_EIP
+}
+
 /// Try to dispatch a hypercall for the given function ID.
 /// Returns true if handled in WASM, false to fall through to JS.
 pub unsafe fn try_dispatch(function_id: i32) -> bool {

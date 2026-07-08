@@ -3480,8 +3480,11 @@ pub unsafe fn main_loop() -> f64 {
     loop {
         do_many_cycles_native();
 
-        // If cycle_limit was lowered for preemption → lean yield
-        if is_preempt_mode {
+        // If cycle_limit was lowered for preemption → lean yield. Same when EIP is
+        // parked on the spin loop: without this the outer loop would re-enter
+        // do_many_cycles_native (which exits immediately at the park address) in a
+        // hot loop until TIME_PER_FRAME.
+        if is_preempt_mode || hypercall::eip_at_park(*instruction_pointer as u32) {
             let now = js::microtick();
             js::run_hardware_timers(*acpi_enabled, now);
             handle_irqs();
@@ -3508,8 +3511,17 @@ pub unsafe fn do_many_cycles_native() {
     let initial_instruction_counter = *instruction_counter;
     jit_cycle_start_instruction_counter = initial_instruction_counter;
     let limit = hypercall::read_cycle_limit();
+    // Park-address exit: the spin loop (JMP $ at the async-park address) is a PARKING
+    // slot, not code — once EIP lands there, burning the rest of the slice budget
+    // honestly executing it is pure waste (measured in-race on NFSU: 1.8B spin
+    // block-execs / 15 s ≈ the whole timer-thread CPU share). Strict equality: SEH
+    // stubs live at +2/+4/+0x200 and must keep running. Checked AFTER cycle_internal
+    // so thunk-stub tails (OUT + RET N into the spin loop) execute normally first —
+    // exiting mid-stub instead breaks the async-park ESP bookkeeping (observed as
+    // "async RET N mismatch" → stack-EIP fault → guest SEH ExitProcess(0)).
     while (*instruction_counter).wrapping_sub(initial_instruction_counter) < limit
         && !*in_hlt
+        && !hypercall::eip_at_park(*instruction_pointer as u32)
     {
         cycle_internal();
     }

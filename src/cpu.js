@@ -1806,6 +1806,23 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
 
     const code = new Uint8Array(this.wasm_memory.buffer, ptr, len);
 
+    // Track-2b instrumentation: capture generated module bytes at runtime,
+    // gated on a harness-set global so production pays one falsy check.
+    // globalThis.__wasmDump = { pages: Set<physPageNumber>, out: [] } — a
+    // module is captured when its ENTRY page is in the set (start>>>12).
+    // Read/clear `out` from the harness; bytes are copied (the builder's
+    // output buffer is reused for the next compilation).
+    const wasmDump = globalThis["__wasmDump"];
+    if(wasmDump && wasmDump["pages"] && wasmDump["pages"].has(start >>> 12))
+    {
+        (wasmDump["out"] || (wasmDump["out"] = [])).push({
+            "start": start >>> 0,
+            "table_index": wasm_table_index,
+            "len": len,
+            "bytes": code.slice(),
+        });
+    }
+
     if(DEBUG)
     {
         if(DUMP_GENERATED_WASM && !this.seen_code[start])

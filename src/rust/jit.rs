@@ -225,6 +225,28 @@ static mut JIT_PUSH_RUN_COALESCING: bool = false;
 // targets dispatcher entries so AbsoluteEip re-dispatches stay intra-module.
 // Off by default; requires collected trace2 data to have any effect.
 static mut JIT_INDIRECT_REGIONS: bool = false;
+
+// E2b safety: virtual-address range that indirect-region growth must NEVER pull
+// targets from — the thunk/callback/spin bucket. Guest code indirect-calls thunk
+// stubs constantly (GetProcAddress'd exports), so profiled indirect targets point
+// into stub pages; compiling those into a guest superblock trapped `unreachable`
+// at CALLBACK_STUB+0x477f0 within ~1 min (2026-07-08). Set by JS via
+// jit_set_region_exclusion (scheduler arms it with [THUNK_CODE_BASE, ROM_BASE)).
+// hi == 0 → no exclusion (feature off, e.g. older TS).
+static mut REGION_EXCLUDE_LO: u32 = 0;
+static mut REGION_EXCLUDE_HI: u32 = 0;
+
+#[no_mangle]
+pub fn jit_set_region_exclusion(lo: u32, hi: u32) {
+    unsafe {
+        REGION_EXCLUDE_LO = lo;
+        REGION_EXCLUDE_HI = hi;
+    }
+}
+
+fn region_target_excluded(target: u32) -> bool {
+    unsafe { REGION_EXCLUDE_HI != 0 && target >= REGION_EXCLUDE_LO && target < REGION_EXCLUDE_HI }
+}
 static mut JIT_INDIRECT_REGION_MIN_SHARE: u32 = 5; // percent of per-site hits
 const JIT_INDIRECT_REGION_MAX_TARGETS: usize = 16;
 // Page budget for region growth ACROSS INDIRECT EDGES only — kept separate from
@@ -1254,6 +1276,22 @@ fn jit_find_basic_blocks(
 
         let phys_page = Page::page_of(phys_target);
 
+        // Never GROW a module INTO the thunk/callback/spin bucket (REGION_EXCLUDE_*):
+        // stub pages are full of OUT traps and must stay standalone modules. This must
+        // gate EVERY growth edge, not just profiled indirect targets — direct IAT-style
+        // CALLs into stubs reached CALLBACK_STUB pages once the tier-2 page budget grew
+        // past the default (fatal 0x3003 mid-race within ~1 min, 2026-07-08).
+        // `!pages.is_empty()` is load-bearing: the INITIAL entry points are seeded
+        // through follow_jump with an empty page set — gating those blocks stub-page
+        // modules from compiling at all (their dispatch then hits `unreachable` at the
+        // stub EIP on the first execution, deterministic at boot).
+        if !pages.is_empty()
+            && region_target_excluded(virt_target as u32)
+            && !pages.contains(&phys_page)
+        {
+            return None;
+        }
+
         // `>=` (not `==`): a proper ceiling. Equivalent to the original for the
         // single-cap default path (growth is monotonic), but required so the cap
         // holds when region formation seeds the page set above the base cap.
@@ -1560,6 +1598,11 @@ fn jit_find_basic_blocks(
                             // Targets are hottest-first, so the cap keeps the
                             // most-executed cases when it binds.
                             for target in targets {
+                                if region_target_excluded(target) {
+                                    // Thunk/callback/spin bucket — stub pages full of
+                                    // OUT traps must never join a guest superblock.
+                                    continue;
+                                }
                                 if follow_jump(
                                     target as i32,
                                     ctx,

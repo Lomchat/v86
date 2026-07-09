@@ -2400,11 +2400,11 @@ pub fn gen_getzf(ctx: &mut JitContext, negate: ConditionNegate) {
             }
             else if opsize == OPSIZE_16 {
                 ctx.builder
-                    .load_fixed_u16(global_pointers::last_result as u32);
+                    .flag_load_u16(FLAG_LOCAL_LAST_RESULT, global_pointers::last_result as u32);
             }
             else if opsize == OPSIZE_8 {
                 ctx.builder
-                    .load_fixed_u8(global_pointers::last_result as u32);
+                    .flag_load_u8(FLAG_LOCAL_LAST_RESULT, global_pointers::last_result as u32);
             }
             if negate == ConditionNegate::False {
                 ctx.builder.eqz_i32();
@@ -3593,15 +3593,16 @@ fn gen_fpu_write_status_compare_flags(ctx: &mut JitContext, compare_flags: &Wasm
 fn gen_fpu_write_eflags_compare_flags(ctx: &mut JitContext, compare_flags: &WasmLocal) {
     ctx.builder.const_i32(global_pointers::flags_changed as i32);
     ctx.builder.const_i32(0);
-    ctx.builder.store_aligned_i32(0);
+    ctx.builder.flag_store_i32(FLAG_LOCAL_FLAGS_CHANGED);
 
     ctx.builder.const_i32(global_pointers::flags as i32);
-    ctx.builder.load_fixed_i32(global_pointers::flags as u32);
+    ctx.builder
+        .flag_load_i32(FLAG_LOCAL_FLAGS, global_pointers::flags as u32);
     ctx.builder.const_i32(!FLAGS_ALL);
     ctx.builder.and_i32();
     ctx.builder.get_local(compare_flags);
     ctx.builder.or_i32();
-    ctx.builder.store_aligned_i32(0);
+    ctx.builder.flag_store_i32(FLAG_LOCAL_FLAGS);
 }
 
 fn gen_fpu_compare_status_from_bits(

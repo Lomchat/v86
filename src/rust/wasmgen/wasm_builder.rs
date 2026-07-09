@@ -1163,6 +1163,49 @@ impl WasmBuilder {
         }
     }
 
+    /// Drop-in replacement for `store_aligned_i32(0)` at flag-global write sites
+    /// whose address const is already emitted: stack is [addr, value]. In locals
+    /// mode SETLOCAL pops the value, DROP pops the now-dead address — same stack
+    /// effect as the store, so call sites swap a single line.
+    pub fn flag_store_i32(&mut self, slot: usize) {
+        match self.flag_locals {
+            Some(locals) => {
+                self.set_local_raw(locals[slot].0);
+                self.drop_();
+            },
+            None => self.store_aligned_i32(0),
+        }
+    }
+
+    /// Drop-in replacements for load_fixed_{u8,u16,i32}(flag global) read sites.
+    /// `fallback_addr` = the global's linear-memory address (used when locals off).
+    pub fn flag_load_u8(&mut self, slot: usize, fallback_addr: u32) {
+        match self.flag_locals {
+            Some(locals) => {
+                self.get_local_raw(locals[slot].0);
+                self.const_i32(0xFF);
+                self.and_i32();
+            },
+            None => self.load_fixed_u8(fallback_addr),
+        }
+    }
+    pub fn flag_load_u16(&mut self, slot: usize, fallback_addr: u32) {
+        match self.flag_locals {
+            Some(locals) => {
+                self.get_local_raw(locals[slot].0);
+                self.const_i32(0xFFFF);
+                self.and_i32();
+            },
+            None => self.load_fixed_u16(fallback_addr),
+        }
+    }
+    pub fn flag_load_i32(&mut self, slot: usize, fallback_addr: u32) {
+        match self.flag_locals {
+            Some(locals) => self.get_local_raw(locals[slot].0),
+            None => self.load_fixed_i32(fallback_addr),
+        }
+    }
+
     /// Unregister + return the flag locals to the free pool (module epilogue,
     /// after the final spill — satisfies the all-locals-freed finish invariant).
     pub fn free_flag_locals(&mut self) {

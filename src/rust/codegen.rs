@@ -350,9 +350,15 @@ pub fn gen_get_ss_offset(ctx: &mut JitContext) {
 }
 
 pub fn gen_get_flags(builder: &mut WasmBuilder) {
+    if builder.flag_local_get(4) {
+        return; // FLAG_LOCAL_FLAGS (const defined below)
+    }
     builder.load_fixed_i32(global_pointers::flags as u32);
 }
 fn gen_get_flags_changed(builder: &mut WasmBuilder) {
+    if builder.flag_local_get(3) {
+        return; // FLAG_LOCAL_FLAGS_CHANGED
+    }
     builder.load_fixed_i32(global_pointers::flags_changed as u32);
 }
 fn gen_get_last_result(builder: &mut WasmBuilder, previous_instruction: &Instruction) {
@@ -389,13 +395,22 @@ fn gen_get_last_result(builder: &mut WasmBuilder, previous_instruction: &Instruc
                 builder.get_local(&l)
             }
             else {
-                builder.load_fixed_i32(global_pointers::last_result as u32)
+                gen_load_last_result(builder)
             }
         },
-        _ => builder.load_fixed_i32(global_pointers::last_result as u32),
+        _ => gen_load_last_result(builder),
     }
 }
+fn gen_load_last_result(builder: &mut WasmBuilder) {
+    if builder.flag_local_get(1) {
+        return; // FLAG_LOCAL_LAST_RESULT
+    }
+    builder.load_fixed_i32(global_pointers::last_result as u32);
+}
 fn gen_get_last_op_size(builder: &mut WasmBuilder) {
+    if builder.flag_local_get(2) {
+        return; // FLAG_LOCAL_LAST_OP_SIZE
+    }
     builder.load_fixed_i32(global_pointers::last_op_size as u32);
 }
 fn gen_get_last_op1(builder: &mut WasmBuilder, previous_instruction: &Instruction) {
@@ -405,7 +420,12 @@ fn gen_get_last_op1(builder: &mut WasmBuilder, previous_instruction: &Instructio
             source: _,
             opsize: OPSIZE_32,
         } => builder.get_local(&l),
-        _ => builder.load_fixed_i32(global_pointers::last_op1 as u32),
+        _ => {
+            if builder.flag_local_get(0) {
+                return; // FLAG_LOCAL_LAST_OP1
+            }
+            builder.load_fixed_i32(global_pointers::last_op1 as u32)
+        },
     }
 }
 
@@ -2216,19 +2236,43 @@ pub fn gen_get_real_eip(ctx: &mut JitContext) {
     }
 }
 
+// Flag-local slot order (must match jit_generate_module's registration):
+pub const FLAG_LOCAL_LAST_OP1: usize = 0;
+pub const FLAG_LOCAL_LAST_RESULT: usize = 1;
+pub const FLAG_LOCAL_LAST_OP_SIZE: usize = 2;
+pub const FLAG_LOCAL_FLAGS_CHANGED: usize = 3;
+pub const FLAG_LOCAL_FLAGS: usize = 4;
+
 pub fn gen_set_last_op1(builder: &mut WasmBuilder, source: &WasmLocal) {
+    if builder.flag_locals.is_some() {
+        builder.get_local(&source);
+        builder.flag_local_set(FLAG_LOCAL_LAST_OP1);
+        return;
+    }
     builder.const_i32(global_pointers::last_op1 as i32);
     builder.get_local(&source);
     builder.store_aligned_i32(0);
 }
 
 pub fn gen_set_last_result(builder: &mut WasmBuilder, source: &WasmLocal) {
+    if builder.flag_locals.is_some() {
+        builder.get_local(&source);
+        builder.flag_local_set(FLAG_LOCAL_LAST_RESULT);
+        return;
+    }
     builder.const_i32(global_pointers::last_result as i32);
     builder.get_local(&source);
     builder.store_aligned_i32(0);
 }
 
 pub fn gen_clear_flags_changed_bits(builder: &mut WasmBuilder, bits_to_clear: i32) {
+    if builder.flag_locals.is_some() {
+        gen_get_flags_changed(builder);
+        builder.const_i32(!bits_to_clear);
+        builder.and_i32();
+        builder.flag_local_set(FLAG_LOCAL_FLAGS_CHANGED);
+        return;
+    }
     builder.const_i32(global_pointers::flags_changed as i32);
     gen_get_flags_changed(builder);
     builder.const_i32(!bits_to_clear);
@@ -2242,6 +2286,13 @@ pub fn gen_set_last_op_size_and_flags_changed(
     flags_changed: i32,
 ) {
     dbg_assert!(last_op_size == OPSIZE_8 || last_op_size == OPSIZE_16 || last_op_size == OPSIZE_32);
+    if builder.flag_locals.is_some() {
+        builder.const_i32(last_op_size);
+        builder.flag_local_set(FLAG_LOCAL_LAST_OP_SIZE);
+        builder.const_i32(flags_changed);
+        builder.flag_local_set(FLAG_LOCAL_FLAGS_CHANGED);
+        return;
+    }
     dbg_assert!(global_pointers::last_op_size as i32 % 8 == 0);
     dbg_assert!(global_pointers::last_op_size as i32 + 4 == global_pointers::flags_changed as i32);
     builder.const_i32(global_pointers::last_op_size as i32);
@@ -2250,6 +2301,13 @@ pub fn gen_set_last_op_size_and_flags_changed(
 }
 
 pub fn gen_set_flags_bits(builder: &mut WasmBuilder, bits_to_set: i32) {
+    if builder.flag_locals.is_some() {
+        gen_get_flags(builder);
+        builder.const_i32(bits_to_set);
+        builder.or_i32();
+        builder.flag_local_set(FLAG_LOCAL_FLAGS);
+        return;
+    }
     builder.const_i32(global_pointers::flags as i32);
     gen_get_flags(builder);
     builder.const_i32(bits_to_set);
@@ -2258,6 +2316,13 @@ pub fn gen_set_flags_bits(builder: &mut WasmBuilder, bits_to_set: i32) {
 }
 
 pub fn gen_clear_flags_bits(builder: &mut WasmBuilder, bits_to_clear: i32) {
+    if builder.flag_locals.is_some() {
+        gen_get_flags(builder);
+        builder.const_i32(!bits_to_clear);
+        builder.and_i32();
+        builder.flag_local_set(FLAG_LOCAL_FLAGS);
+        return;
+    }
     builder.const_i32(global_pointers::flags as i32);
     gen_get_flags(builder);
     builder.const_i32(!bits_to_clear);
@@ -4618,6 +4683,10 @@ pub fn gen_move_registers_from_locals_to_memory(ctx: &mut JitContext) {
         ctx.builder.get_local(&ctx.register_locals[i]);
         ctx.builder.store_aligned_i32(0);
     }
+    // Flag locals share the registers' spill discipline: wherever guest register
+    // state must be visible in memory (block-boundary helpers, module exits, the
+    // OUT/hypercall context-save class — RFC §2.2c), the flag tuple must be too.
+    ctx.builder.emit_flag_spill();
 }
 pub fn gen_move_registers_from_memory_to_locals(ctx: &mut JitContext) {
     if cfg!(feature = "profiler") {
@@ -4631,6 +4700,8 @@ pub fn gen_move_registers_from_memory_to_locals(ctx: &mut JitContext) {
         ctx.builder.load_aligned_i32(0);
         ctx.builder.set_local(&ctx.register_locals[i]);
     }
+    // Mirror of the spill above: the helper may have modified flag state in memory.
+    ctx.builder.emit_flag_reload();
 }
 
 pub fn gen_profiler_stat_increment(builder: &mut WasmBuilder, stat: profiler::stat) {

@@ -93,6 +93,26 @@ pub struct WasmBuilder {
     free_locals_i64: Vec<WasmLocalI64>,
     local_count: u8,
     pub arg_local_initial_state: WasmLocal,
+
+    // DOD RFC part 2 (flag-tuple in locals, jit config idx 21). Registered by
+    // jit_generate_module when enabled: (local_idx, linear-memory address) for each
+    // of the five lazy-flag globals. While Some, the locals are the authoritative
+    // flag state and call_fn() spills them to memory before — and reloads them
+    // after — every call whose target is not in the proven-flag-pure whitelist
+    // (unknown helper = spilled = safe; covers arith flag-protocol helpers AND
+    // OUT/hypercall thunks whose context switches read cpu.get_eflags()).
+    pub flag_locals: Option<[(u8, u32); 5]>,
+}
+
+// Helpers proven not to touch the lazy-flag globals (RFC §2.2b). Everything else
+// gets the spill/reload pair — including every generated instr_* helper.
+fn flag_spill_whitelisted(name: &str) -> bool {
+    name.starts_with("safe_read")
+        || name.starts_with("safe_write")
+        || name.starts_with("report_")
+        || name.starts_with("jit_find_cache_entry")
+        || name == "fastmem_deopt_jit_unit"
+        || name == "coverage_log"
 }
 
 #[derive(Eq, PartialEq)]
@@ -143,6 +163,7 @@ impl WasmBuilder {
             free_locals_i64: Vec::with_capacity(8),
             local_count: 0,
             arg_local_initial_state: WasmLocal(0),
+            flag_locals: None,
         };
         b.init();
         b
@@ -174,6 +195,7 @@ impl WasmBuilder {
         self.free_locals_i32.clear();
         self.free_locals_i64.clear();
         self.local_count = 0;
+        self.flag_locals = None;
 
         dbg_assert!(self.label_to_depth.is_empty());
         dbg_assert!(self.label_stack.is_empty());
@@ -1078,9 +1100,88 @@ impl WasmBuilder {
     }
 
     fn call_fn(&mut self, name: &str, function: FunctionType) {
+        // Flag-locals funnel (RFC §2.2b): materialize the lazy-flag tuple to its
+        // memory globals before any helper that may read them, and re-read after
+        // any helper that may have written them. Emitting stores/loads here is
+        // stack-safe even with the call's arguments already pushed: each store
+        // pops exactly the address/value pair it pushes.
+        let spill = self.flag_locals.is_some() && !flag_spill_whitelisted(name);
+        if spill {
+            self.emit_flag_spill();
+        }
         let i = self.get_fn_idx(name, function);
         self.instruction_body.push(op::OP_CALL);
         write_leb_u32(&mut self.instruction_body, i as u32);
+        if spill {
+            self.emit_flag_reload();
+        }
+    }
+
+    /// Locals → memory globals (call sites + module epilogues).
+    pub fn emit_flag_spill(&mut self) {
+        if let Some(locals) = self.flag_locals {
+            for (idx, addr) in locals {
+                self.const_i32(addr as i32);
+                self.instruction_body.push(op::OP_GETLOCAL);
+                self.instruction_body.push(idx);
+                self.store_aligned_i32(0);
+            }
+        }
+    }
+
+    /// Memory globals → locals (after helpers that write flags, e.g. update_eflags).
+    pub fn emit_flag_reload(&mut self) {
+        if let Some(locals) = self.flag_locals {
+            for (idx, addr) in locals {
+                self.load_fixed_i32(addr);
+                self.instruction_body.push(op::OP_SETLOCAL);
+                self.instruction_body.push(idx);
+            }
+        }
+    }
+
+    /// Flag-local slot accessors (tuple order fixed at registration:
+    /// 0=last_op1 1=last_result 2=last_op_size 3=flags_changed 4=flags).
+    /// Return false when flag locals are not registered — caller falls back to
+    /// the linear-memory global. Value semantics identical.
+    pub fn flag_local_get(&mut self, slot: usize) -> bool {
+        match self.flag_locals {
+            Some(locals) => {
+                self.get_local_raw(locals[slot].0);
+                true
+            },
+            None => false,
+        }
+    }
+    pub fn flag_local_set(&mut self, slot: usize) -> bool {
+        match self.flag_locals {
+            Some(locals) => {
+                self.set_local_raw(locals[slot].0);
+                true
+            },
+            None => false,
+        }
+    }
+
+    /// Unregister + return the flag locals to the free pool (module epilogue,
+    /// after the final spill — satisfies the all-locals-freed finish invariant).
+    pub fn free_flag_locals(&mut self) {
+        if let Some(locals) = self.flag_locals.take() {
+            for (idx, _) in locals {
+                self.free_local(WasmLocal(idx));
+            }
+        }
+    }
+
+    /// Raw local access for the registered flag locals (indices held as u8, not
+    /// WasmLocal, because they live for the whole module like register locals).
+    pub fn get_local_raw(&mut self, idx: u8) {
+        self.instruction_body.push(op::OP_GETLOCAL);
+        self.instruction_body.push(idx);
+    }
+    pub fn set_local_raw(&mut self, idx: u8) {
+        self.instruction_body.push(op::OP_SETLOCAL);
+        self.instruction_body.push(idx);
     }
 
     pub fn return_call_indirect_fn1(&mut self) {

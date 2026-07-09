@@ -226,6 +226,14 @@ static mut JIT_PUSH_RUN_COALESCING: bool = false;
 // Track 2b Phase W — fastmem WRITES behind a per-page writability map (idx 19).
 // Off by default until the in-game gate passes (plan/2b-codegen-quality.md §1.4).
 static mut JIT_FASTMEM_WRITES: bool = false;
+// DOD RFC part 2 (plan/dod-dispatch-flatten-rfc.md §2) — lazy-flag tuple in wasm
+// LOCALS instead of linear-memory globals 96-120 (idx 21, default OFF). Removes
+// per-ALU-op flag stores AND their TurboFan aliasing barriers. Correctness
+// contract: locals are authoritative between spills; the builder-level call_fn
+// funnel spills/reloads around every non-whitelisted helper call (§2.2b/§2.2c —
+// covers arith flag-protocol helpers AND OUT/hypercall context saves), and the
+// module epilogues spill at every exit.
+static mut JIT_FLAG_LOCALS: bool = false;
 
 // Tier-2R (E2b, plan/tier2-region-recompiler.md §5): grow page groups across
 // indirect edges using trace_profiler target histograms, and make hot indirect
@@ -530,6 +538,9 @@ pub fn x87_locals_enabled() -> bool { unsafe { JIT_X87_LOCALS } }
 pub fn push_run_coalescing_enabled() -> bool { unsafe { JIT_PUSH_RUN_COALESCING } }
 
 pub fn fastmem_read_split_enabled() -> bool { unsafe { JIT_FASTMEM_READ_SPLIT } }
+
+#[inline]
+pub fn flag_locals_enabled() -> bool { unsafe { JIT_FLAG_LOCALS } }
 
 // Compile-time gate for the store fast path. Same regime as fastmem reads (32-bit
 // protected mode + paging): the map's identity-map store `mem8 + addr` is only valid
@@ -2611,6 +2622,27 @@ fn jit_generate_module(
     builder.const_i32(0);
     let instruction_counter = builder.set_new_local();
 
+    // DOD RFC part 2 (idx 21): lazy-flag tuple lives in wasm locals for the whole
+    // module — initialized from the memory globals here, spilled back at every
+    // exit epilogue and around every non-whitelisted helper call (builder funnel).
+    if flag_locals_enabled() {
+        let addrs: [u32; 5] = [
+            global_pointers::last_op1 as u32,
+            global_pointers::last_result as u32,
+            global_pointers::last_op_size as u32,
+            global_pointers::flags_changed as u32,
+            global_pointers::flags as u32,
+        ];
+        let mut locals = [(0u8, 0u32); 5];
+        for (i, &addr) in addrs.iter().enumerate() {
+            builder.load_fixed_i32(addr);
+            let l = builder.set_new_local();
+            locals[i] = (l.idx(), addr);
+            std::mem::forget(l); // whole-module lifetime; freed via free_flag_locals
+        }
+        builder.flag_locals = Some(locals);
+    }
+
     let exit_label = builder.block_void();
     let exit_with_fault_label = builder.block_void();
     let main_loop_label = builder.loop_void();
@@ -3524,6 +3556,7 @@ fn jit_generate_module(
     }
     ctx.builder
         .free_local(ctx.instruction_counter.unsafe_clone());
+    ctx.builder.free_flag_locals();
 
     ctx.builder.finish();
 
@@ -4176,6 +4209,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         17 => TIER2_MAX_PAGES = value,
         18 => JIT_FASTMEM_READ_SPLIT = value != 0,
         19 => JIT_FASTMEM_WRITES = value != 0,
+        21 => JIT_FLAG_LOCALS = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -4203,6 +4237,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         17 => TIER2_MAX_PAGES,
         18 => JIT_FASTMEM_READ_SPLIT as u32,
         19 => JIT_FASTMEM_WRITES as u32,
+        21 => JIT_FLAG_LOCALS as u32,
         _ => 0,
     }
 }

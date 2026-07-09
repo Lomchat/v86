@@ -317,15 +317,12 @@ pub static mut tsc_speed: u64 = 1;
 // used for restoring the state
 pub static mut tsc_offset: u64 = 0;
 
-pub struct Code {
-    pub wasm_table_index: jit::WasmTableIndex,
-    pub state_flags: CachedStateFlags,
-    pub fastmem_generation: u64,
-    pub state_table: [u16; 0x1000],
-}
+// Compiled-code dispatch metadata moved to the DOD SoA in jit.rs (DISPATCH_META /
+// DISPATCH_SLABS — see the RFC reference there). The old per-page Box<Code> +
+// tlb_code pointer array cost a 3-deep dependent-load chase on every ret/indirect
+// dispatch; the SoA derives all addresses from the page number alone.
 
 pub static mut tlb_data: [i32; 0x100000] = [0; 0x100000];
-pub static mut tlb_code: [Option<ptr::NonNull<Code>>; 0x100000] = [None; 0x100000];
 
 pub static mut valid_tlb_entries: [i32; 10000] = [0; 10000];
 pub static mut valid_tlb_entries_count: i32 = 0;
@@ -3207,37 +3204,33 @@ pub unsafe fn cycle_internal() {
     }
     let initial_state_flags = *state_flags;
 
-    match tlb_code[(initial_eip as u32 >> 12) as usize] {
-        None => {},
-        Some(c) => {
-            let c = c.as_ref();
-            // Deopt can free c; copy its fields first.
-            let unit_generation = c.fastmem_generation;
-            let unit_index = c.wasm_table_index;
-            let unit_state_flags = c.state_flags;
+    // DOD SoA lookup (jit::DISPATCH_META — no pointer chase). The old lookup-time
+    // fastmem-generation deopt is gone: a stale unit self-deopts via its prologue
+    // guard right after dispatch, one bounce, same observable behavior.
+    let meta = jit::dispatch_meta_get(initial_eip as u32 >> 12);
+    {
+        if meta != 0 {
+            let unit_index = jit::dispatch_meta_table_index(meta);
+            let unit_state_flags =
+                CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta));
             let unit_state = if initial_state_flags == unit_state_flags {
-                c.state_table[initial_eip as usize & 0xFFF]
+                jit::dispatch_state_lookup(meta, initial_eip as u32)
             }
             else {
                 u16::MAX
             };
 
-            if unit_generation != 0
-                && unit_generation != jit::fastmem_current_generation()
-            {
-                jit::fastmem_deopt_jit_unit(unit_index.to_u16() as u32);
-            }
-            else if initial_state_flags == unit_state_flags {
+            if initial_state_flags == unit_state_flags {
                 if unit_state != u16::MAX {
                     // B3 hotness tiering: returns true when this module just crossed the
                     // tier-2 threshold and was freed — don't dispatch into it; run
                     // interpreted this slice and let hotness recompile it with the
                     // tier-2 budget.
-                    if jit::jit_tier2_note_execution(unit_index.to_u16()) {
+                    if jit::jit_tier2_note_execution(unit_index) {
                         profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_CODE);
                     }
                     else {
-                        jit_entry = Some((unit_index.to_u16(), unit_state));
+                        jit_entry = Some((unit_index, unit_state));
                     }
                 }
                 else {
@@ -3265,7 +3258,7 @@ pub unsafe fn cycle_internal() {
                     profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_SS32);
                 }
             }
-        },
+        }
     }
 
     if let Some((wasm_table_index, initial_state)) = jit_entry {
@@ -3341,18 +3334,14 @@ pub unsafe fn cycle_internal() {
         *previous_ip = initial_eip;
         let phys_addr = return_on_pagefault!(get_phys_eip());
 
-        match tlb_code[(initial_eip as u32 >> 12) as usize] {
-            None => {},
-            Some(c) => {
-                let c = c.as_ref();
-
-                if initial_state_flags == c.state_flags
-                    && c.state_table[initial_eip as usize & 0xFFF] != u16::MAX
-                {
-                    profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK);
-                    return;
-                }
-            },
+        let meta = jit::dispatch_meta_get(initial_eip as u32 >> 12);
+        if meta != 0
+            && initial_state_flags
+                == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta))
+            && jit::dispatch_state_lookup(meta, initial_eip as u32) != u16::MAX
+        {
+            profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK);
+            return;
         }
 
         #[cfg(feature = "profiler")]
@@ -4593,16 +4582,12 @@ pub unsafe fn get_opstats_buffer(
 pub unsafe fn get_opstats_buffer() -> f64 { 0.0 }
 
 pub fn clear_tlb_code(page: i32) {
-    unsafe {
-        if let Some(c) = tlb_code[page as usize] {
-            drop(Box::from_raw(c.as_ptr()));
-            // A code-TLB eviction invalidates dispatch targets the stock resolvers
-            // would re-derive from tlb_code on the next probe; the B1b ret-target
-            // memo must not outlive it (see RET_CACHE in jit.rs). Bump only when an
-            // entry was actually dropped — data-page evictions don't affect the memo.
-            jit::ret_cache_invalidate_all();
-        }
-        tlb_code[page as usize] = None;
+    // A code-TLB eviction invalidates dispatch targets the stock resolvers would
+    // re-derive from the dispatch SoA on the next probe; the B1b ret-target memo
+    // must not outlive it (see RET_CACHE in jit.rs). Bump only when an entry was
+    // actually dropped — data-page evictions don't affect the memo.
+    if jit::dispatch_meta_clear(page as u32) {
+        jit::ret_cache_invalidate_all();
     }
 }
 

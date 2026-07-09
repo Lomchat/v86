@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
 use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
-use std::ptr::NonNull;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::analysis;
@@ -337,6 +336,142 @@ static mut FASTMEM_WRITE_MAP_MAX_PAGE: u32 = 0;
 // of caller. hi == 0 ⇒ no exclusion (feature off / older TS).
 static mut FASTMEM_WRITE_EXCLUDE_LO_PAGE: u32 = 0;
 static mut FASTMEM_WRITE_EXCLUDE_HI_PAGE: u32 = 0;
+
+// ── DOD dispatch metadata (RFC plan/dod-dispatch-flatten-rfc.md, Part 1) ──────────
+// Replaces the Box<Code> layout behind the old `cpu::tlb_code` pointer array. The
+// hot resolvers (jit_find_cache_entry* — called on EVERY guest ret/indirect jump,
+// hit or miss) used to walk THREE dependent loads, two through heap pointers:
+//   tlb_code[page] → *Box<Code> → .state_table[offset]
+// measured at 40-130ns/call (cache-miss-bound pointer chase; 12.6% of worker busy
+// on NFSU in-race, 2026-07-09 trace). The SoA replacement derives every address
+// from `page` alone — the loads are INDEPENDENT and issue in parallel:
+//   DISPATCH_META[page]                        ; packed word, dense 8 MB array
+//   DISPATCH_SLABS[slab*0x1000 + (addr&0xFFF)] ; dense u16 pool, no chase
+//
+// meta packing: state_flags(u32) << 32 | wasm_table_index(u16) << 16 | slab(u16).
+// meta == 0 ⇒ page has no compiled code. Slab index 0 is RESERVED-invalid so the
+// zero word stays an unambiguous sentinel; usable slabs are 1..DISPATCH_SLAB_COUNT.
+//
+// The per-unit fastmem generation was deliberately DROPPED from the lookup path:
+// a stale-generation unit that gets dispatched self-deopts via its own prologue
+// guard (jit_generate_module's fastmem_generation check) on entry — one extra
+// bounce right after a generation bump, identical observable behavior.
+//
+// Maintenance funnels are exactly the old tlb_code writers: set_tlb_code (compile/
+// TLB-fill) and cpu::clear_tlb_code (eviction/invlpg/dirty) — no new choke points.
+pub const DISPATCH_SLAB_COUNT: usize = 4096; // 4096 × 8 KB = 32 MB pool
+static mut DISPATCH_META: [u64; 1 << 20] = [0; 1 << 20];
+static mut DISPATCH_SLABS: [u16; DISPATCH_SLAB_COUNT * 0x1000] =
+    [0; DISPATCH_SLAB_COUNT * 0x1000];
+// Free stack of slab indices; filled 1..DISPATCH_SLAB_COUNT by rust_init.
+static mut DISPATCH_SLAB_FREE: [u16; DISPATCH_SLAB_COUNT] = [0; DISPATCH_SLAB_COUNT];
+static mut DISPATCH_SLAB_FREE_TOP: usize = 0;
+static mut DISPATCH_SLAB_HIGH_WATER: u32 = 0;
+static mut DISPATCH_SLAB_OVERFLOWS: u32 = 0;
+
+pub fn dispatch_meta_init() {
+    unsafe {
+        // Stack of free slabs, slab 0 excluded (reserved sentinel).
+        for i in 1..DISPATCH_SLAB_COUNT {
+            DISPATCH_SLAB_FREE[i - 1] = i as u16;
+        }
+        DISPATCH_SLAB_FREE_TOP = DISPATCH_SLAB_COUNT - 1;
+    }
+}
+
+#[inline]
+pub fn dispatch_meta_get(page: u32) -> u64 { unsafe { DISPATCH_META[page as usize & 0xFFFFF] } }
+
+#[inline]
+pub fn dispatch_meta_state_flags(meta: u64) -> u32 { (meta >> 32) as u32 }
+
+#[inline]
+pub fn dispatch_meta_table_index(meta: u64) -> u16 { (meta >> 16) as u16 }
+
+#[inline]
+pub fn dispatch_state_lookup(meta: u64, virt_address: u32) -> u16 {
+    unsafe {
+        let slab = (meta as u16) as usize;
+        dbg_assert!(slab != 0 && slab < DISPATCH_SLAB_COUNT);
+        DISPATCH_SLABS[slab * 0x1000 + (virt_address as usize & 0xFFF)]
+    }
+}
+
+/// Publish (or refresh) a page's dispatch entries. Reuses the page's existing slab
+/// when present. On pool exhaustion the page simply stays unpublished (meta 0) —
+/// resolvers miss, the interpreter runs the code, correctness is unaffected; the
+/// loud counter makes the condition visible in stats long before it can matter
+/// (pool = 4095 pages-with-code, typical live set is a few hundred).
+pub fn dispatch_meta_set(
+    virt_page: Page,
+    wasm_table_index: WasmTableIndex,
+    entries: &Vec<(u16, u16)>,
+    state_flags: CachedStateFlags,
+) {
+    unsafe {
+        let page = virt_page.to_u32() as usize & 0xFFFFF;
+        let existing = DISPATCH_META[page];
+        let slab = if existing != 0 {
+            (existing as u16) as usize
+        }
+        else {
+            if DISPATCH_SLAB_FREE_TOP == 0 {
+                DISPATCH_SLAB_OVERFLOWS = DISPATCH_SLAB_OVERFLOWS.saturating_add(1);
+                dbg_log!("dispatch: slab pool exhausted, page {:x} unpublished", page);
+                return;
+            }
+            DISPATCH_SLAB_FREE_TOP -= 1;
+            let s = DISPATCH_SLAB_FREE[DISPATCH_SLAB_FREE_TOP] as usize;
+            let in_use = (DISPATCH_SLAB_COUNT - 1 - DISPATCH_SLAB_FREE_TOP) as u32;
+            if in_use > DISPATCH_SLAB_HIGH_WATER {
+                DISPATCH_SLAB_HIGH_WATER = in_use;
+            }
+            s
+        };
+        dbg_assert!(slab != 0 && slab < DISPATCH_SLAB_COUNT);
+
+        let table = &mut DISPATCH_SLABS[slab * 0x1000..slab * 0x1000 + 0x1000];
+        table.fill(u16::MAX);
+        for &(addr, state) in entries {
+            dbg_assert!(state != u16::MAX);
+            table[addr as usize] = state;
+        }
+
+        DISPATCH_META[page] = (state_flags.to_u32() as u64) << 32
+            | (wasm_table_index.to_u16() as u64) << 16
+            | slab as u64;
+    }
+}
+
+/// Unpublish a page. Returns true if the page actually had an entry (callers use
+/// this to bump the B1b ret-memo epoch only on real evictions, as before).
+pub fn dispatch_meta_clear(page: u32) -> bool {
+    unsafe {
+        let page = page as usize & 0xFFFFF;
+        let meta = DISPATCH_META[page];
+        if meta == 0 {
+            return false;
+        }
+        let slab = (meta as u16) as usize;
+        dbg_assert!(slab != 0 && slab < DISPATCH_SLAB_COUNT);
+        dbg_assert!(DISPATCH_SLAB_FREE_TOP < DISPATCH_SLAB_COUNT);
+        DISPATCH_SLAB_FREE[DISPATCH_SLAB_FREE_TOP] = slab as u16;
+        DISPATCH_SLAB_FREE_TOP += 1;
+        DISPATCH_META[page] = 0;
+        true
+    }
+}
+
+// Bases exported for the D2 inline-lookup codegen (JIT modules share this linear
+// memory) and the TS stats verb.
+#[no_mangle]
+pub fn dispatch_meta_base() -> u32 { unsafe { &DISPATCH_META[0] as *const u64 as u32 } }
+#[no_mangle]
+pub fn dispatch_slabs_base() -> u32 { unsafe { &DISPATCH_SLABS[0] as *const u16 as u32 } }
+#[no_mangle]
+pub fn dispatch_slab_high_water() -> u32 { unsafe { DISPATCH_SLAB_HIGH_WATER } }
+#[no_mangle]
+pub fn dispatch_slab_overflows() -> u32 { unsafe { DISPATCH_SLAB_OVERFLOWS } }
 
 // Coarse remap-thrash latch, using guest icount as the clock.
 static mut FASTMEM_THRASH_WINDOW_START: u32 = 0;
@@ -754,7 +889,7 @@ impl DerefMut for JitStateRef {
 
 #[no_mangle]
 pub fn rust_init() {
-    dbg_assert!(std::mem::size_of::<[Option<NonNull<cpu::Code>>; 0x100000]>() == 0x100000 * 4);
+    dispatch_meta_init();
 
     let _ = JIT_STATE
         .try_lock()
@@ -835,9 +970,12 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
             let tlb_physical_page = Page::of_u32(
                 (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
             );
-            let w = match unsafe { cpu::tlb_code[page as usize] } {
-                None => None,
-                Some(c) => unsafe { Some(c.as_ref().wasm_table_index) },
+            let meta = dispatch_meta_get(page as u32);
+            let w = if meta != 0 {
+                Some(WasmTableIndex(dispatch_meta_table_index(meta)))
+            }
+            else {
+                None
             };
             let tlb_has_code = entry & cpu::TLB_HAS_CODE == cpu::TLB_HAS_CODE;
             let infos = ctx.pages.get(&tlb_physical_page);
@@ -1296,28 +1434,15 @@ pub fn jit_find_cache_entry_in_page(
 
     let state_flags = CachedStateFlags::of_u32(state_flags);
 
-    unsafe {
-        match cpu::tlb_code[(virt_address >> 12) as usize] {
-            None => {},
-            Some(c) => {
-                let c = c.as_ref();
-                // Copy out before any deopt (which frees this unit's Box).
-                let unit_generation = c.fastmem_generation;
-                let unit_index = c.wasm_table_index;
-                let matches = state_flags == c.state_flags && wasm_table_index == unit_index;
-                let unit_state = if matches {
-                    c.state_table[virt_address as usize & 0xFFF]
-                }
-                else {
-                    u16::MAX
-                };
-                if unit_generation != 0 && unit_generation != fastmem_current_generation() {
-                    fastmem_deopt_jit_unit(unit_index.to_u16() as u32);
-                }
-                else if matches && unit_state != u16::MAX {
-                    return unit_state.into();
-                }
-            },
+    // DOD SoA lookup (no pointer chase; stale-generation units self-deopt on entry).
+    let meta = dispatch_meta_get(virt_address >> 12);
+    if meta != 0
+        && dispatch_meta_state_flags(meta) == state_flags.to_u32()
+        && dispatch_meta_table_index(meta) == wasm_table_index.to_u16()
+    {
+        let unit_state = dispatch_state_lookup(meta, virt_address);
+        if unit_state != u16::MAX {
+            return unit_state.into();
         }
     }
 
@@ -1350,32 +1475,19 @@ pub unsafe fn jit_find_cache_entry_for_chaining(state_flags: u32) -> i32 {
     let virt_address = *global_pointers::instruction_pointer as u32;
     let state_flags = CachedStateFlags::of_u32(state_flags);
 
-    match cpu::tlb_code[(virt_address >> 12) as usize] {
-        None => {},
-        Some(c) => {
-            let c = c.as_ref();
-            // Copy out before any deopt (which frees this unit's Box).
-            let unit_generation = c.fastmem_generation;
-            let unit_index = c.wasm_table_index;
-            let matches = state_flags == c.state_flags;
-            let unit_state = if matches {
-                c.state_table[virt_address as usize & 0xFFF]
+    // DOD SoA lookup (no pointer chase; stale-generation units self-deopt on entry).
+    let meta = dispatch_meta_get(virt_address >> 12);
+    if meta != 0 && dispatch_meta_state_flags(meta) == state_flags.to_u32() {
+        let unit_state = dispatch_state_lookup(meta, virt_address);
+        if unit_state != u16::MAX {
+            if dispatch_stats_enabled() {
+                profiler::stat_increment_always(stat::MODULE_CHAINED_EDGE);
             }
-            else {
-                u16::MAX
-            };
-            if unit_generation != 0 && unit_generation != fastmem_current_generation() {
-                fastmem_deopt_jit_unit(unit_index.to_u16() as u32);
-            }
-            else if matches && unit_state != u16::MAX {
-                if dispatch_stats_enabled() {
-                    profiler::stat_increment_always(stat::MODULE_CHAINED_EDGE);
-                }
 
-                let table_slot = unit_index.to_u16() as i32 + cpu::WASM_TABLE_OFFSET as i32;
-                return table_slot << 16 | unit_state as i32;
-            }
-        },
+            let table_slot =
+                dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
+            return table_slot << 16 | unit_state as i32;
+        }
     }
 
     if dispatch_stats_enabled() {
@@ -1427,40 +1539,25 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     let raw_state_flags = state_flags;
     let state_flags = CachedStateFlags::of_u32(state_flags);
 
-    match cpu::tlb_code[(virt_address >> 12) as usize] {
-        None => {},
-        Some(c) => {
-            let c = c.as_ref();
-            // Copy out before any deopt (which frees this unit's Box).
-            let unit_generation = c.fastmem_generation;
-            let unit_index = c.wasm_table_index;
-            let matches = state_flags == c.state_flags;
-            let unit_state = if matches {
-                c.state_table[virt_address as usize & 0xFFF]
+    // DOD SoA lookup (no pointer chase). Generation staleness is handled by the
+    // unit's own prologue guard (self-deopt on entry), and a deopt/free bumps
+    // RET_CACHE_EPOCH via free_wasm_table_index — so unlike the old Box walk, the
+    // memo may now cache EVERY unit: there is no lookup-time generation check left
+    // for it to skip.
+    let meta = dispatch_meta_get(virt_address >> 12);
+    if meta != 0 && dispatch_meta_state_flags(meta) == state_flags.to_u32() {
+        let unit_state = dispatch_state_lookup(meta, virt_address);
+        if unit_state != u16::MAX {
+            if dispatch_stats_enabled() {
+                profiler::stat_increment_always(stat::RET_CHAIN_HIT);
             }
-            else {
-                u16::MAX
-            };
-            if unit_generation != 0 && unit_generation != fastmem_current_generation() {
-                fastmem_deopt_jit_unit(unit_index.to_u16() as u32);
-            }
-            else if matches && unit_state != u16::MAX {
-                if dispatch_stats_enabled() {
-                    profiler::stat_increment_always(stat::RET_CHAIN_HIT);
-                }
 
-                let table_slot = unit_index.to_u16() as i32 + cpu::WASM_TABLE_OFFSET as i32;
-                let packed = table_slot << 16 | unit_state as i32;
-                // Only cache generation-0 units: a fastmem-tracked unit (generation != 0)
-                // must re-run the generation check on every dispatch, which the memo
-                // would skip.
-                if unit_generation == 0 {
-                    RET_CACHE[cache_idx] =
-                        (virt_address, raw_state_flags, packed, RET_CACHE_EPOCH);
-                }
-                return packed;
-            }
-        },
+            let table_slot =
+                dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
+            let packed = table_slot << 16 | unit_state as i32;
+            RET_CACHE[cache_idx] = (virt_address, raw_state_flags, packed, RET_CACHE_EPOCH);
+            return packed;
+        }
     }
 
     if dispatch_stats_enabled() {
@@ -2392,7 +2489,6 @@ pub fn codegen_finalize_finished(
                     wasm_table_index,
                     &info.entry_points,
                     state_flags,
-                    info.fastmem_generation,
                 );
             }
         }
@@ -2438,53 +2534,22 @@ pub fn update_tlb_code(virt_page: Page, phys_page: Page) {
             entry_points,
             state_flags,
             hidden_wasm_table_indices: _,
-            fastmem_generation,
-        }) => set_tlb_code(
-            virt_page,
-            *wasm_table_index,
-            entry_points,
-            *state_flags,
-            *fastmem_generation,
-        ),
+            fastmem_generation: _,
+        }) => set_tlb_code(virt_page, *wasm_table_index, entry_points, *state_flags),
         None => cpu::clear_tlb_code(phys_page.to_u32() as i32),
     };
 }
 
+// Publish a page's dispatch entries into the DOD SoA (see DISPATCH_META above).
+// The per-unit fastmem generation is intentionally NOT stored: the unit's own
+// prologue guard self-deopts a stale unit on entry (see the SoA header comment).
 pub fn set_tlb_code(
     virt_page: Page,
     wasm_table_index: WasmTableIndex,
     entries: &Vec<(u16, u16)>,
     state_flags: CachedStateFlags,
-    fastmem_generation: u64,
 ) {
-    let c = match unsafe { cpu::tlb_code[virt_page.to_u32() as usize] } {
-        None => {
-            let state_table = [u16::MAX; 0x1000];
-            unsafe {
-                let mut c = NonNull::new_unchecked(Box::into_raw(Box::new(cpu::Code {
-                    wasm_table_index,
-                    state_flags,
-                    fastmem_generation,
-                    state_table,
-                })));
-                cpu::tlb_code[virt_page.to_u32() as usize] = Some(c);
-                c.as_mut()
-            }
-        },
-        Some(mut c) => unsafe {
-            let c = c.as_mut();
-            c.state_table.fill(u16::MAX);
-            c.state_flags = state_flags;
-            c.wasm_table_index = wasm_table_index;
-            c.fastmem_generation = fastmem_generation;
-            c
-        },
-    };
-
-    for &(addr, state) in entries {
-        dbg_assert!(state != u16::MAX);
-        c.state_table[addr as usize] = state;
-    }
+    dispatch_meta_set(virt_page, wasm_table_index, entries, state_flags);
 }
 
 fn gen_chain_or_exit_to_known_successor(
@@ -3748,15 +3813,10 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
 
         for i in 0..unsafe { cpu::valid_tlb_entries_count } {
             let page = unsafe { cpu::valid_tlb_entries[i as usize] };
-            unsafe {
-                match cpu::tlb_code[page as usize] {
-                    None => {},
-                    Some(c) => {
-                        let c = c.as_ref();
-                        dbg_assert!(c.wasm_table_index != wasm_table_index);
-                    },
-                }
-            }
+            let meta = dispatch_meta_get(page as u32);
+            dbg_assert!(
+                meta == 0 || dispatch_meta_table_index(meta) != wasm_table_index.to_u16()
+            );
         }
     }
 
@@ -3786,19 +3846,13 @@ fn free_wasm_module(ctx: &mut JitState, wasm_table_index: WasmTableIndex) -> Vec
             let tlb_physical_page = Page::of_u32(
                 (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
             );
-            match unsafe { cpu::tlb_code[page as usize] } {
-                None => {},
-                Some(c) => unsafe {
-                    let w = c.as_ref().wasm_table_index;
-                    if wasm_table_index == w {
-                        drop(Box::from_raw(c.as_ptr()));
-                        cpu::tlb_code[page as usize] = None;
-                        if !ctx.entry_points.contains_key(&tlb_physical_page) {
-                            // XXX
-                            cpu::tlb_data[page as usize] &= !cpu::TLB_HAS_CODE;
-                        }
-                    }
-                },
+            let meta = dispatch_meta_get(page as u32);
+            if meta != 0 && dispatch_meta_table_index(meta) == wasm_table_index.to_u16() {
+                dispatch_meta_clear(page as u32);
+                if !ctx.entry_points.contains_key(&tlb_physical_page) {
+                    // XXX
+                    unsafe { cpu::tlb_data[page as usize] &= !cpu::TLB_HAS_CODE };
+                }
             }
         }
     }

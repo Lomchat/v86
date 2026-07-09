@@ -134,6 +134,11 @@ static mut JIT_TIER2_RET_SPEC_MAX_INSTR: u32 = 96;
 // modules (cold code keeps the global MAX_PAGES), so the V8 large-function OOM risk
 // that forbids raising the global cap doesn't apply at moderate values.
 static mut TIER2_MAX_PAGES: u32 = 8;
+// Split-range fastmem read shape (Track 2b): two early-exit range tests instead of the
+// 4-compare and/or chain — hot below-guard reads drop ~25 → ~10 wasm ops. Same
+// acceptance set; A/B via set_jit_config idx 18 + JIT cache clear (shape is baked in
+// at module compile time).
+static mut JIT_FASTMEM_READ_SPLIT: bool = true;
 const TIER2_PAGE_SET_CAP: usize = 256;
 static mut MODULE_EXEC_COUNTS: [u32; 0x10000] = [0; 0x10000];
 
@@ -219,6 +224,9 @@ static mut JIT_DEAD_FLAG_ELISION: bool = false;
 static mut JIT_FASTMEM_READS: bool = false;
 static mut JIT_X87_LOCALS: bool = false;
 static mut JIT_PUSH_RUN_COALESCING: bool = false;
+// Track 2b Phase W — fastmem WRITES behind a per-page writability map (idx 19).
+// Off by default until the in-game gate passes (plan/2b-codegen-quality.md §1.4).
+static mut JIT_FASTMEM_WRITES: bool = false;
 
 // Tier-2R (E2b, plan/tier2-region-recompiler.md §5): grow page groups across
 // indirect edges using trace_profiler target histograms, and make hot indirect
@@ -301,6 +309,35 @@ static mut FASTMEM_SPECULATED_LOADS_COMPILED: u32 = 0;
 static mut FASTMEM_DEOPT_RECOMPILES: u32 = 0;
 static mut FASTMEM_THRASH_LATCHED: bool = false;
 
+// ── Fastmem WRITE map (Track 2b Phase W, plan/2b-codegen-quality.md §1.2) ─────────
+// One byte per 4 KB VA page across the full 4 GB space (1 MB static). The JIT store
+// fast path (codegen::gen_fastmem_write_map) accepts a page IFF its byte == 1, so the
+// byte is a bitfield where every restriction independently vetoes the fast path:
+//   bit0  BASE_WRITABLE  committed, RW, plain identity-mapped RAM   — owner: TS choke points
+//   bit1  HAS_CODE       page holds compiled code (SMC net)         — owner: rust tlb_set_has_code
+//   bit2  WRITE_WATCH    debug write-watch armed on this page       — owner: rust dbg_set_write_watch
+// Unlike read speculation this carries NO stale window and NO generation guard: the map
+// is DATA, read per store, updated synchronously at the same choke points that keep the
+// TLB honest, so compiled code never goes stale (§1.3). A stale-writable byte on an
+// RO/CoW/code page would be silent memory corruption (the July class), so the ONLY safe
+// failure direction is leaving a byte != 1 (slow path, byte-precise). Init all zeros =
+// conservative = correct; TS marks RW ranges as regions register/commit during boot.
+pub const FASTMEM_WRITE_MAP_LEN: usize = 1 << 20; // 4 GB / 4 KB pages, one byte each
+static mut FASTMEM_WRITE_MAP: [u8; FASTMEM_WRITE_MAP_LEN] = [0; FASTMEM_WRITE_MAP_LEN];
+const FASTMEM_WRITE_BASE_WRITABLE: u8 = 1 << 0;
+const FASTMEM_WRITE_HAS_CODE: u8 = 1 << 1;
+const FASTMEM_WRITE_WATCH: u8 = 1 << 2;
+static mut FASTMEM_SPECULATED_STORES_COMPILED: u32 = 0;
+// Highest VA page for which TS has ever set bit0 — bounds the audit/count scans so they
+// don't walk the whole 1 MB map every call (the populated prefix is tiny in practice).
+static mut FASTMEM_WRITE_MAP_MAX_PAGE: u32 = 0;
+// Hard "never fast-writable" page band [lo, hi) — TS points this at THUNK_CODE (which
+// holds immutable RX stubs but has RW PTEs under the identity map, so a kind-blind PTE
+// path could otherwise set bit0 on it). bit0 SET is refused inside this band regardless
+// of caller. hi == 0 ⇒ no exclusion (feature off / older TS).
+static mut FASTMEM_WRITE_EXCLUDE_LO_PAGE: u32 = 0;
+static mut FASTMEM_WRITE_EXCLUDE_HI_PAGE: u32 = 0;
+
 // Coarse remap-thrash latch, using guest icount as the clock.
 static mut FASTMEM_THRASH_WINDOW_START: u32 = 0;
 static mut FASTMEM_THRASH_WINDOW_BUMPS: u32 = 0;
@@ -356,6 +393,186 @@ pub fn x87_locals_enabled() -> bool { unsafe { JIT_X87_LOCALS } }
 
 #[inline]
 pub fn push_run_coalescing_enabled() -> bool { unsafe { JIT_PUSH_RUN_COALESCING } }
+
+pub fn fastmem_read_split_enabled() -> bool { unsafe { JIT_FASTMEM_READ_SPLIT } }
+
+// Compile-time gate for the store fast path. Same regime as fastmem reads (32-bit
+// protected mode + paging): the map's identity-map store `mem8 + addr` is only valid
+// where VA == PA, which BottleShip guarantees under paging. Any page NOT identity-RW
+// simply never has bit0 set by TS, so even if the shape is emitted the fast path is
+// never taken there — this gate only avoids emitting dead shape in other regimes.
+pub fn fastmem_writes_compile_enabled(state_flags: CachedStateFlags) -> bool {
+    unsafe {
+        JIT_FASTMEM_WRITES
+            && state_flags.is_32()
+            && *global_pointers::protected_mode
+            && (*global_pointers::cr & cpu::CR0_PG) != 0
+    }
+}
+
+// Wasm-memory address of the write map, baked as a load base in the store fast path.
+#[inline]
+pub fn fastmem_write_map_base() -> u32 {
+    unsafe { &FASTMEM_WRITE_MAP[0] as *const u8 as u32 }
+}
+
+#[inline]
+pub fn fastmem_note_speculated_store_compiled() {
+    unsafe {
+        FASTMEM_SPECULATED_STORES_COMPILED = FASTMEM_SPECULATED_STORES_COMPILED.saturating_add(1);
+    }
+}
+
+// ── Write-map maintenance ─────────────────────────────────────────────────────────
+// TS owns bit0 only; rust owns bit1/bit2. The worker is single-threaded, so the split
+// ownership is a plain (non-atomic) read-modify-write with no race.
+
+/// bit0 (BASE_WRITABLE) over [start_page, start_page+page_count). Owner: TS choke
+/// points (region register / commit / decommit / protect). Only bit0 is touched.
+///
+/// Setting bit0 is authoritatively clamped HERE to the SAME identity-RAM envelope the
+/// read fast path trusts — [LOW_MEM_END, min(GUARD_BASE, ram)) ∪ [GUARD_END, ram), in
+/// pages — so no TS caller can ever fast-enable a low-mem/MMIO page, the guard red zone,
+/// or an unbacked (> ram) page, whatever range it passes. Clearing is unconditional
+/// (slow path is always the safe direction).
+#[no_mangle]
+pub fn fastmem_write_map_set_base(start_page: u32, page_count: u32, writable: u32) {
+    unsafe {
+        let start = (start_page as usize).min(FASTMEM_WRITE_MAP_LEN);
+        let end = (start_page as usize)
+            .saturating_add(page_count as usize)
+            .min(FASTMEM_WRITE_MAP_LEN);
+        if writable == 0 {
+            for p in start..end {
+                FASTMEM_WRITE_MAP[p] &= !FASTMEM_WRITE_BASE_WRITABLE;
+            }
+            return;
+        }
+        let ram = *global_pointers::memory_size;
+        let lo1 = (FASTMEM_LOW_MEM_END >> 12) as usize;
+        let hi1 = (FASTMEM_GUARD_BASE.min(ram) >> 12) as usize;
+        let lo2 = (FASTMEM_GUARD_BASE.wrapping_add(FASTMEM_GUARD_SIZE) >> 12) as usize;
+        let hi2 = (ram >> 12) as usize;
+        let excl_lo = FASTMEM_WRITE_EXCLUDE_LO_PAGE as usize;
+        let excl_hi = FASTMEM_WRITE_EXCLUDE_HI_PAGE as usize;
+        for p in start..end {
+            let in_envelope = (p >= lo1 && p < hi1) || (p >= lo2 && p < hi2);
+            let excluded = excl_hi != 0 && p >= excl_lo && p < excl_hi;
+            if in_envelope && !excluded {
+                FASTMEM_WRITE_MAP[p] |= FASTMEM_WRITE_BASE_WRITABLE;
+                if (p as u32) > FASTMEM_WRITE_MAP_MAX_PAGE {
+                    FASTMEM_WRITE_MAP_MAX_PAGE = p as u32;
+                }
+            }
+        }
+    }
+}
+
+/// TS points this at the THUNK_CODE band at boot so no PTE-level (kind-blind) SET can
+/// ever fast-enable the immutable RX stubs. Also clears bit0 across the band defensively.
+#[no_mangle]
+pub fn fastmem_write_map_set_exclude(lo_page: u32, hi_page: u32) {
+    unsafe {
+        FASTMEM_WRITE_EXCLUDE_LO_PAGE = lo_page;
+        FASTMEM_WRITE_EXCLUDE_HI_PAGE = hi_page;
+        if hi_page > lo_page {
+            let lo = (lo_page as usize).min(FASTMEM_WRITE_MAP_LEN);
+            let hi = (hi_page as usize).min(FASTMEM_WRITE_MAP_LEN);
+            for p in lo..hi {
+                FASTMEM_WRITE_MAP[p] &= !FASTMEM_WRITE_BASE_WRITABLE;
+            }
+        }
+    }
+}
+
+/// Wipe the whole map to zero (conservative). Called by TS at v86 (re)init before it
+/// re-marks the RW regions, in case the wasm instance (and thus this static) persisted.
+#[no_mangle]
+pub fn fastmem_write_map_reset() {
+    unsafe {
+        core::ptr::write_bytes(&raw mut FASTMEM_WRITE_MAP as *mut u8, 0, FASTMEM_WRITE_MAP_LEN);
+        FASTMEM_WRITE_MAP_MAX_PAGE = 0;
+        FASTMEM_SPECULATED_STORES_COMPILED = 0;
+    }
+}
+
+#[inline]
+pub fn fastmem_write_map_set_code(page: u32) {
+    unsafe {
+        if (page as usize) < FASTMEM_WRITE_MAP_LEN {
+            FASTMEM_WRITE_MAP[page as usize] |= FASTMEM_WRITE_HAS_CODE;
+        }
+    }
+}
+
+#[inline]
+pub fn fastmem_write_map_clear_code(page: u32) {
+    unsafe {
+        if (page as usize) < FASTMEM_WRITE_MAP_LEN {
+            FASTMEM_WRITE_MAP[page as usize] &= !FASTMEM_WRITE_HAS_CODE;
+        }
+    }
+}
+
+#[inline]
+pub fn fastmem_write_map_set_watch(page: u32) {
+    unsafe {
+        if (page as usize) < FASTMEM_WRITE_MAP_LEN {
+            FASTMEM_WRITE_MAP[page as usize] |= FASTMEM_WRITE_WATCH;
+        }
+    }
+}
+
+#[inline]
+pub fn fastmem_write_map_clear_watch(page: u32) {
+    unsafe {
+        if (page as usize) < FASTMEM_WRITE_MAP_LEN {
+            FASTMEM_WRITE_MAP[page as usize] &= !FASTMEM_WRITE_WATCH;
+        }
+    }
+}
+
+/// Raw map byte for one page (audit verb).
+#[no_mangle]
+pub fn fastmem_write_map_get(page: u32) -> u32 {
+    unsafe {
+        if (page as usize) < FASTMEM_WRITE_MAP_LEN {
+            FASTMEM_WRITE_MAP[page as usize] as u32
+        }
+        else {
+            0
+        }
+    }
+}
+
+/// Count pages within the populated prefix. mask == 0 → count acceptance (byte == 1);
+/// otherwise count pages where (byte & mask) != 0. Bounded by the max marked page.
+#[no_mangle]
+pub fn fastmem_write_map_count(mask: u32) -> u32 {
+    unsafe {
+        let hi = (FASTMEM_WRITE_MAP_MAX_PAGE as usize + 1).min(FASTMEM_WRITE_MAP_LEN);
+        let mut n = 0u32;
+        for p in 0..hi {
+            let b = FASTMEM_WRITE_MAP[p] as u32;
+            let hit = if mask == 0 { b == 1 } else { (b & mask) != 0 };
+            if hit {
+                n = n.saturating_add(1);
+            }
+        }
+        n
+    }
+}
+
+#[no_mangle]
+pub fn fastmem_get_speculated_stores_compiled() -> u32 {
+    unsafe { FASTMEM_SPECULATED_STORES_COMPILED }
+}
+
+/// Highest VA page ever marked base-writable — upper bound for the audit scan.
+#[no_mangle]
+pub fn fastmem_write_map_max_page() -> u32 {
+    unsafe { FASTMEM_WRITE_MAP_MAX_PAGE }
+}
 
 #[inline]
 pub fn x87_locals_note_cache_load_site_compiled() {
@@ -462,6 +679,7 @@ pub fn fastmem_reset_stats() {
         FASTMEM_THRASH_LATCHED = false;
         FASTMEM_THRASH_WINDOW_START = *global_pointers::instruction_counter;
         FASTMEM_THRASH_WINDOW_BUMPS = 0;
+        FASTMEM_SPECULATED_STORES_COMPILED = 0;
     }
 }
 
@@ -778,6 +996,8 @@ pub struct JitContext<'a> {
     pub elide_current_flags: bool,
     pub instruction_counter: WasmLocal,
     pub fastmem_generation: Option<u64>,
+    /// Track 2b Phase W: emit the per-page-map store fast path for this unit.
+    pub fastmem_writes: bool,
     pub x87_local_cache: [Option<X87LocalCacheSlot>; 8],
     pub push32_write_cache: Option<Push32WriteCache>,
     /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
@@ -2368,6 +2588,7 @@ fn jit_generate_module(
         elide_current_flags: false,
         instruction_counter,
         fastmem_generation,
+        fastmem_writes: fastmem_writes_compile_enabled(state_flags),
         x87_local_cache: std::array::from_fn(|_| None),
         push32_write_cache: None,
         x87_cache_kept: false,
@@ -3899,6 +4120,8 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         15 => JIT_TIER2_THRESHOLD = value,
         16 => JIT_TIER2_RET_SPEC_MAX_INSTR = value,
         17 => TIER2_MAX_PAGES = value,
+        18 => JIT_FASTMEM_READ_SPLIT = value != 0,
+        19 => JIT_FASTMEM_WRITES = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -3924,6 +4147,8 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         15 => JIT_TIER2_THRESHOLD,
         16 => JIT_TIER2_RET_SPEC_MAX_INSTR,
         17 => TIER2_MAX_PAGES,
+        18 => JIT_FASTMEM_READ_SPLIT as u32,
+        19 => JIT_FASTMEM_WRITES as u32,
         _ => 0,
     }
 }

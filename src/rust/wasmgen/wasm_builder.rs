@@ -1007,11 +1007,10 @@ impl WasmBuilder {
         self.instruction_body.push(op::OP_IF);
         self.instruction_body.push(op::TYPE_I64);
     }
-    #[allow(dead_code)]
-    pub fn block_i32(&mut self) {
-        self.open_block();
+    pub fn block_i32(&mut self) -> Label {
         self.instruction_body.push(op::OP_BLOCK);
         self.instruction_body.push(op::TYPE_I32);
+        self.open_block()
     }
 
     pub fn if_void(&mut self) {

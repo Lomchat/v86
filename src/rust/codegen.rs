@@ -793,6 +793,11 @@ fn gen_fastmem_read(
 
     crate::jit::fastmem_note_speculated_load_compiled();
 
+    if crate::jit::fastmem_read_split_enabled() {
+        gen_fastmem_read_split(ctx, bits, address_local, where_to_write);
+        return true;
+    }
+
     ctx.builder.const_i32(0);
     let load_address_local = ctx.builder.set_new_local();
 
@@ -916,6 +921,156 @@ fn gen_fastmem_read(
     true
 }
 
+// Split-range shape of the fastmem read fast path (set_jit_config idx 18, default on).
+// Same acceptance set as the legacy shape — [LOW_MEM_END, min(GUARD_BASE, ram) - bytes]
+// ∪ [GUARD_END, ram - bytes] — decomposed into two early-exit range tests so the hot
+// case (below-guard HEAP/image data) costs one sub+cmp+br_if and a direct load:
+// ~10 wasm ops instead of the legacy ~25 (4-compare and/or chain + if/else + local).
+// The value flows on the stack via a result-typed block; no address local at all
+// (except DQWORD, which needs the host address twice).
+fn gen_fastmem_read_split(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    where_to_write: Option<u32>,
+) {
+    let bytes = bits.bytes() as u32;
+    let ram_size = unsafe { *global_pointers::memory_size };
+    const LOW_MEM_END: u32 = crate::jit::FASTMEM_LOW_MEM_END;
+    const GUARD_BASE: u32 = crate::jit::FASTMEM_GUARD_BASE;
+    const GUARD_SIZE: u32 = crate::jit::FASTMEM_GUARD_SIZE;
+    const GUARD_END: u32 = GUARD_BASE + GUARD_SIZE;
+
+    // Range 1: [LOW_MEM_END, r1_top]; min() keeps small-RAM configs correct.
+    let r1_top = GUARD_BASE.min(ram_size) - bytes;
+    dbg_assert!(r1_top >= LOW_MEM_END); // caller checked max_addr >= LOW_MEM_END
+    // Range 2: [GUARD_END, ram - bytes], only when RAM extends past the red zone.
+    let r2 = if ram_size >= GUARD_END + bytes {
+        Some(ram_size - bytes - GUARD_END)
+    }
+    else {
+        None
+    };
+
+    let host = ctx.builder.block_i32(); // yields the wasm-memory offset to load from
+
+    let try_next = ctx.builder.block_void();
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(LOW_MEM_END as i32);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32((r1_top - LOW_MEM_END) as i32);
+    ctx.builder.gtu_i32();
+    ctx.builder.br_if(try_next);
+    ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
+    ctx.builder.get_local(address_local);
+    ctx.builder.add_i32();
+    ctx.builder.br(host);
+    ctx.builder.block_end();
+
+    if let Some(r2_span) = r2 {
+        let slow = ctx.builder.block_void();
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(GUARD_END as i32);
+        ctx.builder.sub_i32();
+        ctx.builder.const_i32(r2_span as i32);
+        ctx.builder.gtu_i32();
+        ctx.builder.br_if(slow);
+        ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
+        ctx.builder.get_local(address_local);
+        ctx.builder.add_i32();
+        ctx.builder.br(host);
+        ctx.builder.block_end();
+    }
+
+    // Slow path: universal helper (MMIO, guard faults, decommit, out-of-range).
+    if cfg!(feature = "profiler") {
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(0);
+        ctx.builder.call_fn2("report_safe_read_jit_slow");
+    }
+
+    ctx.builder.get_local(address_local);
+    ctx.builder
+        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    match bits {
+        BitSize::BYTE => {
+            ctx.builder.call_fn2_ret("safe_read8_slow_jit");
+        },
+        BitSize::WORD => {
+            ctx.builder.call_fn2_ret("safe_read16_slow_jit");
+        },
+        BitSize::DWORD => {
+            ctx.builder.call_fn2_ret("safe_read32s_slow_jit");
+        },
+        BitSize::QWORD => {
+            ctx.builder.call_fn2_ret("safe_read64s_slow_jit");
+        },
+        BitSize::DQWORD => {
+            ctx.builder.call_fn2_ret("safe_read128s_slow_jit");
+        },
+    }
+    let entry_local = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+
+    if cfg!(feature = "profiler") {
+        ctx.builder.if_void();
+        gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+        ctx.builder.block_end();
+
+        ctx.builder.get_local(&entry_local);
+        ctx.builder.const_i32(1);
+        ctx.builder.and_i32();
+    }
+
+    ctx.builder.br_if(ctx.exit_with_fault_label);
+
+    // TLB entries fold mem8 in: (entry & ~0xFFF) ^ addr is a wasm-memory offset.
+    ctx.builder.get_local(&entry_local);
+    ctx.builder.const_i32(!0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(address_local);
+    ctx.builder.xor_i32();
+    ctx.builder.free_local(entry_local);
+
+    ctx.builder.block_end(); // host
+
+    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST);
+
+    dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
+
+    match bits {
+        BitSize::BYTE => {
+            ctx.builder.load_u8(0);
+        },
+        BitSize::WORD => {
+            ctx.builder.load_unaligned_u16(0);
+        },
+        BitSize::DWORD => {
+            ctx.builder.load_unaligned_i32(0);
+        },
+        BitSize::QWORD => {
+            ctx.builder.load_unaligned_i64(0);
+        },
+        BitSize::DQWORD => {
+            let where_to_write = where_to_write.unwrap();
+            let virt_address_local = ctx.builder.set_new_local();
+
+            ctx.builder.const_i32(0);
+            ctx.builder.get_local(&virt_address_local);
+            ctx.builder.load_unaligned_i64(0);
+            ctx.builder.store_unaligned_i64(where_to_write);
+
+            ctx.builder.const_i32(0);
+            ctx.builder.get_local(&virt_address_local);
+            ctx.builder.load_unaligned_i64(8);
+            ctx.builder.store_unaligned_i64(where_to_write + 8);
+
+            ctx.builder.free_local(virt_address_local);
+        },
+    }
+}
+
 pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal) {
     // Similar to gen_safe_read, but return the physical eip + memory::mem rather than reading from memory
     // In functions that need to use this value we need to fix it by substracting memory::mem
@@ -993,12 +1148,148 @@ pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal
     ctx.builder.free_local(entry_local);
 }
 
+// Track 2b Phase W — store fast path gated by the per-page write map (idx 19).
+// Structure mirrors gen_fastmem_read_split: a result-typed `host` block yields the
+// wasm-memory offset to store to. Fast path (map byte == 1 → base-writable, no
+// compiled code, no watch, and the access does not cross a page) yields `mem8 + addr`
+// (identity map, VA == PA). Slow path calls the universal byte-precise helper, which
+// itself validates + performs MMIO / page-cross writes and returns a TLB-style entry
+// so the trailing inline store lands in real RAM (or a scratch page for the cases the
+// helper already handled). No generation guard — the map is DATA read per store, kept
+// honest synchronously at the same choke points as the TLB (plan §1.2/§1.3).
+fn gen_fastmem_write_map(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    value_local: GenSafeWriteValue,
+) {
+    let bytes = bits.bytes() as i32;
+    let map_base = crate::jit::fastmem_write_map_base();
+
+    crate::jit::fastmem_note_speculated_store_compiled();
+
+    let host = ctx.builder.block_i32(); // yields the wasm-memory offset to store to
+
+    let slow = ctx.builder.block_void();
+    // Reject unless map[addr >> 12] == 1 AND (multi-byte) the access stays in-page.
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder.load_u8(map_base);
+    ctx.builder.const_i32(1);
+    ctx.builder.ne_i32();
+    if bits != BitSize::BYTE {
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(0x1000 - bytes);
+        ctx.builder.gt_i32();
+        ctx.builder.or_i32();
+    }
+    ctx.builder.br_if(slow);
+    // fast: identity map, mem8 + addr
+    ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
+    ctx.builder.get_local(address_local);
+    ctx.builder.add_i32();
+    ctx.builder.br(host);
+    ctx.builder.block_end(); // slow
+
+    // Slow path: universal helper (fault, MMIO, page-cross, code page, out-of-range).
+    if cfg!(feature = "profiler") {
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(0);
+        ctx.builder.call_fn2("report_safe_write_jit_slow");
+    }
+
+    ctx.builder.get_local(address_local);
+    match value_local {
+        GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
+        GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
+        GenSafeWriteValue::TwoI64s(local1, local2) => {
+            ctx.builder.get_local_i64(local1);
+            ctx.builder.get_local_i64(local2)
+        },
+    }
+    ctx.builder
+        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    match bits {
+        BitSize::BYTE => ctx.builder.call_fn3_ret("safe_write8_slow_jit"),
+        BitSize::WORD => ctx.builder.call_fn3_ret("safe_write16_slow_jit"),
+        BitSize::DWORD => ctx.builder.call_fn3_ret("safe_write32_slow_jit"),
+        BitSize::QWORD => ctx.builder.call_fn3_i32_i64_i32_ret("safe_write64_slow_jit"),
+        BitSize::DQWORD => ctx
+            .builder
+            .call_fn4_i32_i64_i64_i32_ret("safe_write128_slow_jit"),
+    }
+    let entry_local = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+
+    if cfg!(feature = "profiler") {
+        ctx.builder.if_void();
+        gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+        ctx.builder.block_end();
+
+        ctx.builder.get_local(&entry_local);
+        ctx.builder.const_i32(1);
+        ctx.builder.and_i32();
+    }
+
+    ctx.builder.br_if(ctx.exit_with_fault_label);
+
+    // Helper returned a TLB-style entry: (entry & ~0xFFF) ^ addr is the store offset.
+    ctx.builder.get_local(&entry_local);
+    ctx.builder.const_i32(!0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(address_local);
+    ctx.builder.xor_i32();
+    ctx.builder.free_local(entry_local);
+
+    ctx.builder.block_end(); // host — store offset now on stack
+
+    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_WRITE_FAST);
+
+    // Store the value at the yielded offset (stack top is the offset).
+    match value_local {
+        GenSafeWriteValue::I32(local) => {
+            ctx.builder.get_local(local);
+            match bits {
+                BitSize::BYTE => ctx.builder.store_u8(0),
+                BitSize::WORD => ctx.builder.store_unaligned_u16(0),
+                BitSize::DWORD => ctx.builder.store_unaligned_i32(0),
+                _ => dbg_assert!(false),
+            }
+        },
+        GenSafeWriteValue::I64(local) => {
+            ctx.builder.get_local_i64(local);
+            ctx.builder.store_unaligned_i64(0);
+        },
+        GenSafeWriteValue::TwoI64s(local1, local2) => {
+            let store_addr = ctx.builder.set_new_local();
+            ctx.builder.get_local(&store_addr);
+            ctx.builder.get_local_i64(local1);
+            ctx.builder.store_unaligned_i64(0);
+            ctx.builder.get_local(&store_addr);
+            ctx.builder.get_local_i64(local2);
+            ctx.builder.store_unaligned_i64(8);
+            ctx.builder.free_local(store_addr);
+        },
+    }
+}
+
 fn gen_safe_write(
     ctx: &mut JitContext,
     bits: BitSize,
     address_local: &WasmLocal,
     value_local: GenSafeWriteValue,
 ) {
+    // Track 2b Phase W: when enabled for this unit, route through the per-page write
+    // map instead of the inline TLB fast path. Flag off = byte-identical to below.
+    if ctx.fastmem_writes {
+        gen_fastmem_write_map(ctx, bits, address_local, value_local);
+        return;
+    }
+
     // Execute a virtual memory write. All slow paths (memory-mapped IO, tlb miss, page fault,
     // write across page boundary and page containing jitted code are handled in safe_write_jit_slow
 

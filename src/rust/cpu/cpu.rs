@@ -552,6 +552,15 @@ pub static mut DBG_WW_ZERO_HITS: u32 = 0;
 
 #[no_mangle] pub unsafe fn dbg_set_write_watch(addr: u32) {
     crate::jit::fastmem_bump_generation(crate::jit::FASTMEM_BUMP_WRITE_WATCH);
+    // Track 2b Phase W: force the watched page onto the store slow path so dbg_check_write
+    // still fires when fastmem writes are on (the fast path bypasses it). Move bit2 from
+    // the previously watched page to the new one (addr == 0 disarms → just clear).
+    if DBG_WRITE_WATCH != 0 {
+        crate::jit::fastmem_write_map_clear_watch(DBG_WRITE_WATCH >> 12);
+    }
+    if addr != 0 {
+        crate::jit::fastmem_write_map_set_watch(addr >> 12);
+    }
     DBG_WRITE_WATCH = addr; DBG_WW_HITS = 0; DBG_WW_ZERO_HITS = 0;
     DBG_WW_LAST_EIP = 0; DBG_WW_LAST_PREV = 0; DBG_WW_LAST_VAL = 0;
     DBG_WW_ZERO_EIP = 0; DBG_WW_ZERO_PREV = 0;
@@ -2547,6 +2556,15 @@ pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: boo
 }
 
 pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
+    // Track 2b Phase W: keep the fastmem write map's SMC bit (bit1) in lockstep with
+    // TLB_HAS_CODE. Under the identity map (where bit0 is ever set) physical == virtual
+    // page, so this is the exact, page-precise TLB_HAS_CODE discipline for stores.
+    if has_code {
+        jit::fastmem_write_map_set_code(physical_page.to_u32());
+    }
+    else {
+        jit::fastmem_write_map_clear_code(physical_page.to_u32());
+    }
     for i in 0..unsafe { valid_tlb_entries_count } {
         let page = unsafe { valid_tlb_entries[i as usize] };
         let entry = unsafe { tlb_data[page as usize] };
@@ -2570,6 +2588,17 @@ pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
 }
 pub fn tlb_set_has_code_multiple(physical_pages: &HashSet<Page>, has_code: bool) {
     let physical_pages: Vec<Page> = physical_pages.into_iter().copied().collect();
+    // Track 2b Phase W: mirror TLB_HAS_CODE into the write map's SMC bit (bit1) for the
+    // whole set. On the compile path this runs before the module's entries become
+    // dispatchable, closing the SMC window (plan §5).
+    for &p in &physical_pages {
+        if has_code {
+            jit::fastmem_write_map_set_code(p.to_u32());
+        }
+        else {
+            jit::fastmem_write_map_clear_code(p.to_u32());
+        }
+    }
     for i in 0..unsafe { valid_tlb_entries_count } {
         let page = unsafe { valid_tlb_entries[i as usize] };
         let entry = unsafe { tlb_data[page as usize] };

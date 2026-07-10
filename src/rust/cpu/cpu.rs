@@ -3524,6 +3524,77 @@ pub unsafe fn main_loop() -> f64 {
     return 0.0;
 }
 
+/// Guarded Inner-Loop HLE (hle-lib): synchronously execute guest code from the
+/// CURRENT CPU state until EIP lands exactly on `sentinel_eip`. Called by JS
+/// from INSIDE an io_port_write32 thunk trap — re-entering the cycle loop here
+/// is safe because port I/O is a JIT block boundary with registers flushed to
+/// memory before the call and reloaded after (gen/jit.rs 0xEE/0xEF), and the
+/// caller saves/restores the full CPU context (GPRs/EIP/EFLAGS/FPU/SSE) around
+/// this call. Runs one dispatch entry per iteration (a jitted module may chain
+/// many blocks internally); no IRQ handling, no slice bookkeeping — the guest
+/// function is expected to be a short pure leaf.
+///
+/// Returns: 0 = reached sentinel; 1 = block budget exhausted; 2 = CPU entered
+/// HLT; 3 = EIP entered [abort_lo, abort_hi) (the thunk-stub region — the
+/// callee tried to call a WinAPI import, which must not re-enter the JS
+/// dispatcher; the JIT's region exclusion guarantees stub entries always bounce
+/// through the dispatch loop, so this check fires BEFORE the stub's OUT).
+/// `exempt_eip` is one address inside the abort range that is allowed — the
+/// hook trampoline itself lives among the stubs. On any nonzero return the
+/// caller MUST restore the saved context and abandon the result.
+#[no_mangle]
+pub unsafe fn run_guest_until(
+    sentinel_eip: u32,
+    exempt_eip: u32,
+    max_blocks: u32,
+    abort_lo: u32,
+    abort_hi: u32,
+) -> u32 {
+    // Debug-build re-entrancy bookkeeping: we are called from inside a JIT
+    // block's port-I/O import, so in_jit may be true; interpreter paths taken
+    // by the inner cycle_internal assert !in_jit. Clear for the inner run,
+    // restore for the outer block we return into.
+    #[cfg(debug_assertions)]
+    let outer_in_jit = in_jit;
+    #[cfg(debug_assertions)]
+    {
+        in_jit = false;
+    }
+    let result = run_guest_until_inner(sentinel_eip, exempt_eip, max_blocks, abort_lo, abort_hi);
+    #[cfg(debug_assertions)]
+    {
+        in_jit = outer_in_jit;
+    }
+    result
+}
+
+unsafe fn run_guest_until_inner(
+    sentinel_eip: u32,
+    exempt_eip: u32,
+    max_blocks: u32,
+    abort_lo: u32,
+    abort_hi: u32,
+) -> u32 {
+    let mut n: u32 = 0;
+    loop {
+        let eip = *instruction_pointer as u32;
+        if eip == sentinel_eip {
+            return 0;
+        }
+        if n >= max_blocks {
+            return 1;
+        }
+        if *in_hlt {
+            return 2;
+        }
+        if eip != exempt_eip && abort_hi > abort_lo && eip >= abort_lo && eip < abort_hi {
+            return 3;
+        }
+        cycle_internal();
+        n += 1;
+    }
+}
+
 pub unsafe fn do_many_cycles_native() {
     profiler::stat_increment(stat::DO_MANY_CYCLES);
     let initial_instruction_counter = *instruction_counter;

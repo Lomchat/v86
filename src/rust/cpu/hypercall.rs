@@ -365,6 +365,12 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         // calls/frame at max settings; the JS tier's per-call OUT round-trip was
         // a net regression there, so this MUST live in WASM.
         128 => handle_eagl_shader_const_convert(),
+        // 129-131 = EAGL shader-parameter APPLY converter family (named by the
+        // post-128 trace2 top: the FUN_005cdca7 apply walk's pure leaves).
+        // Semantics documented in hle-lib/libs/eagl/apply-kernels.ts.
+        129 => handle_eagl_apply(ApplyFamily::Int, ApplyLayout::Register),
+        130 => handle_eagl_apply(ApplyFamily::Float, ApplyLayout::Register),
+        131 => handle_eagl_apply(ApplyFamily::Float, ApplyLayout::Packed),
         _ => false,
     };
 
@@ -919,6 +925,201 @@ unsafe fn handle_eagl_shader_const_convert() -> bool {
     }
     write_reg32(EAX, 0);
     true
+}
+
+// --- EAGL shader-parameter APPLY converter family (handlers 129-131) ------
+
+#[derive(Clone, Copy, PartialEq)]
+enum ApplyFamily {
+    /// FUN_005c85c1: 1 = i32→f32 (FILD/FSTP), 2 = u32→f32 (+2^32 correction),
+    /// 3 = f32 copy (FLD/FSTP float).
+    Int,
+    /// FUN_005c8303 / FUN_005cad01: 1|2 = raw u32 copy (MOV), 3 = f32→i32
+    /// via CRT _ftol (truncate; NaN/overflow → low32 = 0).
+    Float,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ApplyLayout {
+    /// Budget counts 4-float registers; dst advances ceil(rows/4)*16 per column.
+    Register,
+    /// Budget counts elements; dst advances n*4 per column (FUN_005cad01).
+    Packed,
+}
+
+const APPLY_E_FAIL: i32 = 0x80004005u32 as i32; // -0x7fffbffb
+const APPLY_MAX_DEPTH: u32 = 8;
+
+/// handler_id 129/130/131 — semantically identical to the JS kernels in
+/// `hle-lib/libs/eagl/apply-kernels.ts` (RE-verified, unit-tested against a
+/// decompilation-transcribed reference). ABI: stdcall ret 0x10, four BY-REF
+/// args at [esp+4..]: desc**, src**, dst**, budget*. Any structural doubt
+/// (unmapped memory, insane dims, over-deep nesting) restores the four cursor
+/// cells to their entry values and returns false — the JS kernel re-runs the
+/// whole call from clean cursors (its writes are a superset of any partial
+/// WASM-side writes, so the retry converges).
+unsafe fn handle_eagl_apply(family: ApplyFamily, layout: ApplyLayout) -> bool {
+    let esp = read_reg32(ESP);
+    let desc_cur = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
+    let src_cur = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
+    let dst_cur = match safe_read32s(esp + 12) { Ok(v) => v, Err(_) => return false };
+    let budget = match safe_read32s(esp + 16) { Ok(v) => v, Err(_) => return false };
+
+    // Entry snapshot of the by-ref cells for clean fall-through on abort.
+    let d0 = match safe_read32s(desc_cur) { Ok(v) => v, Err(_) => return false };
+    let s0 = match safe_read32s(src_cur) { Ok(v) => v, Err(_) => return false };
+    let t0 = match safe_read32s(dst_cur) { Ok(v) => v, Err(_) => return false };
+    let b0 = match safe_read32s(budget) { Ok(v) => v, Err(_) => return false };
+    // Same sane envelope as the JS guard — beyond it, defer to the guest.
+    if b0 as u32 > 4096 {
+        return false;
+    }
+
+    match eagl_apply_walk(family, layout, desc_cur, src_cur, dst_cur, budget, 0) {
+        Ok(eax) => {
+            write_reg32(EAX, eax);
+            true
+        },
+        Err(()) => {
+            // Best-effort cursor restore; cells were readable at entry.
+            let _ = safe_write32(desc_cur, d0);
+            let _ = safe_write32(src_cur, s0);
+            let _ = safe_write32(dst_cur, t0);
+            let _ = safe_write32(budget, b0);
+            false
+        },
+    }
+}
+
+/// The recursive walk. Err(()) = abort to JS (memory fault / insane shape);
+/// Ok(eax) = completed with the guest-visible result (0 or E_FAIL).
+unsafe fn eagl_apply_walk(
+    family: ApplyFamily,
+    layout: ApplyLayout,
+    desc_cur: i32,
+    src_cur: i32,
+    dst_cur: i32,
+    budget: i32,
+    depth: u32,
+) -> Result<i32, ()> {
+    if depth > APPLY_MAX_DEPTH {
+        return Err(());
+    }
+    let d = safe_read32s(desc_cur).map_err(|_| ())?;
+    let cls = safe_read32s(d + 4).map_err(|_| ())?;
+    let mut items = safe_read32s(d + 0x10).map_err(|_| ())? as u32;
+    if items == 0 {
+        items = 1;
+    }
+    if items > 1024 {
+        return Err(());
+    }
+
+    if cls >= 0 && cls <= 3 {
+        let mode = safe_read32s(d).map_err(|_| ())? as u32;
+        let rows = safe_read32s(d + 0x14).map_err(|_| ())? as u32;
+        let cols = safe_read32s(d + 0x18).map_err(|_| ())? as u32;
+        if mode < 1 || mode > 3 {
+            return Ok(APPLY_E_FAIL);
+        }
+        if rows > 64 || cols > 64 {
+            return Err(());
+        }
+
+        // Sticky clamp state (the guest's spilled locals, set once per call).
+        let mut regs = (rows >> 2) + ((rows & 3 != 0) as u32);
+        let mut elems = rows;
+        let mut n = rows;
+
+        for _ in 0..items {
+            if safe_read32s(budget).map_err(|_| ())? == 0 {
+                break;
+            }
+            let src_base = safe_read32s(src_cur).map_err(|_| ())?;
+            for j in 0..cols as i32 {
+                let rem = safe_read32s(budget).map_err(|_| ())? as u32;
+                if rem == 0 {
+                    break;
+                }
+                let (count, dst_step, budget_step) = match layout {
+                    ApplyLayout::Register => {
+                        if rem < regs {
+                            elems = rem * 4;
+                            regs = rem;
+                        }
+                        (elems, regs * 16, regs)
+                    },
+                    ApplyLayout::Packed => {
+                        if rem < n {
+                            n = rem;
+                        }
+                        (n, n * 4, n)
+                    },
+                };
+                let dst_base = safe_read32s(dst_cur).map_err(|_| ())?;
+                for e in 0..count as i32 {
+                    let s = src_base + (j + e * cols as i32) * 4;
+                    let dst = dst_base + e * 4;
+                    let sv = safe_read32s(s).map_err(|_| ())?;
+                    let out = match family {
+                        ApplyFamily::Int => match mode {
+                            1 => ((sv as f64) as f32).to_bits() as i32,        // FILD i32 → FSTP f32
+                            2 => ((sv as u32 as f64) as f32).to_bits() as i32, // u32 → f32 (FADD 2^32)
+                            _ => ((f32::from_bits(sv as u32) as f64) as f32).to_bits() as i32, // FLD/FSTP
+                        },
+                        ApplyFamily::Float => match mode {
+                            3 => ftol_low32(f32::from_bits(sv as u32) as f64) as i32, // _ftol
+                            _ => sv,                                                  // MOV copy
+                        },
+                    };
+                    safe_write32(dst, out).map_err(|_| ())?;
+                }
+                safe_write32(dst_cur, dst_base.wrapping_add(dst_step as i32)).map_err(|_| ())?;
+                safe_write32(budget, (rem - budget_step) as i32).map_err(|_| ())?;
+            }
+            safe_write32(
+                src_cur,
+                src_base.wrapping_add((cols * rows * 4) as i32),
+            ).map_err(|_| ())?;
+        }
+        safe_write32(desc_cur, d.wrapping_add(0x1c)).map_err(|_| ())?;
+        return Ok(0);
+    }
+
+    if cls == 5 {
+        let children = safe_read32s(d + 0x14).map_err(|_| ())? as u32;
+        if children > 64 {
+            return Err(());
+        }
+        safe_write32(desc_cur, d.wrapping_add(0x18)).map_err(|_| ())?;
+        let mut ret = 0i32;
+        for _ in 0..items {
+            if safe_read32s(budget).map_err(|_| ())? == 0 {
+                return Ok(ret);
+            }
+            safe_write32(desc_cur, d.wrapping_add(0x18)).map_err(|_| ())?;
+            for _ in 0..children {
+                if safe_read32s(budget).map_err(|_| ())? == 0 {
+                    break;
+                }
+                // FUN_005cad01's container recurses into the REGISTER-layout
+                // float walk (FUN_005c8303); the other two into themselves.
+                ret = match layout {
+                    ApplyLayout::Packed => eagl_apply_walk(
+                        ApplyFamily::Float, ApplyLayout::Register,
+                        desc_cur, src_cur, dst_cur, budget, depth + 1)?,
+                    ApplyLayout::Register => eagl_apply_walk(
+                        family, layout, desc_cur, src_cur, dst_cur, budget, depth + 1)?,
+                };
+                if ret < 0 {
+                    return Ok(ret);
+                }
+            }
+        }
+        return Ok(ret);
+    }
+
+    Ok(APPLY_E_FAIL)
 }
 
 // --- _CI* intrinsics: read ST(0)/ST(1), operate, write result back ---

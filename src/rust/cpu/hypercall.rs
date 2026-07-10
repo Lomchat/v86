@@ -354,6 +354,17 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         // Uncontended mutex fast paths (see mutex mirror table @ OFF_HC_MUTEX_MIRROR_PTR).
         80 => handle_release_mutex(),
         81 => handle_wait_for_single_object(),
+
+        // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels
+        //    (plan/inner-loop-hle.md), kept in a distinct range from the
+        //    conventional WinAPI/CRT tiers (1..=127) so the category is obvious
+        //    from the dispatch byte alone. handler_id is a u8, so 128 is the
+        //    inner-loop base. On any guard miss a handler returns false → the JS
+        //    kernel (shadow-validated fallback) handles the call. ──
+        // 128 = EAGL shader-constant converter (FUN_005cbd17): ~thousands of
+        // calls/frame at max settings; the JS tier's per-call OUT round-trip was
+        // a net regression there, so this MUST live in WASM.
+        128 => handle_eagl_shader_const_convert(),
         _ => false,
     };
 
@@ -835,6 +846,78 @@ unsafe fn handle_ftol() -> bool {
     let v = val as i64; // Rust float->int `as` truncates toward zero and saturates on overflow
     write_reg32(EAX, v as i32);          // low 32
     write_reg32(EDX, (v >> 32) as i32);  // high 32
+    true
+}
+
+/// CRT `_ftol` truncation, EAX (low 32 bits of the i64) only — the guest's
+/// mode-1/2 loops consume only EAX. NaN / |x| >= 2^63 → FPU integer-indefinite
+/// (0x8000000000000000), whose low 32 bits are 0. Rust `as i64` saturates
+/// (wrong for the guest), so the out-of-range cases are handled explicitly.
+#[inline(always)]
+fn ftol_low32(x: f64) -> u32 {
+    if !x.is_finite() || x >= 9223372036854775808.0 || x < -9223372036854775808.0 {
+        return 0;
+    }
+    (x as i64) as u32
+}
+
+/// handler_id 128 — EAGL shader-constant converter (guest FUN_005cbd17, stdcall
+/// ret 0x10). Semantically identical to the JS kernel in
+/// `hle-lib/libs/eagl/descriptor.ts` (RE-verified, unit-tested), executed
+/// entirely in WASM so the ~thousands-of-calls/frame path pays no OUT→JS
+/// round-trip. Any structural doubt (bad dims, unmapped memory) returns false →
+/// the guest OUT falls through to the JS kernel (shadow-validated fallback).
+///
+///   u32 convert(desc*, dst*, src*, count)   [esp+4, +8, +12, +16]
+///   mode=u32[desc], rows=u32[desc+0x14], cols=u32[desc+0x18]
+///   r=min(rows,4) c=min(cols,4)
+///   src cell f32/u32 @ src + i*0x40 + rr*0x10 + cc*4  (fixed 4x4 staging)
+///   dst cell u32     @ dst + i*rows*cols*4 + rr*cols*4 + cc*4  (packed)
+///   mode 1: f32→bool(ftol!=0)  2: f32→int(ftol)  3: u32 copy
+///   unknown mode → EAX=0x8876086C (D3DERR_INVALIDCALL), no writes
+unsafe fn handle_eagl_shader_const_convert() -> bool {
+    let esp = read_reg32(ESP);
+    let desc = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
+    let dst = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
+    let src = match safe_read32s(esp + 12) { Ok(v) => v, Err(_) => return false };
+    let count = match safe_read32s(esp + 16) { Ok(v) => v as u32, Err(_) => return false };
+
+    let mode = match safe_read32s(desc) { Ok(v) => v as u32, Err(_) => return false };
+    let rows = match safe_read32s(desc + 0x14) { Ok(v) => v as u32, Err(_) => return false };
+    let cols = match safe_read32s(desc + 0x18) { Ok(v) => v as u32, Err(_) => return false };
+
+    if mode < 1 || mode > 3 {
+        write_reg32(EAX, 0x8876086Cu32 as i32);
+        return true;
+    }
+    // Same sane envelope as the JS guard — beyond it, defer to the guest.
+    if rows > 16 || cols > 16 || count > 4096 {
+        return false;
+    }
+
+    let r = rows.min(4);
+    let c = cols.min(4);
+    let dst_item_stride = (rows * cols * 4) as i32;
+    let dst_row_stride = (cols * 4) as i32;
+
+    for i in 0..count as i32 {
+        let src_item = src + i * 0x40;
+        let dst_item = dst + i * dst_item_stride;
+        for rr in 0..r as i32 {
+            let s = src_item + rr * 0x10;
+            let d = dst_item + rr * dst_row_stride;
+            for cc in 0..c as i32 {
+                let sv = match safe_read32s(s + cc * 4) { Ok(v) => v, Err(_) => return false };
+                let out = match mode {
+                    3 => sv,
+                    2 => ftol_low32(f32::from_bits(sv as u32) as f64) as i32,
+                    _ => if ftol_low32(f32::from_bits(sv as u32) as f64) != 0 { 1 } else { 0 },
+                };
+                if safe_write32(d + cc * 4, out).is_err() { return false; }
+            }
+        }
+    }
+    write_reg32(EAX, 0);
     true
 }
 

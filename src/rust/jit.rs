@@ -119,6 +119,13 @@ pub fn ret_cache_invalidate_all() {
     }
 }
 
+// Count of double-frees the release-safe guard in free_wasm_table_index absorbed.
+// Nonzero means a free-discipline bug survives somewhere — investigate, don't shrug.
+static mut WASM_TABLE_INDEX_DOUBLE_FREE_SKIPPED: u32 = 0;
+
+#[no_mangle]
+pub fn jit_get_double_free_skipped() -> u32 { unsafe { WASM_TABLE_INDEX_DOUBLE_FREE_SKIPPED } }
+
 // B3 hotness tiering: a module whose RE-ENTRY count (bumped per cycle_internal entry —
 // the cheapest per-module execution proxy that needs no codegen) crosses the threshold
 // gets its pages marked tier-2 and is freed; the ordinary hotness path recompiles it,
@@ -881,7 +888,10 @@ pub const BRTABLE_CUTOFF: usize = 10;
 // needs to be synced to const.js
 pub const WASM_TABLE_SIZE: u32 = 900;
 
-pub const CHECK_JIT_STATE_INVARIANTS: bool = false;
+// Crash-hunt 2026-07-10: light the invariant checks up in debug builds — the
+// retail-NFSU corruption class (silent ExitProcess via #PF on garbage state)
+// needs the free/publish discipline asserted loudly, not assumed.
+pub const CHECK_JIT_STATE_INVARIANTS: bool = cfg!(debug_assertions);
 
 const MAX_INSTRUCTION_LENGTH: u32 = 16;
 
@@ -3853,6 +3863,19 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
         }
     }
 
+    // Release-safe double-free guard (root-caused 2026-07-10, see
+    // free_wasm_module_forest): a second push would hand the SAME table slot to
+    // two future modules — silent cross-module dispatch corruption. The debug
+    // assert above screams first; release skips loudly and keeps the state sane.
+    if ctx.wasm_table_index_free_list.contains(&wasm_table_index) {
+        unsafe { WASM_TABLE_INDEX_DOUBLE_FREE_SKIPPED += 1 };
+        dbg_log!(
+            "BUG: double-free of wasm table index {} skipped",
+            wasm_table_index.to_u16()
+        );
+        return;
+    }
+
     ctx.wasm_table_index_free_list.push(wasm_table_index);
 
     // This is the ONLY place a table slot is nulled — invalidate the B1b ret-target
@@ -3918,9 +3941,24 @@ fn free_wasm_module(ctx: &mut JitState, wasm_table_index: WasmTableIndex) -> Vec
 }
 
 fn free_wasm_module_tree(ctx: &mut JitState, root: WasmTableIndex) {
+    free_wasm_module_forest(ctx, vec![root]);
+}
+
+/// Free a SET of module roots under ONE `seen` guard. The roots of a dirtied
+/// page (primary + its captured hidden list) can reach each other: a sibling
+/// page sharing the primary carries the same hidden index in its own list, so
+/// the primary's tree walk already frees it. Walking each root with a fresh
+/// `seen` set (the pre-2026-07-10 shape) double-freed such shared indices —
+/// the free list then held the index TWICE, two later modules were handed the
+/// SAME wasm table slot, and dispatch_meta of the first pointed into the
+/// second: cross-module dispatch = the retail-NFSU silent-ExitProcess class
+/// (garbage-register #PF / wild EIP into data / stale brtable traps).
+/// Root-caused live 2026-07-10: debug assert at free_wasm_table_index fired
+/// under jit_clear_cache → jit_dirty_page_ctx → free_wasm_module_tree.
+fn free_wasm_module_forest(ctx: &mut JitState, roots: Vec<WasmTableIndex>) {
     // Hidden entries cannot be promoted; free them with the removed primary.
     let mut seen = HashSet::new();
-    let mut stack = vec![root];
+    let mut stack = roots;
     while let Some(index) = stack.pop() {
         if !seen.insert(index) {
             continue;
@@ -3944,10 +3982,12 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
         profiler::stat_increment(stat::INVALIDATE_PAGE_HAD_CODE);
         did_have_code = true;
 
-        free_wasm_module_tree(ctx, wasm_table_index);
-        for wasm_table_index in hidden_wasm_table_indices {
-            free_wasm_module_tree(ctx, wasm_table_index);
-        }
+        // ONE forest walk for primary + hidden: the captured hidden list and the
+        // primary's tree overlap (see free_wasm_module_forest) — separate walks
+        // double-free the shared indices.
+        let mut roots = hidden_wasm_table_indices;
+        roots.push(wasm_table_index);
+        free_wasm_module_forest(ctx, roots);
     }
 
     match ctx.entry_points.remove(&page) {

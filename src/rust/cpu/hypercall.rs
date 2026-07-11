@@ -50,12 +50,14 @@
 //!   0x1C4C: hc_event_starvation_limit   u32 — max consecutive before JS fallthrough
 //!   0x1C50: hc_mutex_mirror_ptr         u32 — guest addr of mutex mirror table (2048×u32)
 //!     Mutex mirror word: MUX_VALID | MUX_HAS_WAITERS | MUX_ABANDONED | owner:16 | rec:8
+//!   0x1C54: hc_eagl_token_cfg_ptr       u32 — guest addr of the EAGL token-dispatch
+//!     config block for handler 132 (0 = disabled); layout in handle_eagl_token_dispatch
 
 use std::ptr::{addr_of, addr_of_mut};
 
 use crate::cpu::memory;
 use crate::cpu::cpu::{
-    read_reg32, safe_read32s, safe_write32, write_reg32, EAX, EDX, ESP,
+    read_reg32, safe_read32s, safe_write32, write_reg32, EAX, ECX, EDX, ESP,
 };
 use crate::cpu::hypercall_rtti::{rt_dynamic_cast, RtDynamicCastResult};
 use crate::cpu::fpu::{fpu_get_st0, fpu_get_sti, fpu_pop, fpu_push, fpu_write_st};
@@ -145,6 +147,10 @@ unsafe fn slab_wr(ctl: u32, rel: u32, value: u32) {
 const OFF_HC_EVENT_STARVATION_COUNTER: usize = 0x1C48;
 const OFF_HC_EVENT_STARVATION_LIMIT: usize = 0x1C4C;
 const OFF_HC_MUTEX_MIRROR_PTR: usize = 0x1C50;
+/// Guest address of the EAGL token-dispatch config block (0 = handler 132
+/// disabled). Written by JS (hle-lib libs/eagl) once the d3d9 WBUF ring +
+/// setter shadow tables exist. Layout: see handle_eagl_token_dispatch.
+const OFF_HC_EAGL_TOKEN_CFG_PTR: usize = 0x1C54;
 
 const KERNEL_HANDLE_BASE: u32 = 0x30000;
 const EVENT_TABLE_SLOTS: u32 = 2048;
@@ -371,6 +377,11 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         129 => handle_eagl_apply(ApplyFamily::Int, ApplyLayout::Register),
         130 => handle_eagl_apply(ApplyFamily::Float, ApplyLayout::Register),
         131 => handle_eagl_apply(ApplyFamily::Float, ApplyLayout::Packed),
+        // 132 = EAGL→D3D9 state-token dispatcher (FUN_005c97cb), hot classes
+        // 1/2/8 only — a guest-side filter trampoline routes every other token
+        // class to the original function, so this handler never sees them.
+        // See plan/eagl-state-commit-hle-rfc.md.
+        132 => handle_eagl_token_dispatch(),
         _ => false,
     };
 
@@ -1120,6 +1131,176 @@ unsafe fn eagl_apply_walk(
     }
 
     Ok(APPLY_E_FAIL)
+}
+
+/// handler_id 132 — EAGL→D3D9 state-token dispatcher, hot classes only
+/// (plan/eagl-state-commit-hle-rfc.md; guest FUN_005c97cb, __thiscall RET 8:
+/// ECX = EAGL device ctx, [esp+4] = token node, [esp+8] = stage-or-index).
+///
+/// A guest-side filter trampoline (hle-lib libs/eagl/token-dispatch.ts)
+/// classifies the token BEFORE the OUT and routes anything that is not
+/// class 1 (SetRenderState), 2 (SetTextureStageState) or 8 (SetSamplerState)
+/// to the original function — so this handler only replicates those three
+/// case bodies: resolve node/stage exactly like the original, then perform
+/// the same virtual call the guest would make, short-circuiting the KNOWN
+/// callee shape (our own WBUF setter stub `B8 funcId …` + value-shadow /
+/// ring-append trampoline). Anything off-script — vtable not pointing at the
+/// expected stub, ring near-full (the trampoline's .ovf OUT path), unmapped
+/// reads — returns false and the JS tier completes the call.
+///
+/// Config block (guest RAM, written by libs/eagl once the d3d9 WBUF ring and
+/// shadow tables exist; pointer parked at OFF_HC_EAGL_TOKEN_CFG_PTR):
+///   +0x00 u32 version (must be 1)
+///   +0x04 u32 tokenTableBase   (EAGL token descriptor table, stride 0x1c)
+///   +0x08 u32 ringCtrlAddr     (WBUF head u32; +4 overflow)
+///   +0x0C u32 ringDataBase
+///   +0x10 u32 ringCapacity
+///   +0x14 u32 ownerGlobalAddr  (setter-shadow owner gate; 0 = no gate)
+///   +0x18 u32 srsFuncId        (SetRenderState stub functionId)
+///   +0x1C u32 srsShadowBase    (0 = plain ring, no shadow)
+///   +0x20 u32 srsSkipCtrAddr
+///   +0x24 u32 sampFuncId       (SetSamplerState)
+///   +0x28 u32 sampShadowBase
+///   +0x2C u32 sampSkipCtrAddr
+///   +0x30 u32 tssFuncId        (SetTextureStageState — plain ring)
+unsafe fn handle_eagl_token_dispatch() -> bool {
+    let cfg = *(hp_ptr().add(OFF_HC_EAGL_TOKEN_CFG_PTR) as *const u32) as i32;
+    if cfg == 0 {
+        return false;
+    }
+    let ver = match safe_read32s(cfg) { Ok(v) => v, Err(_) => return false };
+    if ver != 1 {
+        return false;
+    }
+
+    let esp = read_reg32(ESP);
+    let this_ctx = read_reg32(ECX);
+    let node = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
+    let mut stage = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
+    if node == 0 {
+        return false;
+    }
+    // Original entry semantics: param_3 == -1 → param_2[1] (the RAW node,
+    // before alias resolution).
+    if stage == -1 {
+        stage = match safe_read32s(node + 4) { Ok(v) => v, Err(_) => return false };
+    }
+    // *node == -1 → the aliased/compiled node at node[0x19].
+    let mut n = node;
+    let mut tok = match safe_read32s(n) { Ok(v) => v, Err(_) => return false };
+    if tok == -1 {
+        n = match safe_read32s(node + 0x64) { Ok(v) => v, Err(_) => return false };
+        tok = match safe_read32s(n) { Ok(v) => v, Err(_) => return false };
+    }
+
+    let token_table = match safe_read32s(cfg + 0x04) { Ok(v) => v, Err(_) => return false };
+    let desc = match safe_read32s(token_table.wrapping_add(tok.wrapping_mul(0x1c))) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let class = desc >> 24;
+    let d3d_enum = (desc & 0xff_ffff) as i32;
+    // Value = node[0x1a] for all three classes.
+    let value = match safe_read32s(n + 0x68) { Ok(v) => v, Err(_) => return false };
+    // dev = *(this + 8); vtable = *dev.
+    let dev = match safe_read32s(this_ctx + 8) { Ok(v) => v, Err(_) => return false };
+    let vt = match safe_read32s(dev) { Ok(v) => v, Err(_) => return false };
+
+    // (vtable offset, expected funcId cfg slot, shadow cfg slots, shadow slot key, argc)
+    let (vt_off, fid_off, shadow_off, skip_off, slot, argc): (i32, i32, i32, i32, i32, i32) =
+        match class {
+            1 => (0xe4, 0x18, 0x1c, 0x20, if (d3d_enum as u32) < 256 { d3d_enum } else { -1 }, 3),
+            2 => (0x10c, 0x30, 0, 0, -1, 4),
+            8 => (
+                0x114,
+                0x24,
+                0x28,
+                0x2c,
+                if (stage as u32) < 16 && (d3d_enum as u32) < 16 { (stage << 4) | d3d_enum } else { -1 },
+                4,
+            ),
+            _ => return false,
+        };
+
+    // Perform the virtual call — but only for the KNOWN callee shape: our WBUF
+    // setter stub starts `B8 <funcId:u32>`. Anything else (proxied device,
+    // unpatched setter) → the JS tier / original.
+    let target = match safe_read32s(vt + vt_off) { Ok(v) => v, Err(_) => return false };
+    if match hc_safe_read8(target) { Ok(v) => v, Err(_) => return false } != 0xB8 {
+        return false;
+    }
+    let fid = match safe_read32s(target + 1) { Ok(v) => v, Err(_) => return false };
+    let expect_fid = match safe_read32s(cfg + fid_off) { Ok(v) => v, Err(_) => return false };
+    if fid != expect_fid || fid == 0 {
+        return false;
+    }
+
+    // Ring capacity gate FIRST (before any shadow mutation): the trampoline's
+    // .ovf path OUT-traps to the real setter thunk (drain-first) — replicated
+    // by returning false so the JS tier (which runs after the standard
+    // pre-dispatch drain) completes the call.
+    let ring_ctrl = match safe_read32s(cfg + 0x08) { Ok(v) => v, Err(_) => return false };
+    let ring_base = match safe_read32s(cfg + 0x0c) { Ok(v) => v, Err(_) => return false };
+    let capacity = match safe_read32s(cfg + 0x10) { Ok(v) => v, Err(_) => return false };
+    let head = match safe_read32s(ring_ctrl) { Ok(v) => v, Err(_) => return false };
+    if head < 0 || head >= capacity - 36 {
+        return false;
+    }
+
+    // Value shadow (same fold + owner gate as writeShadowTrampoline). Decide
+    // the skip HERE, but defer the slot update until the ring-entry bytes are
+    // written: a false-return between shadow-update and head-bump would lose
+    // the set (JS retry would see value==shadow and skip a state change the
+    // device never received). Entry bytes below the un-bumped head are
+    // invisible, so this order makes every abort point safe.
+    let mut shadow_slot_addr = 0i32;
+    if shadow_off != 0 && slot >= 0 {
+        let shadow_base = match safe_read32s(cfg + shadow_off) { Ok(v) => v, Err(_) => return false };
+        if shadow_base != 0 {
+            let owner_global = match safe_read32s(cfg + 0x14) { Ok(v) => v, Err(_) => return false };
+            if owner_global != 0 {
+                let owner = match safe_read32s(owner_global) { Ok(v) => v, Err(_) => return false };
+                if owner == dev {
+                    let slot_addr = shadow_base + slot * 4;
+                    let cur = match safe_read32s(slot_addr) { Ok(v) => v, Err(_) => return false };
+                    if cur == value {
+                        // Redundant set: bump the skip counter, EAX = D3D_OK.
+                        let skip_addr = match safe_read32s(cfg + skip_off) { Ok(v) => v, Err(_) => return false };
+                        if skip_addr != 0 {
+                            let c = match safe_read32s(skip_addr) { Ok(v) => v, Err(_) => return false };
+                            if safe_write32(skip_addr, c.wrapping_add(1)).is_err() { return false; }
+                        }
+                        write_reg32(EAX, 0);
+                        return true;
+                    }
+                    shadow_slot_addr = slot_addr;
+                }
+            }
+        }
+    }
+
+    // Ring append: [funcId][dev][(stage)][enum][value], head += stride.
+    let entry = ring_base + head;
+    if safe_write32(entry, fid).is_err() { return false; }
+    if safe_write32(entry + 4, dev).is_err() { return false; }
+    let ok = if argc == 3 {
+        safe_write32(entry + 8, d3d_enum).is_ok() && safe_write32(entry + 12, value).is_ok()
+    } else {
+        safe_write32(entry + 8, stage).is_ok()
+            && safe_write32(entry + 12, d3d_enum).is_ok()
+            && safe_write32(entry + 16, value).is_ok()
+    };
+    if !ok {
+        return false;
+    }
+    if shadow_slot_addr != 0 {
+        if safe_write32(shadow_slot_addr, value).is_err() { return false; }
+    }
+    if safe_write32(ring_ctrl, head + (argc + 1) * 4).is_err() {
+        return false;
+    }
+    write_reg32(EAX, 0);
+    true
 }
 
 // --- _CI* intrinsics: read ST(0)/ST(1), operate, write result back ---

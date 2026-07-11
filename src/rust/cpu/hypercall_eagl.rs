@@ -4,7 +4,9 @@
 //!
 //!   128       shader-constant converter (guest FUN_005cbd17)
 //!   129..=131 shader-parameter APPLY converter family (FUN_005c85c1/8303/ad01)
-//!   132       state-token dispatcher, hot classes 1/2/8 (FUN_005c97cb)
+//!   132       state-token dispatcher (FUN_005c97cb): classes 1/2/8 single-pass
+//!             + class-6 shader batches (bind/constants/sub-pass recursion)
+//!             via a scan-then-commit walk
 //!
 //! JS twins: src/worker/core/hle-lib/libs/eagl/ (kernels are the validated
 //! fallbacks; this module is the production tier). Guest-side plumbing
@@ -13,7 +15,7 @@
 use std::ptr::{addr_of, addr_of_mut};
 
 use crate::cpu::cpu::{
-    read_reg32, safe_read32s, safe_write32, write_reg32, EAX, ECX, ESP,
+    read_reg32, safe_read16, safe_read32s, safe_write32, write_reg32, EAX, ECX, ESP,
 };
 use crate::cpu::hypercall::{hc_safe_read8, hp_ptr, OFF_HC_EAGL_TOKEN_CFG_PTR};
 
@@ -31,8 +33,9 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         129 => handle_eagl_apply_reg_int(),
         130 => handle_eagl_apply_reg_float(),
         131 => handle_eagl_apply_packed(),
-        // 132 = state-token dispatcher (FUN_005c97cb), hot classes 1/2/8 only —
-        // the guest filter routes other classes to the original.
+        // 132 = state-token dispatcher (FUN_005c97cb): classes 1/2/8 plus
+        // class-6 shader batches — the guest filter routes everything else
+        // (and class-6 record mode) to the original.
         132 => handle_eagl_token_dispatch(),
         _ => false,
     }
@@ -315,24 +318,40 @@ unsafe fn eagl_apply_walk(
     Ok(APPLY_E_FAIL)
 }
 
-/// handler_id 132 — EAGL→D3D9 state-token dispatcher, hot classes only
-/// (plan/eagl-state-commit-hle-rfc.md; guest FUN_005c97cb, __thiscall RET 8:
-/// ECX = EAGL device ctx, [esp+4] = token node, [esp+8] = stage-or-index).
+/// handler_id 132 — EAGL→D3D9 state-token dispatcher (guest FUN_005c97cb,
+/// __thiscall RET 8: ECX = EAGL device ctx, [esp+4] = token node, [esp+8] =
+/// stage-or-index). plan/eagl-state-commit-hle-rfc.md.
 ///
 /// A guest-side filter trampoline (hle-lib libs/eagl/token-dispatch.ts)
-/// classifies the token BEFORE the OUT and routes anything that is not
-/// class 1 (SetRenderState), 2 (SetTextureStageState) or 8 (SetSamplerState)
-/// to the original function — so this handler only replicates those three
-/// case bodies: resolve node/stage exactly like the original, then perform
-/// the same virtual call the guest would make, short-circuiting the KNOWN
-/// callee shape (our own WBUF setter stub `B8 funcId …` + value-shadow /
-/// ring-append trampoline). Anything off-script — vtable not pointing at the
-/// expected stub, ring near-full (the trampoline's .ovf OUT path), unmapped
-/// reads — returns false and the JS tier completes the call.
+/// classifies the token BEFORE the OUT and routes only class 1
+/// (SetRenderState), 2 (SetTextureStageState), 8 (SetSamplerState) and
+/// class 6 outside record mode (shader programs, mode != 2) here; everything
+/// else runs the original at native speed. Two coverage tiers:
+///
+///  - classes 1/2/8: single-pass hot path (~1M calls/s) — resolve node/stage
+///    exactly like the original, then perform the same virtual call the guest
+///    would make, short-circuiting the KNOWN callee shape (our own WBUF
+///    setter stub `B8 funcId …` + value-shadow / ring-append trampoline).
+///  - class 6 — the BATCH boundary: one crossing handles SetFVF / direct
+///    shader-constant uploads / the vs/ps bind path with its default-constant
+///    walk AND the type-3 sub-pass recursion (0xac stride, ~4.4 sub-tokens
+///    avg), dispatching sub-tokens of classes {1,2,8,6} natively. Runs as
+///    SCAN-then-COMMIT: the scan pass performs every read, bound check and
+///    stub-shape check with zero side effects (any doubt → decline with the
+///    ring untouched); the commit pass re-walks and writes. No guest code
+///    runs between the passes, so the commit cannot fault where the scan did
+///    not, and every write lands in our own RW structures (ring, shadows).
+///
+/// Declines (false → JS tier, which completes via the sync original): vtable
+/// not pointing at the expected stub, ring near-full, unmapped reads, mode 2
+/// (state-block record — must go through the real BeginStateBlock path),
+/// integer/bool shader constants (no WBUF registration), classes
+/// 3/4/5/7/9/10 anywhere in a batch, nested type-3 recursion, bound
+/// violations.
 ///
 /// Config block (guest RAM, written by libs/eagl once the d3d9 WBUF ring and
 /// shadow tables exist; pointer parked at OFF_HC_EAGL_TOKEN_CFG_PTR):
-///   +0x00 u32 version (must be 1)
+///   +0x00 u32 version (must be 2)
 ///   +0x04 u32 tokenTableBase   (EAGL token descriptor table, stride 0x1c)
 ///   +0x08 u32 ringCtrlAddr     (WBUF head u32; +4 overflow)
 ///   +0x0C u32 ringDataBase
@@ -345,11 +364,18 @@ unsafe fn eagl_apply_walk(
 ///   +0x28 u32 sampShadowBase
 ///   +0x2C u32 sampSkipCtrAddr
 ///   +0x30 u32 tssFuncId        (SetTextureStageState — plain ring)
+///   +0x34 u32 enabledFlag      (guest-filter gate byte — not read here)
 ///   +0x38 u32 generation       (bumped by JS on every re-arm — cache key)
+///   +0x3C u32 fvfFuncId        (SetFVF — plain ring, 2 args)
+///   +0x40 u32 svsFuncId        (SetVertexShader — plain ring, 2 args)
+///   +0x44 u32 spsFuncId        (SetPixelShader — plain ring, 2 args)
+///   +0x48 u32 vscfFuncId       (SetVertexShaderConstantF — payload entry)
+///   +0x4C u32 pscfFuncId       (SetPixelShaderConstantF — payload entry)
+///   +0x50 u32 texFuncId        (SetTexture — class-5 sub-tokens, 3 args)
 ///
 /// The block is IMMUTABLE while armed (JS writes all fields, then generation,
-/// then version=1, then publishes the page pointer), so the ~10 config reads
-/// are cached in statics keyed on (ptr, generation) — measured at ~1M calls/s
+/// then version, then publishes the page pointer), so the config reads are
+/// cached in statics keyed on (ptr, generation) — measured at ~1M calls/s
 /// the uncached reads were half the handler's 200 ns self-time.
 struct EaglTokenCfg {
     ptr: i32,
@@ -366,11 +392,19 @@ struct EaglTokenCfg {
     samp_shadow: i32,
     samp_skip: i32,
     tss_fid: i32,
+    fvf_fid: i32,
+    svs_fid: i32,
+    sps_fid: i32,
+    vscf_fid: i32,
+    pscf_fid: i32,
+    tex_fid: i32,
 }
 static mut EAGL_TOKEN_CFG: EaglTokenCfg = EaglTokenCfg {
     ptr: 0, generation: 0, token_table: 0, ring_ctrl: 0, ring_base: 0, capacity: 0,
     owner_global: 0, srs_fid: 0, srs_shadow: 0, srs_skip: 0,
     samp_fid: 0, samp_shadow: 0, samp_skip: 0, tss_fid: 0,
+    fvf_fid: 0, svs_fid: 0, sps_fid: 0, vscf_fid: 0, pscf_fid: 0,
+    tex_fid: 0,
 };
 
 unsafe fn eagl_token_cfg_refresh(cfg: i32) -> Result<(), ()> {
@@ -388,6 +422,12 @@ unsafe fn eagl_token_cfg_refresh(cfg: i32) -> Result<(), ()> {
     c.samp_shadow = r(0x28)?;
     c.samp_skip = r(0x2c)?;
     c.tss_fid = r(0x30)?;
+    c.fvf_fid = r(0x3c)?;
+    c.svs_fid = r(0x40)?;
+    c.sps_fid = r(0x44)?;
+    c.vscf_fid = r(0x48)?;
+    c.pscf_fid = r(0x4c)?;
+    c.tex_fid = r(0x50)?;
     c.generation = r(0x38)?;
     c.ptr = cfg;
     Ok(())
@@ -399,10 +439,10 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
         return false;
     }
     let ver = match safe_read32s(cfg) { Ok(v) => v, Err(_) => return false };
-    if ver != 1 {
+    if ver != 2 {
         return false;
     }
-    // (ptr, generation) cache key — generation is one read instead of ten.
+    // (ptr, generation) cache key — generation is one read instead of ~16.
     let generation = match safe_read32s(cfg + 0x38) { Ok(v) => v, Err(_) => return false };
     {
         let c = &*addr_of!(EAGL_TOKEN_CFG);
@@ -439,12 +479,24 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
         Err(_) => return false,
     };
     let class = desc >> 24;
-    let d3d_enum = (desc & 0xff_ffff) as i32;
-    // Value = node[0x1a] for all three classes.
-    let value = match safe_read32s(n + 0x68) { Ok(v) => v, Err(_) => return false };
     // dev = *(this + 8); vtable = *dev.
     let dev = match safe_read32s(this_ctx + 8) { Ok(v) => v, Err(_) => return false };
     let vt = match safe_read32s(dev) { Ok(v) => v, Err(_) => return false };
+
+    match class {
+        1 | 2 | 8 => eagl_dispatch_simple(c, dev, vt, class, desc, stage, n),
+        6 => eagl_dispatch_class6_batch(c, this_ctx, dev, vt, node, stage),
+        _ => false,
+    }
+}
+
+/// Single-pass hot path for classes 1/2/8 (~1M calls/s — every read counts).
+unsafe fn eagl_dispatch_simple(
+    c: &EaglTokenCfg, dev: i32, vt: i32, class: u32, desc: u32, stage: i32, n: i32,
+) -> bool {
+    let d3d_enum = (desc & 0xff_ffff) as i32;
+    // Value = node[0x1a] for all three classes.
+    let value = match safe_read32s(n + 0x68) { Ok(v) => v, Err(_) => return false };
 
     // (vtable offset, expected funcId, shadow table/skip addr, shadow slot key, argc)
     let (vt_off, expect_fid, shadow_base, skip_addr, slot, argc): (i32, i32, i32, i32, i32, i32) =
@@ -461,14 +513,7 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
     // Perform the virtual call — but only for the KNOWN callee shape: our WBUF
     // setter stub starts `B8 <funcId:u32>`. Anything else (proxied device,
     // unpatched setter) → the JS tier / original.
-    let target = match safe_read32s(vt + vt_off) { Ok(v) => v, Err(_) => return false };
-    if match hc_safe_read8(target) { Ok(v) => v, Err(_) => return false } != 0xB8 {
-        return false;
-    }
-    let fid = match safe_read32s(target + 1) { Ok(v) => v, Err(_) => return false };
-    if fid != expect_fid || fid == 0 {
-        return false;
-    }
+    let fid = match eagl_stub_fid(vt, vt_off, expect_fid) { Ok(v) => v, Err(_) => return false };
 
     // Ring capacity gate FIRST (before any shadow mutation): the trampoline's
     // .ovf path OUT-traps to the real setter thunk (drain-first) — replicated
@@ -527,5 +572,445 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
         return false;
     }
     write_reg32(EAX, 0);
+    true
+}
+
+// --- class-6 batch engine (scan-then-commit) -------------------------------
+
+/// D3D9 device vtable offsets used by the batch paths (standard
+/// IDirect3DDevice9 layout, RE-verified against the guest jump table).
+const VT_SET_TEXTURE: i32 = 0x104;
+const VT_SET_FVF: i32 = 0x164;
+const VT_SET_VERTEX_SHADER: i32 = 0x170;
+const VT_SET_VS_CONST_F: i32 = 0x178;
+const VT_SET_PIXEL_SHADER: i32 = 0x1ac;
+const VT_SET_PS_CONST_F: i32 = 0x1b4;
+
+/// EAGL's abort HRESULT (-0x7fffbffb = E_FAIL) — returned by the guest when a
+/// shader record is unbound or a pixel default-constant entry has an unknown
+/// type. Guest-visible; must be replicated bit-exact.
+const EAGL_E_FAIL: i32 = 0x80004005u32 as i32;
+
+/// Ring cursor for the two-pass class-6 walk. The scan pass bumps `head`
+/// without writing (every potential append counted — shadow skips are decided
+/// only at commit, so the scan total is a safe upper bound for the room
+/// check); the commit pass writes entry bytes at `head` and then bumps.
+/// The guest-visible ring head (cfg ringCtrl) is written ONCE, after the
+/// commit walk finishes — entry bytes above the un-bumped head are invisible,
+/// so every abort point leaves a consistent ring.
+struct EaglPass {
+    commit: bool,
+    head: i32,
+}
+
+/// Resolve a device vtable slot and require the KNOWN callee shape: our WBUF
+/// setter stub `B8 <funcId:u32>` with the expected id. Err = decline.
+unsafe fn eagl_stub_fid(vt: i32, vt_off: i32, expect_fid: i32) -> Result<i32, ()> {
+    let target = safe_read32s(vt + vt_off).map_err(|_| ())?;
+    if hc_safe_read8(target).map_err(|_| ())? != 0xB8 {
+        return Err(());
+    }
+    let fid = safe_read32s(target + 1).map_err(|_| ())?;
+    if fid != expect_fid || fid == 0 {
+        return Err(());
+    }
+    Ok(fid)
+}
+
+/// Class 1/2/8 state set inside a class-6 batch (sub-pass recursion), in
+/// two-pass form: scan validates and reserves ring room; commit replicates
+/// the shadow compare/skip/update + ring append of the single-pass path.
+unsafe fn eagl_emit_state(
+    c: &EaglTokenCfg, dev: i32, vt: i32, class: u32,
+    d3d_enum: i32, stage: i32, value: i32, p: &mut EaglPass,
+) -> Result<(), ()> {
+    let (vt_off, expect_fid, shadow_base, skip_addr, slot, argc): (i32, i32, i32, i32, i32, i32) =
+        match class {
+            1 => (0xe4, c.srs_fid, c.srs_shadow, c.srs_skip,
+                  if (d3d_enum as u32) < 256 { d3d_enum } else { -1 }, 3),
+            2 => (0x10c, c.tss_fid, 0, 0, -1, 4),
+            8 => (0x114, c.samp_fid, c.samp_shadow, c.samp_skip,
+                  if (stage as u32) < 16 && (d3d_enum as u32) < 16 { (stage << 4) | d3d_enum } else { -1 },
+                  4),
+            _ => return Err(()),
+        };
+    let fid = eagl_stub_fid(vt, vt_off, expect_fid)?;
+
+    let mut shadow_slot_addr = 0i32;
+    if shadow_base != 0 && slot >= 0 && c.owner_global != 0 {
+        let owner = safe_read32s(c.owner_global).map_err(|_| ())?;
+        if owner == dev {
+            let slot_addr = shadow_base + slot * 4;
+            let cur = safe_read32s(slot_addr).map_err(|_| ())?;
+            // The skip decision is only binding at commit: earlier entries of
+            // the SAME batch may rewrite the slot between scan and commit, so
+            // the scan still reserves room for this entry (upper bound).
+            if p.commit && cur == value {
+                if skip_addr != 0 {
+                    let cnt = safe_read32s(skip_addr).map_err(|_| ())?;
+                    safe_write32(skip_addr, cnt.wrapping_add(1)).map_err(|_| ())?;
+                }
+                return Ok(());
+            }
+            shadow_slot_addr = slot_addr;
+        }
+    }
+
+    if p.commit {
+        let entry = c.ring_base + p.head;
+        safe_write32(entry, fid).map_err(|_| ())?;
+        safe_write32(entry + 4, dev).map_err(|_| ())?;
+        if argc == 3 {
+            safe_write32(entry + 8, d3d_enum).map_err(|_| ())?;
+            safe_write32(entry + 12, value).map_err(|_| ())?;
+        } else {
+            safe_write32(entry + 8, stage).map_err(|_| ())?;
+            safe_write32(entry + 12, d3d_enum).map_err(|_| ())?;
+            safe_write32(entry + 16, value).map_err(|_| ())?;
+        }
+        if shadow_slot_addr != 0 {
+            safe_write32(shadow_slot_addr, value).map_err(|_| ())?;
+        }
+    }
+    p.head += (argc + 1) * 4;
+    Ok(())
+}
+
+/// Plain 2-arg ring entry (SetFVF / SetVertexShader / SetPixelShader):
+/// [funcId][dev][value]. SetVertexShader/SetPixelShader carry the raw guest
+/// COM pointer — the drain handler resolves it, same as the trampoline path.
+unsafe fn eagl_emit_2arg(
+    c: &EaglTokenCfg, vt: i32, vt_off: i32, expect_fid: i32, dev: i32, value: i32,
+    p: &mut EaglPass,
+) -> Result<(), ()> {
+    let fid = eagl_stub_fid(vt, vt_off, expect_fid)?;
+    if p.commit {
+        let entry = c.ring_base + p.head;
+        safe_write32(entry, fid).map_err(|_| ())?;
+        safe_write32(entry + 4, dev).map_err(|_| ())?;
+        safe_write32(entry + 8, value).map_err(|_| ())?;
+    }
+    p.head += 12;
+    Ok(())
+}
+
+/// Shader-constant-F ring entry with inline payload capture:
+/// [funcId][dev][startReg][vec4Count][vec4Count×4 dwords] — same layout the
+/// shader-constant trampoline emits and getWbufEntryStride expects (count
+/// 1..=256; a zero-count call is a device no-op the guest also makes, so it
+/// is skipped rather than appended).
+unsafe fn eagl_emit_const_f(
+    c: &EaglTokenCfg, vt: i32, pix: bool, dev: i32, start_reg: i32, src: i32, cnt: i32,
+    p: &mut EaglPass,
+) -> Result<(), ()> {
+    if cnt < 0 || cnt > 256 {
+        return Err(());
+    }
+    if cnt == 0 {
+        return Ok(());
+    }
+    let (vt_off, expect_fid) = if pix {
+        (VT_SET_PS_CONST_F, c.pscf_fid)
+    } else {
+        (VT_SET_VS_CONST_F, c.vscf_fid)
+    };
+    let fid = eagl_stub_fid(vt, vt_off, expect_fid)?;
+    let bytes = cnt * 16;
+    if !p.commit {
+        // Payload readability: ≤4KB spans at most two pages — first and last
+        // dword touch both. The commit pass then reads every dword safely.
+        safe_read32s(src).map_err(|_| ())?;
+        safe_read32s(src.wrapping_add(bytes - 4)).map_err(|_| ())?;
+    } else {
+        let entry = c.ring_base + p.head;
+        safe_write32(entry, fid).map_err(|_| ())?;
+        safe_write32(entry + 4, dev).map_err(|_| ())?;
+        safe_write32(entry + 8, start_reg).map_err(|_| ())?;
+        safe_write32(entry + 12, cnt).map_err(|_| ())?;
+        for i in 0..cnt * 4 {
+            let v = safe_read32s(src.wrapping_add(i * 4)).map_err(|_| ())?;
+            safe_write32(entry + 16 + i * 4, v).map_err(|_| ())?;
+        }
+    }
+    p.head += 16 + bytes;
+    Ok(())
+}
+
+/// Full FUN_005c97cb token dispatch inside a batch (top-level class-6 call or
+/// a type-3 sub-pass recursion element). Replicates the entry semantics
+/// (stage -1 → raw node[1], *node == -1 → alias at node[0x19]), then the
+/// class switch. Ok(hr) = guest-visible result; Err = decline the WHOLE
+/// top-level call (scan pass only — the ring is untouched).
+unsafe fn eagl_dispatch_token(
+    c: &EaglTokenCfg, ctx: i32, mode: i32, dev: i32, vt: i32,
+    node: i32, stage_in: i32, depth: u32, p: &mut EaglPass,
+) -> Result<i32, ()> {
+    if node == 0 {
+        return Err(());
+    }
+    let mut stage = stage_in;
+    if stage == -1 {
+        stage = safe_read32s(node + 4).map_err(|_| ())?;
+    }
+    let mut n = node;
+    let mut tok = safe_read32s(n).map_err(|_| ())?;
+    if tok == -1 {
+        n = safe_read32s(node + 0x64).map_err(|_| ())?;
+        tok = safe_read32s(n).map_err(|_| ())?;
+    }
+    let desc = safe_read32s(c.token_table.wrapping_add(tok.wrapping_mul(0x1c)))
+        .map_err(|_| ())? as u32;
+    match desc >> 24 {
+        cls @ (1 | 2 | 8) => {
+            let value = safe_read32s(n + 0x68).map_err(|_| ())?;
+            eagl_emit_state(c, dev, vt, cls, (desc & 0xff_ffff) as i32, stage, value, p)?;
+            Ok(0)
+        },
+        5 => eagl_class5_texture(c, ctx, mode, dev, vt, n, stage, p),
+        6 => eagl_class6(c, ctx, mode, dev, vt, n, desc, stage, depth, p),
+        // Lights/material/misc: real staging-struct writes we do not
+        // replicate — decline the whole batch.
+        3 | 4 | 7 | 9 | 10 => Err(()),
+        // Original's switch default: no side effects, returns 0.
+        _ => Ok(0),
+    }
+}
+
+/// The class-6 case body (guest 0x5c9b15..): SetFVF, direct shader-constant
+/// sets, vs/ps bind + default-constant walk + type-3 recursion. Token
+/// sub-ids and their exact guest routing are transcribed from the decompile
+/// (the 0x60001xx-0x60004xx chain collapses to the two constant-F sets).
+unsafe fn eagl_class6(
+    c: &EaglTokenCfg, ctx: i32, mode: i32, dev: i32, vt: i32,
+    n: i32, desc: u32, stage: i32, depth: u32, p: &mut EaglPass,
+) -> Result<i32, ()> {
+    // Mode 2 = state-block record: every device call must go through the real
+    // BeginStateBlock path, not the ring. The guest filter already routes
+    // mode-2 calls to the original; this is the backstop.
+    if mode == 2 {
+        return Err(());
+    }
+    if desc == 0x6000008 {
+        // SetFVF — the one class-6 token that also runs in mode 1 (degraded
+        // mode forces FVF = 2 = D3DFVF_XYZ).
+        let mut value = safe_read32s(n + 0x68).map_err(|_| ())?;
+        if mode == 1 {
+            value = 2;
+        }
+        eagl_emit_2arg(c, vt, VT_SET_FVF, c.fvf_fid, dev, value, p)?;
+        return Ok(0);
+    }
+    if mode == 1 {
+        // Degraded/FFP mode defers all other shader tokens — no side effects.
+        return Ok(0);
+    }
+    match desc {
+        // Direct constant-F uploads: (dev, stage, node[0x13] = data ptr,
+        // node[0x2a] = vec4 count).
+        0x6000002 | 0x6000102 | 0x6000202 | 0x6000302 | 0x6000402 => {
+            let src = safe_read32s(n + 0x4c).map_err(|_| ())?;
+            let cnt = safe_read32s(n + 0xa8).map_err(|_| ())?;
+            eagl_emit_const_f(c, vt, false, dev, stage, src, cnt, p)?;
+            Ok(0)
+        },
+        0x6000005 | 0x6000105 | 0x6000205 | 0x6000305 | 0x6000405 => {
+            let src = safe_read32s(n + 0x4c).map_err(|_| ())?;
+            let cnt = safe_read32s(n + 0xa8).map_err(|_| ())?;
+            eagl_emit_const_f(c, vt, true, dev, stage, src, cnt, p)?;
+            Ok(0)
+        },
+        // Integer/bool constant sets: no WBUF registration for the I/B
+        // setters — the original handles these (rare) tokens.
+        0x6000003 | 0x6000004 | 0x6000006 | 0x6000007 => Err(()),
+        0x6000000 => eagl_class6_bind(c, ctx, mode, dev, vt, n, false, depth, p),
+        0x6000001 => eagl_class6_bind(c, ctx, mode, dev, vt, n, true, depth, p),
+        // Original's inner default: no side effects, returns 0.
+        _ => Ok(0),
+    }
+}
+
+/// The vs (0x6000000) / ps (0x6000001) bind path: resolve the shader resource
+/// record through the ctx handle tables, bind the program, upload its
+/// default-constant table, and (pixel only) recurse into type-3 sub-pass
+/// arrays. Transcription notes (decompile, `re decompile 0x5c97cb`):
+///   record   = *(ctx+0x24) + idx*0x1c, idx via *(ctx+0x8c)[node[3]] tables
+///   rec+0x04 = shader COM pointer (SetVertexShader/SetPixelShader arg)
+///   rec+0x0c = bound flag — 0 → return E_FAIL (before any device call)
+///   rec+0x14 = default-constant table: count @+0xc, entries @ +(*(+0x10))+6,
+///              stride 20 bytes: u16 type @-2, u16 reg @0, u16 vec4Count @+2
+///   rec+0x18 → header ptr; *(hdr+0x44) = payload block: F data at +8+reg*16
+///              (type 2); type 1 = int4, type 0 = bool — no WBUF path, decline;
+///              *(hdrPtr+0x30)[k] = type-3 sub-pass descriptor
+///   vertex walk: unknown type silently skipped; pixel walk: unknown type
+///   aborts with E_FAIL (guest LAB_005c9ab3) — both replicated exactly.
+/// mode==2 (CreateVertexDeclaration path) never reaches here — declined at
+/// eagl_class6 entry.
+/// The shared ctx handle-table resolve (classes 5 and 6 bind use the exact
+/// same chain): *(ctx+0x8c)[node[3]] → per-resource record → index (direct
+/// or via the double-indirect table) → the 0x1c-stride record at ctx+0x24.
+unsafe fn eagl_resolve_record(ctx: i32, n: i32) -> Result<i32, ()> {
+    let page_tbl = safe_read32s(ctx + 0x8c).map_err(|_| ())?;
+    let nid = safe_read32s(n + 0xc).map_err(|_| ())?;
+    let r = safe_read32s(page_tbl.wrapping_add(nid.wrapping_mul(4))).map_err(|_| ())?;
+    let t = safe_read32s(r + 0x38).map_err(|_| ())?;
+    let a = safe_read32s(r + 0x28).map_err(|_| ())?
+        .wrapping_add(safe_read32s(n + 0x14).map_err(|_| ())?);
+    let idx = if t == 0 {
+        let off = safe_read32s(ctx + 0x2c).map_err(|_| ())?;
+        safe_read32s(a.wrapping_add(off)).map_err(|_| ())?
+    } else {
+        let inner_off = safe_read32s(safe_read32s(ctx + 0xc).map_err(|_| ())? + 8).map_err(|_| ())?;
+        let inner = safe_read32s(a.wrapping_add(inner_off)).map_err(|_| ())?;
+        safe_read32s(safe_read32s(t + 8).map_err(|_| ())?.wrapping_add(inner.wrapping_mul(4)))
+            .map_err(|_| ())?
+    };
+    Ok(idx.wrapping_mul(0x1c).wrapping_add(safe_read32s(ctx + 0x24).map_err(|_| ())?))
+}
+
+/// Class 5 — SetTexture (guest case 5, non-record mode): resolve the texture
+/// record, ring-append SetTexture(dev, stage, *(rec+4)). The mode-2 branch
+/// (GetDeviceCaps format validation) never reaches here — the whole batch is
+/// gated on mode != 2.
+unsafe fn eagl_class5_texture(
+    c: &EaglTokenCfg, ctx: i32, mode: i32, dev: i32, vt: i32,
+    n: i32, stage: i32, p: &mut EaglPass,
+) -> Result<i32, ()> {
+    if mode == 2 || c.tex_fid == 0 {
+        return Err(());
+    }
+    let rec = eagl_resolve_record(ctx, n)?;
+    let value = safe_read32s(rec + 4).map_err(|_| ())?;
+    let fid = eagl_stub_fid(vt, VT_SET_TEXTURE, c.tex_fid)?;
+    if p.commit {
+        let entry = c.ring_base + p.head;
+        safe_write32(entry, fid).map_err(|_| ())?;
+        safe_write32(entry + 4, dev).map_err(|_| ())?;
+        safe_write32(entry + 8, stage).map_err(|_| ())?;
+        safe_write32(entry + 12, value).map_err(|_| ())?;
+    }
+    p.head += 16;
+    Ok(0)
+}
+
+unsafe fn eagl_class6_bind(
+    c: &EaglTokenCfg, ctx: i32, mode: i32, dev: i32, vt: i32,
+    n: i32, pix: bool, depth: u32, p: &mut EaglPass,
+) -> Result<i32, ()> {
+    let rec = eagl_resolve_record(ctx, n)?;
+    if safe_read32s(rec + 0xc).map_err(|_| ())? == 0 {
+        // Unbound shader record: guest returns E_FAIL before any device call.
+        return Ok(EAGL_E_FAIL);
+    }
+    let handle = safe_read32s(rec + 4).map_err(|_| ())?;
+    if pix {
+        eagl_emit_2arg(c, vt, VT_SET_PIXEL_SHADER, c.sps_fid, dev, handle, p)?;
+    } else {
+        eagl_emit_2arg(c, vt, VT_SET_VERTEX_SHADER, c.svs_fid, dev, handle, p)?;
+    }
+
+    let ct = safe_read32s(rec + 0x14).map_err(|_| ())?;
+    if ct == 0 {
+        return Ok(0);
+    }
+    let hdr_ptr = safe_read32s(rec + 0x18).map_err(|_| ())?;
+    let hdr = safe_read32s(hdr_ptr + 0x44).map_err(|_| ())?;
+    let f_base = hdr.wrapping_add(8);
+    let total = safe_read32s(ct + 0xc).map_err(|_| ())?;
+    if total as u32 > 1024 {
+        return Err(());
+    }
+    let mut ep = ct
+        .wrapping_add(safe_read32s(ct + 0x10).map_err(|_| ())?)
+        .wrapping_add(6);
+    for k in 0..total {
+        let typ = safe_read16(ep - 2).map_err(|_| ())?;
+        let reg = safe_read16(ep).map_err(|_| ())?;
+        let cn = safe_read16(ep + 2).map_err(|_| ())?;
+        match typ {
+            2 => {
+                let src = f_base.wrapping_add(reg.wrapping_mul(16));
+                eagl_emit_const_f(c, vt, pix, dev, reg, src, cn, p)?;
+            },
+            // Types 0/1 = bool/int default constants — no WBUF registration.
+            0 | 1 => return Err(()),
+            3 if pix => {
+                // Sub-pass recursion (the 0xac-stride array): one nesting
+                // level is all the content uses — decline anything deeper.
+                if depth != 0 {
+                    return Err(());
+                }
+                let sub_arr = safe_read32s(hdr_ptr + 0x30).map_err(|_| ())?;
+                let sub = safe_read32s(sub_arr.wrapping_add(k.wrapping_mul(4))).map_err(|_| ())?;
+                if sub != 0 {
+                    let pass_id = safe_read32s(safe_read32s(sub + 4).map_err(|_| ())? + 4)
+                        .map_err(|_| ())?;
+                    let page_tbl = safe_read32s(ctx + 0x8c).map_err(|_| ())?;
+                    let pr = safe_read32s(page_tbl.wrapping_add(pass_id.wrapping_mul(4)))
+                        .map_err(|_| ())?;
+                    let m = safe_read32s(pr + 0x3c).map_err(|_| ())?;
+                    if m as u32 > 256 {
+                        return Err(());
+                    }
+                    let base = safe_read32s(pr + 0x40).map_err(|_| ())?;
+                    for i in 0..m {
+                        let sub_node = base.wrapping_add(i.wrapping_mul(0xac));
+                        let hr = eagl_dispatch_token(c, ctx, mode, dev, vt, sub_node, reg, depth + 1, p)?;
+                        if hr < 0 {
+                            // Guest aborts the whole commit on a negative
+                            // sub-result — partial device calls stand.
+                            return Ok(hr);
+                        }
+                    }
+                }
+            },
+            _ => {
+                if pix {
+                    // Pixel walk: unknown entry type aborts with E_FAIL after
+                    // the calls made so far (guest LAB_005c9ab3).
+                    return Ok(EAGL_E_FAIL);
+                }
+                // Vertex walk: unknown entry type is silently skipped.
+            },
+        }
+        ep = ep.wrapping_add(20);
+    }
+    Ok(0)
+}
+
+/// Top-level class-6 entry: scan (no side effects, any doubt → decline to the
+/// JS tier / original), room check, then commit. The guest-visible ring head
+/// is published once, after the commit walk completes or aborts — every
+/// intermediate state is invisible to the drain.
+unsafe fn eagl_dispatch_class6_batch(
+    c: &EaglTokenCfg, ctx: i32, dev: i32, vt: i32, node: i32, stage: i32,
+) -> bool {
+    let mode = match safe_read32s(ctx + 0x84) { Ok(v) => v, Err(_) => return false };
+    if mode == 2 {
+        return false;
+    }
+    let head0 = match safe_read32s(c.ring_ctrl) { Ok(v) => v, Err(_) => return false };
+    if head0 < 0 || head0 > c.capacity {
+        return false;
+    }
+    let mut scan = EaglPass { commit: false, head: head0 };
+    let hr = match eagl_dispatch_token(c, ctx, mode, dev, vt, node, stage, 0, &mut scan) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // Room for the whole batch plus slack; otherwise let the JS tier complete
+    // via the original (its trampolines drain through the .ovf path).
+    if scan.head > c.capacity - 64 {
+        return false;
+    }
+    let mut com = EaglPass { commit: true, head: head0 };
+    // The commit pass repeats exactly the scan's reads (no guest code ran in
+    // between) and writes only to our own RW structures — an Err here is
+    // effectively unreachable; fall back to the scan's hr with whatever
+    // entries fully committed (head tracks complete entries only).
+    let hr = eagl_dispatch_token(c, ctx, mode, dev, vt, node, stage, 0, &mut com).unwrap_or(hr);
+    if safe_write32(c.ring_ctrl, com.head).is_err() {
+        return false;
+    }
+    write_reg32(EAX, hr);
     true
 }

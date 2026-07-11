@@ -3744,71 +3744,68 @@ fn gen_fpu_load_m64_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder.reinterpret_i64_as_f64();
 }
 
-fn gen_fpu_relaxed_load_binop_operands_m32(
-    ctx: &mut JitContext,
-    op: FpuFastBinOp,
-    st0_addr: &WasmLocal,
-    modrm_byte: ModrmByte,
-) {
-    let reversed = matches!(op, FpuFastBinOp::SubR | FpuFastBinOp::DivR);
-    if reversed {
-        gen_fpu_load_m32_as_f64(ctx, modrm_byte);
-        gen_fpu_load_relaxed_st_f64(ctx, 0, st0_addr);
-    }
-    else {
-        gen_fpu_load_relaxed_st_f64(ctx, 0, st0_addr);
-        gen_fpu_load_m32_as_f64(ctx, modrm_byte);
+/// Memory operand type for the relaxed-FPU fast paths. The m32/i32/i16/m64 binop and
+/// fcom families are identical apart from which typed load helper they call; this
+/// selects it. (m32/m64 float and i16/i32 int operands all convert to f64 exactly, so
+/// the only semantic difference vs the F80 path is the binop/compare rounding.)
+#[derive(Clone, Copy)]
+enum FpuMemSrc { M32, I32, I16, M64 }
+
+// F80-producing slow load for the relaxed BINOP slow path (feeds call_fn3_i32_i64_i32).
+fn gen_fpu_load_mem_binop_slow(ctx: &mut JitContext, src: FpuMemSrc, modrm_byte: ModrmByte) {
+    match src {
+        FpuMemSrc::M32 => gen_fpu_load_m32(ctx, modrm_byte),
+        FpuMemSrc::I32 => gen_fpu_load_i32_f80(ctx, modrm_byte),
+        FpuMemSrc::I16 => gen_fpu_load_i16_f80(ctx, modrm_byte),
+        FpuMemSrc::M64 => gen_fpu_load_m64(ctx, modrm_byte),
     }
 }
 
-fn gen_fpu_relaxed_load_binop_operands_i32(
-    ctx: &mut JitContext,
-    op: FpuFastBinOp,
-    st0_addr: &WasmLocal,
-    modrm_byte: ModrmByte,
-) {
-    let reversed = matches!(op, FpuFastBinOp::SubR | FpuFastBinOp::DivR);
-    if reversed {
-        gen_fpu_load_i32_as_f64(ctx, modrm_byte);
-        gen_fpu_load_relaxed_st_f64(ctx, 0, st0_addr);
-    }
-    else {
-        gen_fpu_load_relaxed_st_f64(ctx, 0, st0_addr);
-        gen_fpu_load_i32_as_f64(ctx, modrm_byte);
+// Plain slow load for the relaxed FCOM slow path (feeds call_fn2_i64_i32).
+fn gen_fpu_load_mem_fcom_slow(ctx: &mut JitContext, src: FpuMemSrc, modrm_byte: ModrmByte) {
+    match src {
+        FpuMemSrc::M32 => gen_fpu_load_m32(ctx, modrm_byte),
+        FpuMemSrc::I32 => gen_fpu_load_i32(ctx, modrm_byte),
+        FpuMemSrc::I16 => gen_fpu_load_i16(ctx, modrm_byte),
+        FpuMemSrc::M64 => gen_fpu_load_m64(ctx, modrm_byte),
     }
 }
 
-fn gen_fpu_relaxed_load_binop_operands_i16(
-    ctx: &mut JitContext,
-    op: FpuFastBinOp,
-    st0_addr: &WasmLocal,
-    modrm_byte: ModrmByte,
-) {
-    let reversed = matches!(op, FpuFastBinOp::SubR | FpuFastBinOp::DivR);
-    if reversed {
-        gen_fpu_load_i16_as_f64(ctx, modrm_byte);
-        gen_fpu_load_relaxed_st_f64(ctx, 0, st0_addr);
-    }
-    else {
-        gen_fpu_load_relaxed_st_f64(ctx, 0, st0_addr);
-        gen_fpu_load_i16_as_f64(ctx, modrm_byte);
+// Exact-f64 fast load of the memory operand (pushed on the wasm stack).
+fn gen_fpu_load_mem_as_f64(ctx: &mut JitContext, src: FpuMemSrc, modrm_byte: ModrmByte) {
+    match src {
+        FpuMemSrc::M32 => gen_fpu_load_m32_as_f64(ctx, modrm_byte),
+        FpuMemSrc::I32 => gen_fpu_load_i32_as_f64(ctx, modrm_byte),
+        FpuMemSrc::I16 => gen_fpu_load_i16_as_f64(ctx, modrm_byte),
+        FpuMemSrc::M64 => gen_fpu_load_m64_as_f64(ctx, modrm_byte),
     }
 }
 
-fn gen_fpu_relaxed_load_binop_operands_m64(
+// Exact-f64 fast load of the memory operand, returned as an i64-bits local.
+fn gen_fpu_load_mem_as_f64_bits(ctx: &mut JitContext, src: FpuMemSrc, modrm_byte: ModrmByte) -> WasmLocalI64 {
+    match src {
+        FpuMemSrc::M32 => gen_fpu_load_m32_as_f64_bits(ctx, modrm_byte),
+        FpuMemSrc::I32 => gen_fpu_load_i32_as_f64_bits(ctx, modrm_byte),
+        FpuMemSrc::I16 => gen_fpu_load_i16_as_f64_bits(ctx, modrm_byte),
+        FpuMemSrc::M64 => gen_fpu_load_m64_as_f64_bits(ctx, modrm_byte),
+    }
+}
+
+fn gen_fpu_relaxed_load_binop_operands_mem(
     ctx: &mut JitContext,
     op: FpuFastBinOp,
     st0_addr: &WasmLocal,
+    src: FpuMemSrc,
     modrm_byte: ModrmByte,
 ) {
     let reversed = matches!(op, FpuFastBinOp::SubR | FpuFastBinOp::DivR);
     if reversed {
-        gen_fpu_load_m64_as_f64(ctx, modrm_byte);
+        gen_fpu_load_mem_as_f64(ctx, src, modrm_byte);
         gen_fpu_load_relaxed_st_f64(ctx, 0, st0_addr);
     }
     else {
         gen_fpu_load_relaxed_st_f64(ctx, 0, st0_addr);
-        gen_fpu_load_m64_as_f64(ctx, modrm_byte);
+        gen_fpu_load_mem_as_f64(ctx, src, modrm_byte);
     }
 }
 
@@ -3830,17 +3827,24 @@ fn gen_fpu_relaxed_load_binop_operands_sti(
     }
 }
 
-pub fn gen_fpu_relaxed_binop_m32(
+// Relaxed-FPU binop with a memory operand (fadd/fmul/fsub/fsubr/fdiv/fdivr and their
+// integer forms fiadd/fimul/… DA /r m32int, DE /r m16int). The int operand converts to
+// f64 EXACTLY (both fit), so the only semantic difference vs the F80 helper is the binop
+// rounding — identical to the float-operand relaxed path. Without the int fast paths,
+// integer-operand loops (int PCM × float gain in audio converters) would hit the F80
+// helper on every sample even in relaxed mode.
+fn gen_fpu_relaxed_binop_mem(
     ctx: &mut JitContext,
     modrm_byte: ModrmByte,
     target_sti: u32,
     op: FpuFastBinOp,
     slow_helper: &str,
+    src: FpuMemSrc,
 ) {
     // PC=single -> slow F80 helper (inline f64 path below skips precision-control).
     if !crate::softfloat::is_fpu_relaxed() || crate::softfloat::is_precision_single() {
         ctx.builder.const_i32(target_sti as i32);
-        gen_fpu_load_m32(ctx, modrm_byte);
+        gen_fpu_load_mem_binop_slow(ctx, src, modrm_byte);
         ctx.builder.call_fn3_i32_i64_i32(slow_helper);
         return;
     }
@@ -3852,12 +3856,12 @@ pub fn gen_fpu_relaxed_binop_m32(
     ctx.builder.if_void();
     gen_fpu_relaxed_record_fallback(ctx);
     ctx.builder.const_i32(target_sti as i32);
-    gen_fpu_load_m32(ctx, modrm_slow);
+    gen_fpu_load_mem_binop_slow(ctx, src, modrm_slow);
     ctx.builder.call_fn3_i32_i64_i32(slow_helper);
     gen_x87_local_cache_invalidate_all_runtime(ctx);
     ctx.builder.else_();
     gen_fpu_relaxed_record_hit(ctx);
-    gen_fpu_relaxed_load_binop_operands_m32(ctx, op, &st0_addr, modrm_byte);
+    gen_fpu_relaxed_load_binop_operands_mem(ctx, op, &st0_addr, src, modrm_byte);
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_relaxed_f64_st(ctx, target_sti, &target_addr);
     ctx.builder.block_end();
@@ -3865,112 +3869,17 @@ pub fn gen_fpu_relaxed_binop_m32(
     ctx.builder.free_local(target_addr);
 }
 
-// fiadd/fimul/fisub/fisubr/fidiv/fidivr with integer memory operands (DA /r m32int,
-// DE /r m16int). Same shape as the m32/m64 fast paths: the int operand converts to
-// f64 EXACTLY (both fit), so the only semantic difference vs F80 is the binop
-// rounding — identical to the float-operand relaxed paths. Without this, integer-
-// operand loops (int PCM × float gain in audio converters) hit the F80 helper on
-// every sample even in relaxed mode.
-pub fn gen_fpu_relaxed_binop_i32(
-    ctx: &mut JitContext,
-    modrm_byte: ModrmByte,
-    target_sti: u32,
-    op: FpuFastBinOp,
-    slow_helper: &str,
-) {
-    if !crate::softfloat::is_fpu_relaxed() || crate::softfloat::is_precision_single() {
-        ctx.builder.const_i32(target_sti as i32);
-        gen_fpu_load_i32_f80(ctx, modrm_byte);
-        ctx.builder.call_fn3_i32_i64_i32(slow_helper);
-        return;
-    }
-    let modrm_slow = modrm_byte.clone();
-    let target_addr = gen_fpu_st_addr(ctx, target_sti);
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
-    ctx.builder.eqz_i32();
-    ctx.builder.if_void();
-    gen_fpu_relaxed_record_fallback(ctx);
-    ctx.builder.const_i32(target_sti as i32);
-    gen_fpu_load_i32_f80(ctx, modrm_slow);
-    ctx.builder.call_fn3_i32_i64_i32(slow_helper);
-    gen_x87_local_cache_invalidate_all_runtime(ctx);
-    ctx.builder.else_();
-    gen_fpu_relaxed_record_hit(ctx);
-    gen_fpu_relaxed_load_binop_operands_i32(ctx, op, &st0_addr, modrm_byte);
-    gen_fpu_apply_f64_binop(ctx, op);
-    gen_fpu_store_relaxed_f64_st(ctx, target_sti, &target_addr);
-    ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
-    ctx.builder.free_local(target_addr);
+pub fn gen_fpu_relaxed_binop_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, target_sti: u32, op: FpuFastBinOp, slow_helper: &str) {
+    gen_fpu_relaxed_binop_mem(ctx, modrm_byte, target_sti, op, slow_helper, FpuMemSrc::M32)
 }
-
-pub fn gen_fpu_relaxed_binop_i16(
-    ctx: &mut JitContext,
-    modrm_byte: ModrmByte,
-    target_sti: u32,
-    op: FpuFastBinOp,
-    slow_helper: &str,
-) {
-    if !crate::softfloat::is_fpu_relaxed() || crate::softfloat::is_precision_single() {
-        ctx.builder.const_i32(target_sti as i32);
-        gen_fpu_load_i16_f80(ctx, modrm_byte);
-        ctx.builder.call_fn3_i32_i64_i32(slow_helper);
-        return;
-    }
-    let modrm_slow = modrm_byte.clone();
-    let target_addr = gen_fpu_st_addr(ctx, target_sti);
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
-    ctx.builder.eqz_i32();
-    ctx.builder.if_void();
-    gen_fpu_relaxed_record_fallback(ctx);
-    ctx.builder.const_i32(target_sti as i32);
-    gen_fpu_load_i16_f80(ctx, modrm_slow);
-    ctx.builder.call_fn3_i32_i64_i32(slow_helper);
-    gen_x87_local_cache_invalidate_all_runtime(ctx);
-    ctx.builder.else_();
-    gen_fpu_relaxed_record_hit(ctx);
-    gen_fpu_relaxed_load_binop_operands_i16(ctx, op, &st0_addr, modrm_byte);
-    gen_fpu_apply_f64_binop(ctx, op);
-    gen_fpu_store_relaxed_f64_st(ctx, target_sti, &target_addr);
-    ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
-    ctx.builder.free_local(target_addr);
+pub fn gen_fpu_relaxed_binop_i32(ctx: &mut JitContext, modrm_byte: ModrmByte, target_sti: u32, op: FpuFastBinOp, slow_helper: &str) {
+    gen_fpu_relaxed_binop_mem(ctx, modrm_byte, target_sti, op, slow_helper, FpuMemSrc::I32)
 }
-
-pub fn gen_fpu_relaxed_binop_m64(
-    ctx: &mut JitContext,
-    modrm_byte: ModrmByte,
-    target_sti: u32,
-    op: FpuFastBinOp,
-    slow_helper: &str,
-) {
-    if !crate::softfloat::is_fpu_relaxed() || crate::softfloat::is_precision_single() {
-        ctx.builder.const_i32(target_sti as i32);
-        gen_fpu_load_m64(ctx, modrm_byte);
-        ctx.builder.call_fn3_i32_i64_i32(slow_helper);
-        return;
-    }
-    let modrm_slow = modrm_byte.clone();
-    let target_addr = gen_fpu_st_addr(ctx, target_sti);
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
-    ctx.builder.eqz_i32();
-    ctx.builder.if_void();
-    gen_fpu_relaxed_record_fallback(ctx);
-    ctx.builder.const_i32(target_sti as i32);
-    gen_fpu_load_m64(ctx, modrm_slow);
-    ctx.builder.call_fn3_i32_i64_i32(slow_helper);
-    gen_x87_local_cache_invalidate_all_runtime(ctx);
-    ctx.builder.else_();
-    gen_fpu_relaxed_record_hit(ctx);
-    gen_fpu_relaxed_load_binop_operands_m64(ctx, op, &st0_addr, modrm_byte);
-    gen_fpu_apply_f64_binop(ctx, op);
-    gen_fpu_store_relaxed_f64_st(ctx, target_sti, &target_addr);
-    ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
-    ctx.builder.free_local(target_addr);
+pub fn gen_fpu_relaxed_binop_i16(ctx: &mut JitContext, modrm_byte: ModrmByte, target_sti: u32, op: FpuFastBinOp, slow_helper: &str) {
+    gen_fpu_relaxed_binop_mem(ctx, modrm_byte, target_sti, op, slow_helper, FpuMemSrc::I16)
+}
+pub fn gen_fpu_relaxed_binop_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, target_sti: u32, op: FpuFastBinOp, slow_helper: &str) {
+    gen_fpu_relaxed_binop_mem(ctx, modrm_byte, target_sti, op, slow_helper, FpuMemSrc::M64)
 }
 
 pub fn gen_fpu_relaxed_binop_sti(
@@ -4444,14 +4353,16 @@ pub fn gen_fpu_relaxed_fcom_sti(
     ctx.builder.free_local(st0_addr);
 }
 
-pub fn gen_fpu_relaxed_fcom_m32(
+// Relaxed-FPU compare (fcom/fcomp/ficom/…) against a memory operand.
+fn gen_fpu_relaxed_fcom_mem(
     ctx: &mut JitContext,
     modrm_byte: ModrmByte,
     pop_count: u32,
     slow_helper: &str,
+    src: FpuMemSrc,
 ) {
     if !crate::softfloat::is_fpu_relaxed() {
-        gen_fpu_load_m32(ctx, modrm_byte);
+        gen_fpu_load_mem_fcom_slow(ctx, src, modrm_byte);
         ctx.builder.call_fn2_i64_i32(slow_helper);
         return;
     }
@@ -4461,13 +4372,13 @@ pub fn gen_fpu_relaxed_fcom_m32(
     ctx.builder.eqz_i32();
     ctx.builder.if_void();
     gen_fpu_relaxed_record_fallback(ctx);
-    gen_fpu_load_m32(ctx, modrm_slow);
+    gen_fpu_load_mem_fcom_slow(ctx, src, modrm_slow);
     ctx.builder.call_fn2_i64_i32(slow_helper);
     gen_x87_local_cache_invalidate_all_runtime(ctx);
     ctx.builder.else_();
     gen_fpu_relaxed_record_hit(ctx);
     let x_bits = gen_fpu_load_relaxed_st_bits(ctx, 0, &st0_addr);
-    let y_bits = gen_fpu_load_m32_as_f64_bits(ctx, modrm_byte);
+    let y_bits = gen_fpu_load_mem_as_f64_bits(ctx, src, modrm_byte);
     gen_fpu_compare_status_from_bits(ctx, &x_bits.local, &y_bits);
     ctx.builder.free_local_i64(y_bits);
     gen_free_fpu_bits(ctx, x_bits);
@@ -4476,100 +4387,17 @@ pub fn gen_fpu_relaxed_fcom_m32(
     ctx.builder.free_local(st0_addr);
 }
 
-pub fn gen_fpu_relaxed_fcom_m64(
-    ctx: &mut JitContext,
-    modrm_byte: ModrmByte,
-    pop_count: u32,
-    slow_helper: &str,
-) {
-    if !crate::softfloat::is_fpu_relaxed() {
-        gen_fpu_load_m64(ctx, modrm_byte);
-        ctx.builder.call_fn2_i64_i32(slow_helper);
-        return;
-    }
-    let modrm_slow = modrm_byte.clone();
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
-    ctx.builder.eqz_i32();
-    ctx.builder.if_void();
-    gen_fpu_relaxed_record_fallback(ctx);
-    gen_fpu_load_m64(ctx, modrm_slow);
-    ctx.builder.call_fn2_i64_i32(slow_helper);
-    gen_x87_local_cache_invalidate_all_runtime(ctx);
-    ctx.builder.else_();
-    gen_fpu_relaxed_record_hit(ctx);
-    let x_bits = gen_fpu_load_relaxed_st_bits(ctx, 0, &st0_addr);
-    let y_bits = gen_fpu_load_m64_as_f64_bits(ctx, modrm_byte);
-    gen_fpu_compare_status_from_bits(ctx, &x_bits.local, &y_bits);
-    ctx.builder.free_local_i64(y_bits);
-    gen_free_fpu_bits(ctx, x_bits);
-    gen_fpu_relaxed_pop_n(ctx, pop_count);
-    ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
+pub fn gen_fpu_relaxed_fcom_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop_count: u32, slow_helper: &str) {
+    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::M32)
 }
-
-pub fn gen_fpu_relaxed_fcom_i16(
-    ctx: &mut JitContext,
-    modrm_byte: ModrmByte,
-    pop_count: u32,
-    slow_helper: &str,
-) {
-    if !crate::softfloat::is_fpu_relaxed() {
-        gen_fpu_load_i16(ctx, modrm_byte);
-        ctx.builder.call_fn2_i64_i32(slow_helper);
-        return;
-    }
-    let modrm_slow = modrm_byte.clone();
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
-    ctx.builder.eqz_i32();
-    ctx.builder.if_void();
-    gen_fpu_relaxed_record_fallback(ctx);
-    gen_fpu_load_i16(ctx, modrm_slow);
-    ctx.builder.call_fn2_i64_i32(slow_helper);
-    gen_x87_local_cache_invalidate_all_runtime(ctx);
-    ctx.builder.else_();
-    gen_fpu_relaxed_record_hit(ctx);
-    let x_bits = gen_fpu_load_relaxed_st_bits(ctx, 0, &st0_addr);
-    let y_bits = gen_fpu_load_i16_as_f64_bits(ctx, modrm_byte);
-    gen_fpu_compare_status_from_bits(ctx, &x_bits.local, &y_bits);
-    ctx.builder.free_local_i64(y_bits);
-    gen_free_fpu_bits(ctx, x_bits);
-    gen_fpu_relaxed_pop_n(ctx, pop_count);
-    ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
+pub fn gen_fpu_relaxed_fcom_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop_count: u32, slow_helper: &str) {
+    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::M64)
 }
-
-pub fn gen_fpu_relaxed_fcom_i32(
-    ctx: &mut JitContext,
-    modrm_byte: ModrmByte,
-    pop_count: u32,
-    slow_helper: &str,
-) {
-    if !crate::softfloat::is_fpu_relaxed() {
-        gen_fpu_load_i32(ctx, modrm_byte);
-        ctx.builder.call_fn2_i64_i32(slow_helper);
-        return;
-    }
-    let modrm_slow = modrm_byte.clone();
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
-    ctx.builder.eqz_i32();
-    ctx.builder.if_void();
-    gen_fpu_relaxed_record_fallback(ctx);
-    gen_fpu_load_i32(ctx, modrm_slow);
-    ctx.builder.call_fn2_i64_i32(slow_helper);
-    gen_x87_local_cache_invalidate_all_runtime(ctx);
-    ctx.builder.else_();
-    gen_fpu_relaxed_record_hit(ctx);
-    let x_bits = gen_fpu_load_relaxed_st_bits(ctx, 0, &st0_addr);
-    let y_bits = gen_fpu_load_i32_as_f64_bits(ctx, modrm_byte);
-    gen_fpu_compare_status_from_bits(ctx, &x_bits.local, &y_bits);
-    ctx.builder.free_local_i64(y_bits);
-    gen_free_fpu_bits(ctx, x_bits);
-    gen_fpu_relaxed_pop_n(ctx, pop_count);
-    ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
+pub fn gen_fpu_relaxed_fcom_i16(ctx: &mut JitContext, modrm_byte: ModrmByte, pop_count: u32, slow_helper: &str) {
+    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::I16)
+}
+pub fn gen_fpu_relaxed_fcom_i32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop_count: u32, slow_helper: &str) {
+    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::I32)
 }
 
 pub fn gen_fpu_relaxed_fucom_sti(

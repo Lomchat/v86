@@ -37,6 +37,11 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         // class-6 shader batches — the guest filter routes everything else
         // (and class-6 record mode) to the original.
         132 => handle_eagl_token_dispatch(),
+        // 133 = commit cluster (FUN_005d02d7 → FUN_005cf304 dirty-list walk),
+        // 134 = pass-commit driver (FUN_005d01ec) — phase 3 batch boundaries;
+        // both reuse the token engine + apply kernels as inner cores.
+        133 => handle_eagl_commit_cluster(),
+        134 => handle_eagl_pass_driver(),
         _ => false,
     }
 }
@@ -171,7 +176,7 @@ unsafe fn handle_eagl_apply(family: ApplyFamily, layout: ApplyLayout) -> bool {
         return false;
     }
 
-    match eagl_apply_walk(family, layout, desc_cur, src_cur, dst_cur, budget, 0) {
+    match eagl_apply_walk(family, layout, desc_cur, src_cur, dst_cur, budget, 0, true) {
         Ok(eax) => {
             write_reg32(EAX, eax);
             true
@@ -189,6 +194,11 @@ unsafe fn handle_eagl_apply(family: ApplyFamily, layout: ApplyLayout) -> bool {
 
 /// The recursive walk. Err(()) = abort to JS (memory fault / insane shape);
 /// Ok(eax) = completed with the guest-visible result (0 or E_FAIL).
+///
+/// `commit == false` is the phase-3 scan-pass DRY RUN: every read, bound
+/// check and cursor-cell advance happens (the four cursor cells are cfg
+/// scratch RAM on that path — our own structures), but the guest-visible DST
+/// writes are suppressed, so a later decline leaves guest state pristine.
 unsafe fn eagl_apply_walk(
     family: ApplyFamily,
     layout: ApplyLayout,
@@ -197,6 +207,7 @@ unsafe fn eagl_apply_walk(
     dst_cur: i32,
     budget: i32,
     depth: u32,
+    commit: bool,
 ) -> Result<i32, ()> {
     if depth > APPLY_MAX_DEPTH {
         return Err(());
@@ -268,7 +279,11 @@ unsafe fn eagl_apply_walk(
                             _ => sv,                                                  // MOV copy
                         },
                     };
-                    safe_write32(dst, out).map_err(|_| ())?;
+                    if commit {
+                        safe_write32(dst, out).map_err(|_| ())?;
+                    } else {
+                        let _ = out;
+                    }
                 }
                 safe_write32(dst_cur, dst_base.wrapping_add(dst_step as i32)).map_err(|_| ())?;
                 safe_write32(budget, (rem - budget_step) as i32).map_err(|_| ())?;
@@ -303,9 +318,9 @@ unsafe fn eagl_apply_walk(
                 ret = match layout {
                     ApplyLayout::Packed => eagl_apply_walk(
                         ApplyFamily::Float, ApplyLayout::Register,
-                        desc_cur, src_cur, dst_cur, budget, depth + 1)?,
+                        desc_cur, src_cur, dst_cur, budget, depth + 1, commit)?,
                     ApplyLayout::Register => eagl_apply_walk(
-                        family, layout, desc_cur, src_cur, dst_cur, budget, depth + 1)?,
+                        family, layout, desc_cur, src_cur, dst_cur, budget, depth + 1, commit)?,
                 };
                 if ret < 0 {
                     return Ok(ret);
@@ -439,7 +454,8 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
         return false;
     }
     let ver = match safe_read32s(cfg) { Ok(v) => v, Err(_) => return false };
-    if ver != 2 {
+    // v2 fields are a prefix of v3 (phase 3 adds validate/scratch cells only).
+    if ver < 2 || ver > 3 {
         return false;
     }
     // (ptr, generation) cache key — generation is one read instead of ~16.
@@ -601,6 +617,71 @@ const EAGL_E_FAIL: i32 = 0x80004005u32 as i32;
 struct EaglPass {
     commit: bool,
     head: i32,
+    /// Scan-side model of guest-visible cell writes made earlier in the SAME
+    /// crossing (shadow slots, dirty flags, entry statuses, header bits):
+    /// the scan performs NO guest writes, so any read of a cell the crossing
+    /// already "wrote" must come from this model or the scan diverges from
+    /// the commit replay (e.g. the walk sets `node[10] |= 1` and the same
+    /// node's cdca7 tail tests that bit). 64 slots covers observed crossings;
+    /// overflow sets model_ovf (callers decline or degrade to upper bounds).
+    model_addr: [i32; 64],
+    model_val: [i32; 64],
+    model_n: usize,
+    model_ovf: bool,
+}
+
+impl EaglPass {
+    fn new(commit: bool, head: i32) -> EaglPass {
+        EaglPass {
+            commit,
+            head,
+            model_addr: [0; 64],
+            model_val: [0; 64],
+            model_n: 0,
+            model_ovf: false,
+        }
+    }
+    fn model_get(&self, addr: i32) -> Option<i32> {
+        for i in 0..self.model_n {
+            if self.model_addr[i] == addr {
+                return Some(self.model_val[i]);
+            }
+        }
+        None
+    }
+    fn model_put(&mut self, addr: i32, val: i32) {
+        for i in 0..self.model_n {
+            if self.model_addr[i] == addr {
+                self.model_val[i] = val;
+                return;
+            }
+        }
+        if self.model_n < 64 {
+            self.model_addr[self.model_n] = addr;
+            self.model_val[self.model_n] = val;
+            self.model_n += 1;
+        } else {
+            self.model_ovf = true;
+        }
+    }
+    /// Guest-visible cell write: real on commit, modeled on scan.
+    unsafe fn write_cell(&mut self, addr: i32, val: i32) -> Result<(), ()> {
+        if self.commit {
+            safe_write32(addr, val).map_err(|_| ())
+        } else {
+            self.model_put(addr, val);
+            if self.model_ovf { Err(()) } else { Ok(()) }
+        }
+    }
+    /// Guest-visible cell read that must observe same-crossing writes.
+    unsafe fn read_cell(&self, addr: i32) -> Result<i32, ()> {
+        if !self.commit {
+            if let Some(v) = self.model_get(addr) {
+                return Ok(v);
+            }
+        }
+        safe_read32s(addr).map_err(|_| ())
+    }
 }
 
 /// Resolve a device vtable slot and require the KNOWN callee shape: our WBUF
@@ -641,19 +722,30 @@ unsafe fn eagl_emit_state(
         let owner = safe_read32s(c.owner_global).map_err(|_| ())?;
         if owner == dev {
             let slot_addr = shadow_base + slot * 4;
-            let cur = safe_read32s(slot_addr).map_err(|_| ())?;
-            // The skip decision is only binding at commit: earlier entries of
-            // the SAME batch may rewrite the slot between scan and commit, so
-            // the scan still reserves room for this entry (upper bound).
-            if p.commit && cur == value {
-                if skip_addr != 0 {
-                    let cnt = safe_read32s(skip_addr).map_err(|_| ())?;
-                    safe_write32(skip_addr, cnt.wrapping_add(1)).map_err(|_| ())?;
+            // Scan consults its local model first so earlier same-crossing
+            // writes are seen (exact skip decisions → exact head prediction);
+            // commit reads the real slot (its own writes ARE the model).
+            let cur = match if p.commit { None } else { p.model_get(slot_addr) } {
+                Some(v) => v,
+                None => safe_read32s(slot_addr).map_err(|_| ())?,
+            };
+            // Post-overflow the scan's view may miss an untracked earlier
+            // write — stop skipping (over-reserve is safe, under-reserve is
+            // not); commit always decides on real state.
+            if cur == value && (p.commit || !p.model_ovf) {
+                if p.commit {
+                    if skip_addr != 0 {
+                        let cnt = safe_read32s(skip_addr).map_err(|_| ())?;
+                        safe_write32(skip_addr, cnt.wrapping_add(1)).map_err(|_| ())?;
+                    }
                 }
                 return Ok(());
             }
             shadow_slot_addr = slot_addr;
         }
+    }
+    if !p.commit && shadow_slot_addr != 0 {
+        p.model_put(shadow_slot_addr, value);
     }
 
     if p.commit {
@@ -992,7 +1084,7 @@ unsafe fn eagl_dispatch_class6_batch(
     if head0 < 0 || head0 > c.capacity {
         return false;
     }
-    let mut scan = EaglPass { commit: false, head: head0 };
+    let mut scan = EaglPass::new(false, head0);
     let hr = match eagl_dispatch_token(c, ctx, mode, dev, vt, node, stage, 0, &mut scan) {
         Ok(v) => v,
         Err(_) => return false,
@@ -1002,7 +1094,7 @@ unsafe fn eagl_dispatch_class6_batch(
     if scan.head > c.capacity - 64 {
         return false;
     }
-    let mut com = EaglPass { commit: true, head: head0 };
+    let mut com = EaglPass::new(true, head0);
     // The commit pass repeats exactly the scan's reads (no guest code ran in
     // between) and writes only to our own RW structures — an Err here is
     // effectively unreachable; fall back to the scan's hr with whatever
@@ -1013,4 +1105,782 @@ unsafe fn eagl_dispatch_class6_batch(
     }
     write_reg32(EAX, hr);
     true
+}
+
+// === Phase 3 — commit-cluster (133) & pass-driver (134) batch engines =======
+//
+// plan/eagl-state-commit-hle-rfc.md "Phase 3 design". Two patch points:
+//   133 FUN_005d02d7 (thiscall RET 4): dep-list loop over FUN_005cf304, the
+//       dirty-list commit walk — replicated in full below (eagl_walk_native).
+//   134 FUN_005d01ec (stdcall RET 8): pass-commit driver — stamp write +
+//       element loop of {apply walk FUN_005cdca7, token dispatch(-1)}.
+// Both run SCAN-then-COMMIT through EaglPass: the scan performs every read /
+// bound / stub check with ZERO guest-visible writes (flag/status cells go
+// through the pass model), any doubt → decline with pristine guest state; the
+// commit replays the identical decision sequence with real writes. Inner
+// cores reused: eagl_dispatch_token (the phase-2 token engine) and
+// eagl_apply_walk (handlers 129-131 kernels, dry-run capable).
+//
+// DECLINE surface (→ JS tier → sync original, counted there): evaluator
+// nodes (node[0x14] != 0 with dirty bit), compiled nodes (*node == -1),
+// constant-limit growth (FUN_005c80ae would grow → state-block rebuild),
+// int/bool constant uploads (no WBUF fids), cdca7 default-leg descs (the
+// inline x87 converter incl. D3DCOLOR pack), pending __controlfp restore
+// (ctx+0xb4), iteration/depth bounds, model overflow.
+
+/// Per-crossing cached EAGL device-ctx fields (handler-body discipline: read
+/// each ctx field once). `stamp30` is overridable for the pass driver, whose
+/// guest original writes ctx+0x30 = passIdx BEFORE the element loop.
+struct EaglCommitCtx {
+    ctx: i32,
+    mode: i32,
+    dev: i32,
+    vt: i32,
+    stamp30: i32,
+    stamp34: i32,
+    handle_tbl: i32,
+    off2c: i32,
+    inner_off: i32,
+    tech_base: i32,
+}
+
+unsafe fn eagl_load_commit_ctx(ctx: i32, stamp30_override: Option<i32>) -> Result<EaglCommitCtx, ()> {
+    let r = |a: i32| safe_read32s(a).map_err(|_| ());
+    // Pending __controlfp precision restore (left by a guest-run evaluator
+    // path) — the epilogues would have to replicate CRT __controlfp; decline.
+    if r(ctx + 0xb4)? != 0 {
+        eagl_set_decline_reason(6);
+        return Err(());
+    }
+    let dev = r(ctx + 8)?;
+    Ok(EaglCommitCtx {
+        ctx,
+        mode: r(ctx + 0x84)?,
+        dev,
+        vt: r(dev)?,
+        stamp30: match stamp30_override { Some(v) => v, None => r(ctx + 0x30)? },
+        stamp34: r(ctx + 0x34)?,
+        handle_tbl: r(ctx + 0x8c)?,
+        off2c: r(ctx + 0x2c)?,
+        inner_off: r(r(ctx + 0xc)? + 8)?,
+        tech_base: r(ctx + 0x1c)?,
+    })
+}
+
+/// Resolve wrapper (guest FUN_005cafde/caf72/cce58 bodies): derive the two
+/// source addresses from the param record, then run the SHARED apply kernel
+/// over four cursor cells in cfg scratch RAM (+0x60..0x6f) — our own memory,
+/// so the scan's dry run can still advance cursors while suppressing dst
+/// writes. rec = {+4 fileIdx, +8 descChainOff, +0xc valueOff}.
+unsafe fn eagl_wrapper_apply(
+    cc: &EaglCommitCtx, cfg: i32, family: ApplyFamily, layout: ApplyLayout,
+    rec: i32, dst: i32, cnt: i32, commit: bool,
+) -> Result<i32, ()> {
+    if cnt as u32 > 4096 {
+        return Err(());
+    }
+    let r = |a: i32| safe_read32s(a).map_err(|_| ());
+    let hrec = r(cc.handle_tbl.wrapping_add(r(rec + 4)?.wrapping_mul(4)))?;
+    let off = if r(hrec + 0x38)? == 0 { cc.off2c } else { cc.inner_off };
+    let desc_chain = r(hrec + 0x24)?.wrapping_add(r(rec + 8)?).wrapping_add(off);
+    let src = r(hrec + 0x28)?.wrapping_add(r(rec + 0xc)?).wrapping_add(off);
+    let s = cfg + 0x60;
+    safe_write32(s, desc_chain).map_err(|_| ())?;
+    safe_write32(s + 4, src).map_err(|_| ())?;
+    safe_write32(s + 8, dst).map_err(|_| ())?;
+    safe_write32(s + 12, cnt).map_err(|_| ())?;
+    eagl_apply_walk(family, layout, s, s + 4, s + 8, s + 12, 0, commit)
+}
+
+/// Sane token id → descriptor dword. Table index is bounded — a wild token
+/// id means a structural problem (or a compiled node) → decline.
+unsafe fn eagl_token_desc(c: &EaglTokenCfg, tok: i32) -> Result<u32, ()> {
+    if tok as u32 > 0xffff {
+        return Err(());
+    }
+    Ok(safe_read32s(c.token_table.wrapping_add(tok.wrapping_mul(0x1c))).map_err(|_| ())? as u32)
+}
+
+/// Native FUN_005c80ae in scan form: walk the default-constant table
+/// computing register extents; any extent that would GROW a tech cursor cell
+/// means the guest would take the state-block rebuild path → Err (decline).
+/// Steady state writes nothing. Unknown entry type → guest E_FAIL.
+unsafe fn eagl_scan_80ae(ct: i32, tech: i32, ps: bool, p: &EaglPass) -> Result<i32, ()> {
+    if ct == 0 {
+        return Ok(0);
+    }
+    let r = |a: i32| safe_read32s(a).map_err(|_| ());
+    let total = r(ct + 0xc)?;
+    if total == 0 {
+        return Ok(0);
+    }
+    if total as u32 > 1024 {
+        return Err(());
+    }
+    let (p_f, p_b, p_i) = if ps {
+        (tech + 0x9c, tech + 0xa0, tech + 0xa4)
+    } else {
+        (tech + 0x90, tech + 0x94, tech + 0x98)
+    };
+    let p_s = tech + 0xa8;
+    let mut ep = ct.wrapping_add(r(ct + 0x10)?).wrapping_add(6);
+    for _ in 0..total {
+        let typ = safe_read16(ep - 2).map_err(|_| ())?;
+        let ext = safe_read16(ep).map_err(|_| ())? + safe_read16(ep + 2).map_err(|_| ())?;
+        let cell = match typ {
+            2 => p_f,
+            0 => p_b,
+            1 => p_i,
+            3 => p_s,
+            _ => return Ok(EAGL_E_FAIL),
+        };
+        let ext = if typ == 3 { safe_read16(ep).map_err(|_| ())? + 1 } else { ext };
+        if (p.read_cell(cell)? as u32) < ext as u32 {
+            eagl_set_decline_reason(3); // would grow → rebuild path
+            return Err(());
+        }
+        ep = ep.wrapping_add(0x14);
+    }
+    Ok(0)
+}
+
+/// Native FUN_005cdca7 (the apply walk). Guest-visible writes (dirty-pair
+/// clears, header-flag clears, node[10] clear, conversion staging) are
+/// commit-gated; the scan models flag cells and dry-runs the apply kernels.
+/// Declines: evaluator nodes, compiled nodes, default-leg descs (inline x87
+/// converter), depth/bounds.
+unsafe fn eagl_cdca7_native(
+    c: &EaglTokenCfg, cc: &EaglCommitCtx, cfg: i32, node: i32, depth: u32, p: &mut EaglPass,
+) -> Result<i32, ()> {
+    if depth > APPLY_MAX_DEPTH {
+        return Err(());
+    }
+    let r = |a: i32| safe_read32s(a).map_err(|_| ());
+    let mut hr = 0i32;
+    let tok0 = r(node)?;
+    if tok0 != -1 {
+        let desc0 = eagl_token_desc(c, tok0)?;
+        if desc0 == 0x6000000 || desc0 == 0x6000001 {
+            let prec = eagl_resolve_record(cc.ctx, node)?;
+            if r(prec + 0xc)? != 0 && r(prec + 0x14)? != 0 {
+                let hdrp = r(prec + 0x18)?;
+                let flags = p.read_cell(hdrp + 0x28)?;
+                if flags & 1 != 0 {
+                    p.write_cell(hdrp + 0x28, flags & !1)?;
+                    let ct = r(prec + 0x14)?;
+                    let blk = r(hdrp + 0x44)?;
+                    let f_base = blk.wrapping_add(8);
+                    let i_base = blk.wrapping_add(r(blk)?);
+                    let b_base = blk.wrapping_add(r(blk + 4)?);
+                    let pairs = r(hdrp + 0x30)?;
+                    let total = r(ct + 0xc)?;
+                    if total as u32 > 1024 {
+                        return Err(());
+                    }
+                    let mut ep = ct.wrapping_add(r(ct + 0x10)?).wrapping_add(8);
+                    for k in 0..total {
+                        let pair = r(pairs.wrapping_add(k.wrapping_mul(4)))?;
+                        let typ = safe_read16(ep - 4).map_err(|_| ())?;
+                        let reg = safe_read16(ep - 2).map_err(|_| ())?;
+                        let cn = safe_read16(ep).map_err(|_| ())?;
+                        match typ {
+                            0 => {
+                                if pair != 0 && p.read_cell(pair)? != 0 {
+                                    hr = eagl_wrapper_apply(cc, cfg, ApplyFamily::Float, ApplyLayout::Packed,
+                                        r(pair + 4)?, b_base.wrapping_add(reg.wrapping_mul(4)), cn, p.commit)?;
+                                }
+                            },
+                            1 => {
+                                if pair != 0 && p.read_cell(pair)? != 0 {
+                                    hr = eagl_wrapper_apply(cc, cfg, ApplyFamily::Float, ApplyLayout::Register,
+                                        r(pair + 4)?, i_base.wrapping_add(reg.wrapping_mul(0x10)), cn, p.commit)?;
+                                }
+                            },
+                            2 => {
+                                if pair != 0 && p.read_cell(pair)? != 0 {
+                                    hr = eagl_wrapper_apply(cc, cfg, ApplyFamily::Int, ApplyLayout::Register,
+                                        r(pair + 4)?, f_base.wrapping_add(reg.wrapping_mul(0x10)), cn, p.commit)?;
+                                }
+                            },
+                            3 => {
+                                if pair != 0 {
+                                    let sub = r(cc.handle_tbl.wrapping_add(r(r(pair + 4)? + 4)?.wrapping_mul(4)))?;
+                                    let m = r(sub + 0x3c)?;
+                                    if m as u32 > 256 {
+                                        return Err(());
+                                    }
+                                    let base = r(sub + 0x40)?;
+                                    for i in 0..m {
+                                        hr = eagl_cdca7_native(c, cc, cfg, base.wrapping_add(i.wrapping_mul(0xac)), depth + 1, p)?;
+                                        if hr < 0 {
+                                            return Ok(hr);
+                                        }
+                                    }
+                                }
+                            },
+                            _ => return Ok(EAGL_E_FAIL),
+                        }
+                        if hr < 0 {
+                            return Ok(hr);
+                        }
+                        if pair != 0 {
+                            p.write_cell(pair, 0)?;
+                        }
+                        ep = ep.wrapping_add(0x14);
+                    }
+                    let f2 = p.read_cell(hdrp + 0x28)?;
+                    p.write_cell(hdrp + 0x28, f2 & !1)?;
+                }
+            }
+        }
+    }
+    // node[10] (+0x28) dirty bit — may have been set by the walk THIS crossing.
+    if p.read_cell(node + 0x28)? & 1 == 0 {
+        return Ok(hr);
+    }
+    if r(node + 0x50)? != 0 {
+        eagl_set_decline_reason(1); // evaluator object (guest vtable call)
+        return Err(());
+    }
+    let tok = r(node)?;
+    if tok == -1 {
+        eagl_set_decline_reason(2); // compiled node tail (__ftol cursor rewrite)
+        return Err(());
+    }
+    let desc = eagl_token_desc(c, tok)?;
+    let rec2 = node + 8;
+    let dst = r(node + 0x4c)?;
+    let cnt = r(node + 0xa8)?;
+    match desc {
+        0x6000002 | 0x6000102 | 0x6000202 | 0x6000302 | 0x6000402
+        | 0x6000005 | 0x6000105 | 0x6000205 | 0x6000305 | 0x6000405 => {
+            hr = eagl_wrapper_apply(cc, cfg, ApplyFamily::Int, ApplyLayout::Register, rec2, dst, cnt, p.commit)?;
+            if hr < 0 {
+                return Ok(hr);
+            }
+        },
+        0x6000003 | 0x6000006 => {
+            hr = eagl_wrapper_apply(cc, cfg, ApplyFamily::Float, ApplyLayout::Register, rec2, dst, cnt, p.commit)?;
+            if hr < 0 {
+                return Ok(hr);
+            }
+        },
+        0x6000004 | 0x6000007 => {
+            hr = eagl_wrapper_apply(cc, cfg, ApplyFamily::Float, ApplyLayout::Packed, rec2, dst, cnt, p.commit)?;
+            if hr < 0 {
+                return Ok(hr);
+            }
+        },
+        0x6000000 | 0x6000001 => {
+            let nx = r(node + 0x60)?;
+            if nx != 0 {
+                hr = eagl_cdca7_native(c, cc, cfg, nx, depth + 1, p)?;
+                if hr < 0 {
+                    return Ok(hr);
+                }
+            }
+        },
+        0x5000000 => {},
+        0x9000000 => {
+            let sub = r(cc.handle_tbl.wrapping_add(r(node + 0xc)?.wrapping_mul(4)))?;
+            let m = r(sub + 0x3c)?;
+            if m as u32 > 256 {
+                return Err(());
+            }
+            let base = r(sub + 0x40)?;
+            for i in 0..m {
+                hr = eagl_cdca7_native(c, cc, cfg, base.wrapping_add(i.wrapping_mul(0xac)), depth + 1, p)?;
+                if hr < 0 {
+                    return Ok(hr);
+                }
+            }
+        },
+        // Default leg = the inline x87 converter (matrix trims, D3DCOLOR
+        // pack) — not replicated; decline the whole crossing (counted).
+        _ => {
+            eagl_set_decline_reason(5);
+            return Err(());
+        },
+    }
+    let d2 = p.read_cell(node + 0x28)?;
+    p.write_cell(node + 0x28, d2 & !1)?;
+    Ok(hr)
+}
+
+/// One ==0-branch constant re-upload (shared by the outer walk and the
+/// inner-list 0x6000000/1 leg): wrapper-convert into the shader block, then
+/// the vtable constant-F upload as a ring entry. e = the DIRTY-list entry
+/// whose [5] indexes the constant table; prec = the shader param record.
+/// Returns the guest hr; Err = decline (I/B upload, structural).
+unsafe fn eagl_walk_const_upload(
+    c: &EaglTokenCfg, cc: &EaglCommitCtx, cfg: i32, e: i32, prec: i32, p: &mut EaglPass,
+) -> Result<i32, ()> {
+    let r = |a: i32| safe_read32s(a).map_err(|_| ());
+    let ct = r(prec + 0x14)?;
+    let ebase = ct.wrapping_add(r(ct + 0x10)?);
+    let ce = ebase.wrapping_add(r(e + 0x14)?.wrapping_mul(0x14));
+    let typ = safe_read16(ce + 4).map_err(|_| ())?;
+    let reg = safe_read16(ce + 6).map_err(|_| ())?;
+    let cn = safe_read16(ce + 8).map_err(|_| ())?;
+    let mut hr;
+    match typ {
+        2 => {
+            let hdrp = r(prec + 0x18)?;
+            let f_base = r(hdrp + 0x44)?.wrapping_add(8);
+            hr = eagl_wrapper_apply(cc, cfg, ApplyFamily::Int, ApplyLayout::Register,
+                r(e + 4)?, f_base.wrapping_add(reg.wrapping_mul(0x10)), cn, p.commit)?;
+            if hr < 0 {
+                return Ok(hr);
+            }
+            let kind = r(prec)?;
+            if kind == 0x10 {
+                eagl_emit_const_f(c, cc.vt, false, cc.dev, reg, f_base.wrapping_add(reg.wrapping_mul(16)), cn, p)?;
+                hr = 0;
+            } else if kind == 0xf {
+                eagl_emit_const_f(c, cc.vt, true, cc.dev, reg, f_base.wrapping_add(reg.wrapping_mul(16)), cn, p)?;
+                hr = 0;
+            } else {
+                hr = EAGL_E_FAIL;
+            }
+        },
+        // Int/bool constant uploads: no WBUF registration for the I/B
+        // setters — decline (counted; register fids if content shows these).
+        1 | 0 => {
+            eagl_set_decline_reason(4);
+            return Err(());
+        },
+        _ => hr = 0, // guest: unhandled type → no upload, falls to *e=0
+    }
+    Ok(hr)
+}
+
+/// Native FUN_005cf304 — the dirty-list commit walk, byte-faithful:
+/// circular list (advance-first, head processed last, head slot re-read each
+/// iteration), `node[10] |= 1` + `*entry = 1/0` status protocol, the three
+/// per-entry branches, the inner dependent-list walk with its unlink writes.
+unsafe fn eagl_walk_native(
+    c: &EaglTokenCfg, cc: &EaglCommitCtx, cfg: i32, commit_rec: i32, p: &mut EaglPass,
+) -> Result<i32, ()> {
+    let r = |a: i32| safe_read32s(a).map_err(|_| ());
+    let list_rec = r(cc.handle_tbl.wrapping_add(r(commit_rec + 4)?.wrapping_mul(4)))?;
+    let head_slot = list_rec + 0x2c;
+    let mut hr = 0i32;
+    let mut e = r(head_slot)?;
+    if e == 0 {
+        return Ok(0);
+    }
+    let mut iters = 0;
+    loop {
+        iters += 1;
+        if iters > 4096 {
+            return Err(());
+        }
+        e = r(e + 0x10)?;
+        let node = r(e + 8)?;
+        let nflags = p.read_cell(node + 0x28)?;
+        p.write_cell(node + 0x28, nflags | 1)?;
+        p.write_cell(e, 1)?;
+        let lk = r(node + 0x5c)?;
+        if lk == 0 {
+            if cc.mode == 3 && cc.stamp30 == r(node + 0x58)? && cc.stamp34 == r(node + 0x54)? {
+                let prec = eagl_resolve_record(cc.ctx, node)?;
+                if r(prec + 0xc)? != 0 && r(prec + 0x14)? != 0 {
+                    let hdrp = r(prec + 0x18)?;
+                    let hflags = p.read_cell(hdrp + 0x28)?;
+                    if hflags & 1 != 0 {
+                        hr = eagl_walk_const_upload(c, cc, cfg, e, prec, p)?;
+                        if hr < 0 {
+                            break;
+                        }
+                        p.write_cell(e, 0)?;
+                        let h2 = p.read_cell(hdrp + 0x28)?;
+                        p.write_cell(hdrp + 0x28, h2 & !1)?;
+                    }
+                }
+            }
+        } else if lk == -1 {
+            let tech = r(node + 0x54)?.wrapping_mul(0xac).wrapping_add(cc.tech_base);
+            let tok = r(node)?;
+            if tok == -1 {
+                eagl_set_decline_reason(2); // compiled shader node
+                return Err(());
+            }
+            let desc = eagl_token_desc(c, tok)?;
+            if desc == 0x6000000 || desc == 0x6000001 {
+                let prec = eagl_resolve_record(cc.ctx, node)?;
+                let ct = r(prec + 0x14)?;
+                hr = eagl_scan_80ae(ct, tech, desc == 0x6000001, p)?;
+                if hr < 0 {
+                    break;
+                }
+            }
+            if cc.mode == 3 && cc.stamp34 == r(node + 0x54)? {
+                // Constant-limit growth (the state-block rebuild path) was
+                // declined inside eagl_scan_80ae — reaching here means the
+                // guest would skip the rebuild and go straight to the tail.
+                if cc.stamp30 == r(node + 0x58)? {
+                    hr = eagl_cdca7_native(c, cc, cfg, node, 0, p)?;
+                    if hr < 0 {
+                        break;
+                    }
+                    hr = eagl_dispatch_token(c, cc.ctx, cc.mode, cc.dev, cc.vt, node, -1, 0, p)?;
+                    if hr < 0 {
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Inner dependent-list walk (mode 3 only in the guest).
+            if cc.mode == 3 {
+                let inner_rec = r(cc.handle_tbl.wrapping_add(lk.wrapping_mul(4)))?;
+                let mut ie = r(inner_rec + 0x2c)?;
+                if ie != 0 {
+                    let mut iters2 = 0;
+                    loop {
+                        iters2 += 1;
+                        if iters2 > 4096 {
+                            return Err(());
+                        }
+                        ie = r(ie + 0x10)?;
+                        let n2 = r(ie + 8)?;
+                        let lk2 = r(n2 + 0x5c)?;
+                        if lk2 == 0 {
+                            if cc.stamp30 == r(n2 + 0x58)? && cc.stamp34 == r(n2 + 0x54)? {
+                                let prec2 = eagl_resolve_record(cc.ctx, n2)?;
+                                if r(prec2)? == 0xf && r(prec2 + 0xc)? != 0 {
+                                    let ct2 = r(prec2 + 0x14)?;
+                                    if ct2 != 0 {
+                                        let reg = safe_read16(
+                                            ct2.wrapping_add(r(ct2 + 0x10)?).wrapping_add(6)
+                                                .wrapping_add(r(ie + 0x14)?.wrapping_mul(0x14)),
+                                        ).map_err(|_| ())?;
+                                        hr = eagl_cdca7_native(c, cc, cfg, node, 0, p)?;
+                                        if hr < 0 {
+                                            return Ok(hr);
+                                        }
+                                        hr = eagl_dispatch_token(c, cc.ctx, cc.mode, cc.dev, cc.vt, node, reg, 0, p)?;
+                                        if hr < 0 {
+                                            return Ok(hr);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if lk2 == -1 {
+                            if cc.stamp30 == r(n2 + 0x58)? && cc.stamp34 == r(n2 + 0x54)? {
+                                let tok2 = r(n2)?;
+                                if tok2 == -1 {
+                                    return Err(());
+                                }
+                                let d2 = eagl_token_desc(c, tok2)?;
+                                if d2 == 0x9000000 {
+                                    hr = eagl_cdca7_native(c, cc, cfg, node, 0, p)?;
+                                    if hr < 0 {
+                                        return Ok(hr);
+                                    }
+                                    hr = eagl_dispatch_token(c, cc.ctx, cc.mode, cc.dev, cc.vt, node, r(n2 + 4)?, 0, p)?;
+                                    if hr < 0 {
+                                        return Ok(hr);
+                                    }
+                                } else if d2 == 0x6000000 || d2 == 0x6000001 {
+                                    let prec2 = eagl_resolve_record(cc.ctx, n2)?;
+                                    if r(prec2 + 0xc)? != 0 && r(prec2 + 0x14)? != 0 {
+                                        let hdr2 = r(prec2 + 0x18)?;
+                                        let hf = p.read_cell(hdr2 + 0x28)?;
+                                        if hf & 1 != 0 {
+                                            // Re-upload the OUTER entry's constant
+                                            // against this dependent shader.
+                                            hr = eagl_walk_const_upload(c, cc, cfg, e, prec2, p)?;
+                                            if hr < 0 {
+                                                return Ok(hr);
+                                            }
+                                            p.write_cell(e, 0)?;
+                                            let h3 = p.read_cell(hdr2 + 0x28)?;
+                                            p.write_cell(hdr2 + 0x28, h3 & !1)?;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Deepest sub-walk: find the dependent ps-shader
+                            // entry, re-dispatch the outer node at its reg,
+                            // then bump that list's head to the entry's [3].
+                            let dl_rec = r(cc.handle_tbl.wrapping_add(lk2.wrapping_mul(4)))?;
+                            let dl_head = r(dl_rec + 0x2c)?;
+                            if dl_head != 0 {
+                                let mut de = dl_head;
+                                let mut last_de;
+                                let mut iters3 = 0;
+                                loop {
+                                    iters3 += 1;
+                                    if iters3 > 4096 {
+                                        return Err(());
+                                    }
+                                    de = r(de + 0x10)?;
+                                    last_de = de;
+                                    let n3 = r(de + 8)?;
+                                    if cc.stamp30 == r(n3 + 0x58)? && cc.stamp34 == r(n3 + 0x54)? {
+                                        let tok3 = r(n3)?;
+                                        if tok3 == -1 {
+                                            return Err(());
+                                        }
+                                        if eagl_token_desc(c, tok3)? == 0x6000001 {
+                                            let prec3 = eagl_resolve_record(cc.ctx, n3)?;
+                                            if r(prec3 + 0xc)? != 0 && r(prec3 + 0x14)? != 0 {
+                                                let ct3 = r(prec3 + 0x14)?;
+                                                let reg3 = safe_read16(
+                                                    ct3.wrapping_add(r(ct3 + 0x10)?).wrapping_add(6)
+                                                        .wrapping_add(r(ie + 0x14)?.wrapping_mul(0x14)),
+                                                ).map_err(|_| ())?;
+                                                hr = eagl_cdca7_native(c, cc, cfg, node, 0, p)?;
+                                                if hr < 0 {
+                                                    return Ok(hr);
+                                                }
+                                                hr = eagl_dispatch_token(c, cc.ctx, cc.mode, cc.dev, cc.vt, node, reg3, 0, p)?;
+                                                if hr < 0 {
+                                                    return Ok(hr);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if de == dl_head {
+                                        break;
+                                    }
+                                }
+                                p.write_cell(
+                                    r(cc.handle_tbl.wrapping_add(r(n2 + 0x5c)?.wrapping_mul(4)))? + 0x2c,
+                                    r(last_de + 0xc)?,
+                                )?;
+                            }
+                        }
+                        // Termination re-reads the OUTER node's list head.
+                        let cur_head = r(r(cc.handle_tbl.wrapping_add(lk.wrapping_mul(4)))? + 0x2c)?;
+                        if ie == cur_head {
+                            break;
+                        }
+                    }
+                    p.write_cell(
+                        r(cc.handle_tbl.wrapping_add(lk.wrapping_mul(4)))? + 0x2c,
+                        r(ie + 0xc)?,
+                    )?;
+                }
+            }
+        }
+        if e == r(head_slot)? {
+            break;
+        }
+    }
+    Ok(hr)
+}
+
+/// Validate-mode cells in the cfg block (see the RFC "Gate S (adapted)").
+const CFG_OFF_VALIDATE_REMAINING: i32 = 0x54;
+const CFG_OFF_PREDICTED_DELTA: i32 = 0x58;
+const CFG_OFF_PREDICTED_HR: i32 = 0x5c;
+/// predictedDelta sentinels for the JS fall-through.
+const PREDICT_STRUCTURAL: i32 = -1i32; // 0xFFFFFFFF — structural decline
+const PREDICT_UNRELIABLE: i32 = -2i32; // 0xFFFFFFFE — model overflow, skip compare
+
+/// Structural-decline attribution (HOWTO §7b): the origin site stamps a
+/// reason code; the shell parks it in the predictedHr cell (only meaningful
+/// alongside PREDICT_STRUCTURAL) for the JS fall-through's counters.
+///   1 evaluator node        5 default-desc (inline converter)
+///   2 compiled node         6 pending __controlfp restore
+///   3 constant-limit growth 7 iteration/depth/shape bound
+///   4 int/bool upload       0 everything else (read fault, stub shape, ...)
+static mut EAGL_WALK_DECLINE_REASON: i32 = 0;
+
+#[inline(always)]
+fn eagl_set_decline_reason(code: i32) {
+    unsafe { EAGL_WALK_DECLINE_REASON = code; }
+}
+
+/// Rotating negative-cache slots (cfg +0x70..0x7f): commit records whose walk
+/// declined on an evaluator/compiled node. The guest FILTER compares its rec
+/// argument against these and routes matches to the original at native speed
+/// — without this, each such walk pays OUT + JS + sync-original (~30µs); at
+/// the measured 3.2K declines/s that alone was a −12% FPS regression. The JS
+/// side ages the slots periodically so a rec that stops carrying evaluator
+/// work regains the native path.
+const CFG_OFF_DECLINE_CACHE: i32 = 0x70;
+static mut EAGL_DECLINE_CACHE_ROTOR: i32 = 0;
+
+/// Shared 133/134 shell: cfg gate, scan, validate-mode protocol, room check,
+/// commit replay, single ring-head publish. `decline_cache_key` (0 = off) is
+/// parked in a negative-cache slot when the scan declines on an evaluator or
+/// compiled node — content-stable decline causes worth bypassing in-guest.
+unsafe fn eagl_batch_shell(
+    cfg: i32,
+    decline_cache_key: i32,
+    run: &mut dyn FnMut(&EaglTokenCfg, i32, &mut EaglPass) -> Result<i32, ()>,
+) -> bool {
+    let ver = match safe_read32s(cfg) { Ok(v) => v, Err(_) => return false };
+    if ver != 3 {
+        return false;
+    }
+    let generation = match safe_read32s(cfg + 0x38) { Ok(v) => v, Err(_) => return false };
+    {
+        let c = &*addr_of!(EAGL_TOKEN_CFG);
+        if c.ptr != cfg || c.generation != generation {
+            if eagl_token_cfg_refresh(cfg).is_err() {
+                return false;
+            }
+        }
+    }
+    let c = &*addr_of!(EAGL_TOKEN_CFG);
+    // Structural sentinel FIRST — every early decline leaves it in place.
+    if safe_write32(cfg + CFG_OFF_PREDICTED_DELTA, PREDICT_STRUCTURAL).is_err() {
+        return false;
+    }
+    eagl_set_decline_reason(0);
+    let head0 = match safe_read32s(c.ring_ctrl) { Ok(v) => v, Err(_) => return false };
+    if head0 < 0 || head0 > c.capacity {
+        return false;
+    }
+    let mut scan = EaglPass::new(false, head0);
+    let hr = match run(c, cfg, &mut scan) {
+        Ok(v) => v,
+        Err(_) => {
+            // Park the origin reason for the JS decline counters (the cell is
+            // only read alongside the PREDICT_STRUCTURAL sentinel).
+            let reason = EAGL_WALK_DECLINE_REASON;
+            let _ = safe_write32(cfg + CFG_OFF_PREDICTED_HR, reason);
+            if decline_cache_key != 0 && decline_cache_key != -1 && (reason == 1 || reason == 2) {
+                let rotor = EAGL_DECLINE_CACHE_ROTOR & 3;
+                let _ = safe_write32(cfg + CFG_OFF_DECLINE_CACHE + rotor * 4, decline_cache_key);
+                EAGL_DECLINE_CACHE_ROTOR = rotor + 1;
+            }
+            return false;
+        },
+    };
+    if scan.head > c.capacity - 64 {
+        return false; // no room — JS completes via the original (drain path)
+    }
+    let validate = safe_read32s(cfg + CFG_OFF_VALIDATE_REMAINING).unwrap_or(0);
+    if validate > 0 {
+        if scan.model_ovf {
+            let _ = safe_write32(cfg + CFG_OFF_PREDICTED_DELTA, PREDICT_UNRELIABLE);
+        } else {
+            let _ = safe_write32(cfg + CFG_OFF_PREDICTED_DELTA, scan.head - head0);
+            let _ = safe_write32(cfg + CFG_OFF_PREDICTED_HR, hr);
+            let _ = safe_write32(cfg + CFG_OFF_VALIDATE_REMAINING, validate - 1);
+        }
+        return false; // JS runs the sync original and compares
+    }
+    let mut com = EaglPass::new(true, head0);
+    let hr = match run(c, cfg, &mut com) {
+        Ok(v) => v,
+        // The commit replays the scan's exact reads with no guest code in
+        // between — an Err here means a write to our own structures failed;
+        // publish nothing (head un-bumped ⇒ partial entries invisible).
+        Err(_) => return false,
+    };
+    if safe_write32(c.ring_ctrl, com.head).is_err() {
+        return false;
+    }
+    write_reg32(EAX, hr);
+    true
+}
+
+/// handler 133 — FUN_005d02d7 (thiscall RET 4): the commit-walk cluster.
+/// ECX = ctx, [esp+4] = commit record. Dep-list entries carry their OWN ctx
+/// (disasm: ECX reloaded from [entry] per call — Ghidra drops this).
+unsafe fn handle_eagl_commit_cluster() -> bool {
+    let cfg = *(hp_ptr().add(OFF_HC_EAGL_TOKEN_CFG_PTR) as *const u32) as i32;
+    if cfg == 0 {
+        return false;
+    }
+    let esp = read_reg32(ESP);
+    let ctx = read_reg32(ECX);
+    let rec = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
+    if rec == 0 || ctx == 0 {
+        return false;
+    }
+    eagl_batch_shell(cfg, rec, &mut |c, cfgp, p| {
+        let r = |a: i32| safe_read32s(a).map_err(|_| ());
+        let cc = eagl_load_commit_ctx(ctx, None)?;
+        let mut last_hr = eagl_walk_native(c, &cc, cfgp, rec, p)?;
+        if last_hr >= 0 {
+            let dep_rec = r(cc.handle_tbl.wrapping_add(r(rec + 4)?.wrapping_mul(4)))?;
+            let dep = r(dep_rec + 0x38)?;
+            if dep != 0 {
+                let mut de = r(dep + 0x10)?;
+                let mut iters = 0;
+                while de != dep {
+                    iters += 1;
+                    if iters > 1024 {
+                        return Err(());
+                    }
+                    let dctx = r(de)?;
+                    if dctx != 0 {
+                        let dcc = eagl_load_commit_ctx(dctx, None)?;
+                        last_hr = eagl_walk_native(c, &dcc, cfgp, r(de + 4)?, p)?;
+                        if last_hr < 0 {
+                            break;
+                        }
+                    }
+                    de = r(de + 0x10)?;
+                }
+            }
+        }
+        Ok(last_hr)
+    })
+}
+
+/// handler 134 — FUN_005d01ec (stdcall RET 8): the pass-commit driver.
+/// [esp+4] = ctx, [esp+8] = pass index. mode==0 / passIdx OOB →
+/// D3DERR_INVALIDCALL exactly like the guest; otherwise ctx+0x30 = passIdx
+/// (commit-gated; the scan sees it via the stamp30 override) and the element
+/// loop runs {apply walk, token dispatch(-1)} per 0xac node.
+unsafe fn handle_eagl_pass_driver() -> bool {
+    let cfg = *(hp_ptr().add(OFF_HC_EAGL_TOKEN_CFG_PTR) as *const u32) as i32;
+    if cfg == 0 {
+        return false;
+    }
+    let esp = read_reg32(ESP);
+    let ctx = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
+    let pass_idx = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
+    if ctx == 0 {
+        return false;
+    }
+    // Negative-cache key mirrors the guest filter: (techniqueIdx ^ passIdx)+1
+    // — stable per material-pass (the evaluator carriers) and never 0, since
+    // tech == pass (key 0 pre-increment) is the dominant in-race case.
+    let cache_key = match safe_read32s(ctx + 0x34) {
+        Ok(v) => (v ^ pass_idx).wrapping_add(1),
+        Err(_) => return false,
+    };
+    eagl_batch_shell(cfg, cache_key, &mut |c, cfgp, p| {
+        let r = |a: i32| safe_read32s(a).map_err(|_| ());
+        let mode = r(ctx + 0x84)?;
+        if mode == 0 {
+            return Ok(0x8876086Cu32 as i32);
+        }
+        let tech = r(ctx + 0x34)?.wrapping_mul(0xac).wrapping_add(r(ctx + 0x1c)?);
+        if r(tech + 0x2c)? as u32 <= pass_idx as u32 {
+            return Ok(0x8876086Cu32 as i32);
+        }
+        let cc = eagl_load_commit_ctx(ctx, Some(pass_idx))?;
+        p.write_cell(ctx + 0x30, pass_idx)?;
+        let pass = pass_idx.wrapping_mul(0x3c).wrapping_add(r(tech + 0x30)?);
+        let count = r(pass + 0x24)?;
+        if count as u32 > 4096 {
+            return Err(());
+        }
+        let base = r(pass + 0x28)?;
+        let mut hr = 0i32;
+        for i in 0..count {
+            let node = base.wrapping_add(i.wrapping_mul(0xac));
+            hr = eagl_cdca7_native(c, &cc, cfgp, node, 0, p)?;
+            if hr < 0 {
+                break;
+            }
+            hr = eagl_dispatch_token(c, cc.ctx, cc.mode, cc.dev, cc.vt, node, -1, 0, p)?;
+            if hr < 0 {
+                break;
+            }
+        }
+        Ok(hr)
+    })
 }

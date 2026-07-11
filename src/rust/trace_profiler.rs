@@ -1,7 +1,7 @@
 #![allow(static_mut_refs)]
 
 // Single-threaded wasm profiler state; all access stays on the CPU worker.
-// Tier-2 trace compiler - Phase 0 dynamic profiler (plan/tier2-trace-compiler.md, Step B).
+// Tier-2 trace compiler dynamic profiler.
 //
 // Observation only: NO new execution path. When a page is watched, its Tier-1
 // compilations additionally emit
@@ -129,11 +129,11 @@ pub unsafe fn trace2_record_indirect(from: u32, target: u32) {
     s.indirects.insert((from, target), 1);
 }
 
-/// Tier-2R region formation (E2b): hot indirect targets recorded for the
+/// Tier-2R region formation: hot indirect targets recorded for the
 /// AbsoluteEip terminal at physical `from`. Returns up to `max_k` runtime
 /// virtual targets whose per-site share is at least `min_share_percent`,
 /// hottest first. Used by jit_find_basic_blocks when JIT_INDIRECT_REGIONS is
-/// enabled - see plan/tier2-region-recompiler.md section 5 (E2/E4).
+/// enabled.
 pub fn hot_indirect_targets(from: u32, max_k: usize, min_share_percent: u64) -> Vec<u32> {
     let s = state();
     let mut targets: Vec<(u32, u64)> = s
@@ -192,7 +192,7 @@ pub unsafe fn trace2_reset() {
 
 /// Stop recording and drop instrumentation from watched pages, but KEEP the
 /// collected histograms - so a subsequent (uninstrumented) recompile can still
-/// consume them for region formation (Tier-2R E2b staged flow:
+/// consume them for region formation (Tier-2R staged flow:
 /// watch -> collect -> unwatch_all -> recompile-with-regions).
 #[no_mangle]
 pub unsafe fn trace2_unwatch_all() {

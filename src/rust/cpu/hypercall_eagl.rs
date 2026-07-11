@@ -1,6 +1,5 @@
 //! Inner-loop HLE handlers for EAGL (EA Graphics Layer) — the 128..=132 band
-//! of the hypercall dispatch table (see hypercall.rs try_dispatch and
-//! plan/inner-loop-hle.md / plan/eagl-state-commit-hle-rfc.md):
+//! of the hypercall dispatch table (see hypercall.rs try_dispatch):
 //!
 //!   128       shader-constant converter (guest FUN_005cbd17)
 //!   129..=131 shader-parameter APPLY converter family (FUN_005c85c1/8303/ad01)
@@ -335,7 +334,7 @@ unsafe fn eagl_apply_walk(
 
 /// handler_id 132 — EAGL→D3D9 state-token dispatcher (guest FUN_005c97cb,
 /// __thiscall RET 8: ECX = EAGL device ctx, [esp+4] = token node, [esp+8] =
-/// stage-or-index). plan/eagl-state-commit-hle-rfc.md.
+/// stage-or-index).
 ///
 /// A guest-side filter trampoline (hle-lib libs/eagl/token-dispatch.ts)
 /// classifies the token BEFORE the OUT and routes only class 1
@@ -1107,9 +1106,9 @@ unsafe fn eagl_dispatch_class6_batch(
     true
 }
 
-// === Phase 3 — commit-cluster (133) & pass-driver (134) batch engines =======
+// === Commit-cluster (133) & pass-driver (134) batch engines =======
 //
-// plan/eagl-state-commit-hle-rfc.md "Phase 3 design". Two patch points:
+// Two patch points:
 //   133 FUN_005d02d7 (thiscall RET 4): dep-list loop over FUN_005cf304, the
 //       dirty-list commit walk — replicated in full below (eagl_walk_native).
 //   134 FUN_005d01ec (stdcall RET 8): pass-commit driver — stamp write +
@@ -1674,7 +1673,7 @@ unsafe fn eagl_walk_native(
     Ok(hr)
 }
 
-/// Validate-mode cells in the cfg block (see the RFC "Gate S (adapted)").
+/// Validate-mode cells in the cfg block.
 const CFG_OFF_VALIDATE_REMAINING: i32 = 0x54;
 const CFG_OFF_PREDICTED_DELTA: i32 = 0x58;
 const CFG_OFF_PREDICTED_HR: i32 = 0x5c;
@@ -1682,7 +1681,7 @@ const CFG_OFF_PREDICTED_HR: i32 = 0x5c;
 const PREDICT_STRUCTURAL: i32 = -1i32; // 0xFFFFFFFF — structural decline
 const PREDICT_UNRELIABLE: i32 = -2i32; // 0xFFFFFFFE — model overflow, skip compare
 
-/// Structural-decline attribution (HOWTO §7b): the origin site stamps a
+/// Structural-decline attribution: the origin site stamps a
 /// reason code; the shell parks it in the predictedHr cell (only meaningful
 /// alongside PREDICT_STRUCTURAL) for the JS fall-through's counters.
 ///   1 evaluator node        5 default-desc (inline converter)

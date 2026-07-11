@@ -94,7 +94,7 @@ pub struct WasmBuilder {
     local_count: u8,
     pub arg_local_initial_state: WasmLocal,
 
-    // DOD RFC part 2 (flag-tuple in locals, jit config idx 21). Registered by
+    // Flag-tuple in locals (jit config idx 21). Registered by
     // jit_generate_module when enabled: (local_idx, linear-memory address) for each
     // of the five lazy-flag globals. While Some, the locals are the authoritative
     // flag state and call_fn() spills them to memory before — and reloads them
@@ -104,7 +104,7 @@ pub struct WasmBuilder {
     pub flag_locals: Option<[(u8, u32); 5]>,
 }
 
-// Helpers proven not to touch the lazy-flag globals (RFC §2.2b). Everything else
+// Helpers proven not to touch the lazy-flag globals. Everything else
 // gets the spill/reload pair — including every generated instr_* helper.
 fn flag_spill_whitelisted(name: &str) -> bool {
     name.starts_with("safe_read")
@@ -1100,7 +1100,7 @@ impl WasmBuilder {
     }
 
     fn call_fn(&mut self, name: &str, function: FunctionType) {
-        // Flag-locals funnel (RFC §2.2b): materialize the lazy-flag tuple to its
+        // Flag-locals funnel: materialize the lazy-flag tuple to its
         // memory globals before any helper that may read them, and re-read after
         // any helper that may have written them. Emitting stores/loads here is
         // stack-safe even with the call's arguments already pushed: each store

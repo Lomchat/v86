@@ -318,7 +318,7 @@ pub static mut tsc_speed: u64 = 1;
 pub static mut tsc_offset: u64 = 0;
 
 // Compiled-code dispatch metadata moved to the DOD SoA in jit.rs (DISPATCH_META /
-// DISPATCH_SLABS — see the RFC reference there). The old per-page Box<Code> +
+// DISPATCH_SLABS). The old per-page Box<Code> +
 // tlb_code pointer array cost a 3-deep dependent-load chase on every ret/indirect
 // dispatch; the SoA derives all addresses from the page number alone.
 
@@ -436,7 +436,7 @@ pub static mut DBG_WW_ZERO_HITS: u32 = 0;
 
 #[no_mangle] pub unsafe fn dbg_set_write_watch(addr: u32) {
     crate::jit::fastmem_bump_generation(crate::jit::FASTMEM_BUMP_WRITE_WATCH);
-    // Track 2b Phase W: force the watched page onto the store slow path so dbg_check_write
+    // Force the watched page onto the store slow path so dbg_check_write
     // still fires when fastmem writes are on (the fast path bypasses it). Move bit2 from
     // the previously watched page to the new one (addr == 0 disarms → just clear).
     if DBG_WRITE_WATCH != 0 {
@@ -2440,7 +2440,7 @@ pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: boo
 }
 
 pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
-    // Track 2b Phase W: keep the fastmem write map's SMC bit (bit1) in lockstep with
+    // Keep the fastmem write map's SMC bit (bit1) in lockstep with
     // TLB_HAS_CODE. Under the identity map (where bit0 is ever set) physical == virtual
     // page, so this is the exact, page-precise TLB_HAS_CODE discipline for stores.
     if has_code {
@@ -2472,9 +2472,9 @@ pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
 }
 pub fn tlb_set_has_code_multiple(physical_pages: &HashSet<Page>, has_code: bool) {
     let physical_pages: Vec<Page> = physical_pages.into_iter().copied().collect();
-    // Track 2b Phase W: mirror TLB_HAS_CODE into the write map's SMC bit (bit1) for the
+    // Mirror TLB_HAS_CODE into the write map's SMC bit (bit1) for the
     // whole set. On the compile path this runs before the module's entries become
-    // dispatchable, closing the SMC window (plan §5).
+    // dispatchable, closing the SMC window.
     for &p in &physical_pages {
         if has_code {
             jit::fastmem_write_map_set_code(p.to_u32());
@@ -3174,8 +3174,8 @@ pub unsafe fn cycle_internal() {
             in_jit = false;
         }
 
-        // Block-chaining Phase 0: a compiled module just returned control to the dispatch loop.
-        // This is the per-module-entry overhead Plan B targets. The breakdown of WHY it exited
+        // Block-chaining: a compiled module just returned control to the dispatch loop.
+        // This is the per-module-entry overhead. The breakdown of WHY it exited
         // (chainable / dynamic / indirect) is counted at the exit sites in jit.rs.
         if jit::dispatch_stats_enabled() {
             profiler::stat_increment_always(stat::MODULE_REENTRY);

@@ -42,8 +42,8 @@
 //!          When nonzero the slab control fields (base/end/bump/gen/counts/freelist) live in
 //!          GUEST RAM at this address (same relative layout as the 0x1400 fields rebased to 0),
 //!          NOT in this page. Required because the inline x86 stubs can only address guest RAM
-//!          (this page is a WASM static below guest RAM, unreachable from guest code). See
-//!          plan/slab-d2-handoff.md. The 0x1400.. page fields are then vestigial (legacy mode).
+//!          (this page is a WASM static below guest RAM, unreachable from guest code).
+//!          The 0x1400.. page fields are then vestigial (legacy mode).
 //!   0x1448: hc_event_table      [u8; 2048] — mirrored kernel event state (see EVT_* flags)
 //!   0x1C48: hc_event_starvation_counter u32 — consecutive WASM-handled SetEvent calls
 //!   0x1C4C: hc_event_starvation_limit   u32 — max consecutive before JS fallthrough
@@ -102,12 +102,11 @@ const HC_FLS_SLOT_COUNT: usize = 129;
 // Arena slab control block (HeapAlloc/HeapFree fast path). The live control block lives in
 // GUEST RAM at hc_slab_ctl_ptr and is accessed via SLAB_REL_* below; the legacy 0x1400-based
 // page layout is documented in the header block above and mirrored on the JS side.
-// See plan/slab-d2-handoff.md.
 const OFF_HC_SLAB_CTL_PTR: usize = 0x1444; // guest addr of slab control block (0 = legacy page)
 const OFF_HC_EVENT_TABLE: usize = 0x1448;
 
 // Relative offsets WITHIN the slab control block (page fields rebased to 0). Used when the
-// control block lives in guest RAM (hc_slab_ctl_ptr != 0) — see plan/slab-d2-handoff.md.
+// control block lives in guest RAM (hc_slab_ctl_ptr != 0).
 const SLAB_REL_BASE: u32 = 0x00;
 const SLAB_REL_END: u32 = 0x04;
 const SLAB_REL_BUMP: u32 = 0x08;
@@ -344,8 +343,8 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         80 => handle_release_mutex(),
         81 => handle_wait_for_single_object(),
 
-        // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels
-        //    (plan/inner-loop-hle.md), kept in a distinct range from the
+        // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels,
+        //    kept in a distinct range from the
         //    conventional WinAPI/CRT tiers (1..=127 above, which are generic
         //    Windows/CRT semantics) so the category is obvious from the
         //    dispatch byte alone. Engine-specific handlers do NOT live in this

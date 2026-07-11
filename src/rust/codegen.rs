@@ -1168,7 +1168,7 @@ pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal
     ctx.builder.free_local(entry_local);
 }
 
-// Track 2b Phase W — store fast path gated by the per-page write map (idx 19).
+// Store fast path gated by the per-page write map (idx 19).
 // Structure mirrors gen_fastmem_read_split: a result-typed `host` block yields the
 // wasm-memory offset to store to. Fast path (map byte == 1 → base-writable, no
 // compiled code, no watch, and the access does not cross a page) yields `mem8 + addr`
@@ -1176,7 +1176,7 @@ pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal
 // itself validates + performs MMIO / page-cross writes and returns a TLB-style entry
 // so the trailing inline store lands in real RAM (or a scratch page for the cases the
 // helper already handled). No generation guard — the map is DATA read per store, kept
-// honest synchronously at the same choke points as the TLB (plan §1.2/§1.3).
+// honest synchronously at the same choke points as the TLB.
 fn gen_fastmem_write_map(
     ctx: &mut JitContext,
     bits: BitSize,
@@ -1303,7 +1303,7 @@ fn gen_safe_write(
     address_local: &WasmLocal,
     value_local: GenSafeWriteValue,
 ) {
-    // Track 2b Phase W: when enabled for this unit, route through the per-page write
+    // When enabled for this unit, route through the per-page write
     // map instead of the inline TLB fast path. Flag off = byte-identical to below.
     if ctx.fastmem_writes {
         gen_fastmem_write_map(ctx, bits, address_local, value_local);
@@ -3440,9 +3440,9 @@ fn gen_fpu_relaxed_stat_increment(builder: &mut WasmBuilder, stat: profiler::sta
     builder.increment_fixed_i64(addr, 1);
 }
 
-// Block-chaining Phase 0 — emit an always-on dispatch-characterisation counter increment into the
-// compiled block (gated at compile time by jit::DISPATCH_STATS so it's free unless measuring). See
-// plan/block-chaining.md and profiler::stat. Call sites pass MODULE_EXIT_* / BLOCK_EXECUTION.
+// Emit an always-on dispatch-characterisation counter increment into the
+// compiled block (gated at compile time by jit::DISPATCH_STATS so it's free unless measuring).
+// See profiler::stat. Call sites pass MODULE_EXIT_* / BLOCK_EXECUTION.
 pub fn gen_dispatch_stat_increment(builder: &mut WasmBuilder, stat: profiler::stat) {
     if !crate::jit::dispatch_stats_enabled() {
         return;
@@ -4794,7 +4794,7 @@ pub fn gen_move_registers_from_locals_to_memory(ctx: &mut JitContext) {
     }
     // Flag locals share the registers' spill discipline: wherever guest register
     // state must be visible in memory (block-boundary helpers, module exits, the
-    // OUT/hypercall context-save class — RFC §2.2c), the flag tuple must be too.
+    // OUT/hypercall context-save class), the flag tuple must be too.
     ctx.builder.emit_flag_spill();
 }
 pub fn gen_move_registers_from_memory_to_locals(ctx: &mut JitContext) {

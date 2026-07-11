@@ -122,7 +122,7 @@ pub enum stat {
     FPU_RELAXED_HIT,
     FPU_RELAXED_FALLBACK,
 
-    // Block-chaining Phase 0 — dispatch characterisation (see plan/block-chaining.md).
+    // Block-chaining dispatch characterisation.
     // These are ALWAYS-ON counters (incremented via increment_fixed_i64 in compiled code and
     // stat_increment_always at runtime), gated only by the jit::DISPATCH_STATS toggle so they
     // work WITHOUT the `profiler` feature. Read them through profiler_dispatch_stat_get below

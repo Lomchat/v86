@@ -6,8 +6,7 @@
 //! this is NOT wired into the OUT-trap dispatch table — D3D9 setters already ride the
 //! no-trap WBUF ring and draws are synchronous FastPath calls, both already correctly
 //! ordered by the existing JS dispatch. JS calls the exported functions below directly,
-//! at the same call sites it uses today (see plan/wasm-resident-d3d-command-path.md and
-//! the implementation plan for the full rationale).
+//! at the same call sites it uses today.
 //!
 //! Scope: the PROGRAMMABLE (VS+PS-bound) draw path only. FFP draws (vsHandle==0 ||
 //! psHandle==0) are declined (record_draw* returns -1) — callers must fall back to the
@@ -64,13 +63,9 @@ const SHADER_HANDLE_SLOTS: usize = 1024;
 const VS_CONST_FLOATS: usize = 256 * 4;
 const PS_CONST_FLOATS: usize = 224 * 4;
 // Every draw emits AT LEAST 3 SoA rows (SetPipeline + BindProgrammable + Draw/DrawIndexed
-// — no redundant-emission elision in this pass, that's a future phase), plus occasional
-// SetVertexBuffer/SetIndexBuffer rows on a binding change. NFSU in-race measures ~1800
-// draws/frame (see plan/wasm-resident-draw-path.md §0), so 2560 (originally sized as if
-// 1 row/draw) overflowed almost every frame in practice (measured 625,811 cumulative
-// overflow events during runtime verification). 8192 cut that ~99% (to 7,502 over a much
-// longer run) but didn't fully eliminate it — some frames genuinely exceed ~2700 draws
-// (traffic-heavy scenes) — bumped to 16384 (~5400 draws headroom) to close the remainder.
+// — no redundant-emission elision in this pass), plus occasional SetVertexBuffer/
+// SetIndexBuffer rows on a binding change. Heavy scenes can exceed ~2700 draws/frame,
+// so CMD_CAP is sized at 16384 (~5400 draws of headroom) to avoid arena overflow.
 pub const CMD_CAP: usize = 16384;
 const BUMP_CAP: usize = 16 * 1024 * 1024;
 
@@ -110,7 +105,7 @@ const OFF_FFP_FALLBACK_COUNT: usize = OFF_OVERFLOW_COUNT + 4;
 const OFF_MISMATCH_COUNT: usize = OFF_FFP_FALLBACK_COUNT + 4;
 
 // ---------------------------------------------------------------------------
-// State-block slots (Block A, plan/stateblock-arena-and-superblocks-vision.md).
+// State-block slots.
 // A slot is the arena-resident image of one "arena-coverable" IDirect3DStateBlock9:
 // bitmasks/ranges say WHICH states the block recorded; the value arrays hold the
 // block's captured values. JS writes masks/ranges/initial values through views at
@@ -341,12 +336,11 @@ unsafe fn rs(state: usize) -> i32 {
 /// *ENABLE render state is off — `computeBlendKey` returns bare `n${writeMask}` when
 /// D3DRS_ALPHABLENDENABLE=0 (srcBlend/dstBlend/blendOp/separateAlpha/*Alpha are irrelevant
 /// and NOT part of the key), and `alphaTestKey` returns `"a0"` when D3DRS_ALPHATESTENABLE=0
-/// (func/ref irrelevant). An earlier version of this function hashed those fields
-/// UNCONDITIONALLY — since D3D9 doesn't require an app to zero blend/alpha-test registers
-/// when disabling them, leftover/stale values differed across draws that TS (correctly)
-/// treats as the SAME pipeline identity, causing a real ~0.2-0.3% pipelineKey
-/// cross-check mismatch rate (measured via dbg.d3dArenaStats(), root-caused 2026-07-01).
-/// Fixed by mirroring the exact same collapse-when-disabled behavior.
+/// (func/ref irrelevant). These fields MUST be hashed conditionally, not
+/// unconditionally: D3D9 doesn't require an app to zero blend/alpha-test registers
+/// when disabling them, so leftover/stale values would differ across draws that TS
+/// (correctly) treats as the SAME pipeline identity, causing pipelineKey cross-check
+/// mismatches. Mirror the exact same collapse-when-disabled behavior here.
 unsafe fn derive_blend_alpha_fields() -> (u32, u32, u32) {
     let write_mask = (rs(D3DRS_COLORWRITEENABLE) & 0xf) as u32;
     let alpha_blend_enable = (rs(D3DRS_ALPHABLENDENABLE) != 0) as u32;
@@ -785,7 +779,7 @@ pub unsafe fn d3d9_record_draw_indexed_up(
 }
 
 // ---------------------------------------------------------------------------
-// State-block Capture/Apply (Block A) — see the slot layout comment above.
+// State-block Capture/Apply — see the slot layout comment above.
 // ---------------------------------------------------------------------------
 
 #[inline(always)]

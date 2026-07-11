@@ -165,11 +165,11 @@ function print_misc_stats(cpu)
     return text;
 }
 
-// Block-chaining Phase 0 — dispatch characterisation (see plan/block-chaining.md). Reads the
+// Dispatch characterisation. Reads the
 // always-on dispatch counters via profiler_dispatch_stat_get (works WITHOUT the profiler feature).
 // Enable with set_dispatch_stats(1) + clear the JIT cache BEFORE the workload runs (dbg.dispatchStatsEnable()).
 // The headline number is CHAINABLE FRACTION = MODULE_EXIT_CHAINABLE / MODULE_REENTRY: the share of the
-// per-module dispatch tax that a WASM tail-call (Phase 1) could remove. This is the go/no-go gate.
+// per-module dispatch tax that a WASM tail-call could remove.
 function dispatch_characterisation(cpu)
 {
     const dget = cpu.wm.exports["profiler_dispatch_stat_get"];

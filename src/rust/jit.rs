@@ -70,13 +70,12 @@ static mut JIT_DISABLED: bool = false;
 static mut MAX_PAGES: u32 = 3;
 
 static mut JIT_USE_LOOP_SAFETY: bool = true;
-// RET/AbsoluteEip dynamic chaining (Block B mechanism 1, see
-// plan/stateblock-arena-and-superblocks-vision.md): when the in-module AbsoluteEip
+// RET/AbsoluteEip dynamic chaining: when the in-module AbsoluteEip
 // re-dispatch misses, attempt a cross-module tail-call at the runtime eip instead of
 // exiting to main_loop. Gated at COMPILE time — toggle via
 // set_jit_config(12) and clear the JIT cache.
 static mut JIT_RET_CHAINING: bool = false;
-// RET-target speculation (Block B mechanism 2, superblock lite): annotate the RET of a
+// RET-target speculation (superblock lite): annotate the RET of a
 // small module-local leaf with its call sites' return addresses and emit inline
 // eip-compare + direct dispatcher re-entry, skipping the jit_find_cache_entry_in_page
 // helper on the hot return path. Same-page CALL discovery already splices the callee's
@@ -97,9 +96,8 @@ const RET_SPEC_MAX_CANDIDATES: usize = 4;
 //   - free_wasm_table_index — the ONLY place a wasm-table slot is nulled
 //     (jit_clear_func). NOT free_wasm_module: codegen_finalize_finished's
 //     module-overwrite path (INVALIDATE_MODULE_UNUSED_AFTER_OVERWRITE) frees the
-//     replaced module's index WITHOUT going through free_wasm_module — that was the
-//     null-function crash of the first landing (docs/v86-403a4ee-null-function-
-//     rootcause.md, Mechanism 0).
+//     replaced module's index WITHOUT going through free_wasm_module — missing this
+//     bump causes a null-function crash (Mechanism 0).
 //   - clear_tlb_code, when it actually drops a Code entry — the stock resolver
 //     re-derived liveness from tlb_code on every dispatch; after an eviction/remap
 //     a memo hit would dispatch a stale-but-live module the resolver would have
@@ -139,7 +137,7 @@ static mut JIT_TIER2_RET_SPEC_MAX_INSTR: u32 = 96;
 // modules (cold code keeps the global MAX_PAGES), so the V8 large-function OOM risk
 // that forbids raising the global cap doesn't apply at moderate values.
 static mut TIER2_MAX_PAGES: u32 = 8;
-// Split-range fastmem read shape (Track 2b): two early-exit range tests instead of the
+// Split-range fastmem read shape: two early-exit range tests instead of the
 // 4-compare and/or chain — hot below-guard reads drop ~25 → ~10 wasm ops. Same
 // acceptance set; A/B via set_jit_config idx 18 + JIT cache clear (shape is baked in
 // at module compile time).
@@ -229,29 +227,29 @@ static mut JIT_DEAD_FLAG_ELISION: bool = false;
 static mut JIT_FASTMEM_READS: bool = false;
 static mut JIT_X87_LOCALS: bool = false;
 static mut JIT_PUSH_RUN_COALESCING: bool = false;
-// Track 2b Phase W — fastmem WRITES behind a per-page writability map (idx 19).
-// Off by default until the in-game gate passes (plan/2b-codegen-quality.md §1.4).
+// Fastmem WRITES behind a per-page writability map (idx 19).
+// Off by default until the in-game gate passes.
 static mut JIT_FASTMEM_WRITES: bool = false;
-// DOD RFC part 2 (plan/dod-dispatch-flatten-rfc.md §2) — lazy-flag tuple in wasm
+// Lazy-flag tuple in wasm
 // LOCALS instead of linear-memory globals 96-120 (idx 21, default OFF). Removes
 // per-ALU-op flag stores AND their TurboFan aliasing barriers. Correctness
 // contract: locals are authoritative between spills; the builder-level call_fn
-// funnel spills/reloads around every non-whitelisted helper call (§2.2b/§2.2c —
-// covers arith flag-protocol helpers AND OUT/hypercall context saves), and the
+// funnel spills/reloads around every non-whitelisted helper call (covers arith
+// flag-protocol helpers AND OUT/hypercall context saves), and the
 // module epilogues spill at every exit.
 static mut JIT_FLAG_LOCALS: bool = false;
 
-// Tier-2R (E2b, plan/tier2-region-recompiler.md §5): grow page groups across
+// Tier-2R region recompiler: grow page groups across
 // indirect edges using trace_profiler target histograms, and make hot indirect
 // targets dispatcher entries so AbsoluteEip re-dispatches stay intra-module.
 // Off by default; requires collected trace2 data to have any effect.
 static mut JIT_INDIRECT_REGIONS: bool = false;
 
-// E2b safety: virtual-address range that indirect-region growth must NEVER pull
+// Region-growth safety: virtual-address range that indirect-region growth must NEVER pull
 // targets from — the thunk/callback/spin bucket. Guest code indirect-calls thunk
 // stubs constantly (GetProcAddress'd exports), so profiled indirect targets point
-// into stub pages; compiling those into a guest superblock trapped `unreachable`
-// at CALLBACK_STUB+0x477f0 within ~1 min (2026-07-08). Set by JS via
+// into stub pages; compiling those into a guest superblock traps `unreachable`
+// at CALLBACK_STUB+0x477f0. Set by JS via
 // jit_set_region_exclusion (scheduler arms it with [THUNK_CODE_BASE, ROM_BASE)).
 // hi == 0 → no exclusion (feature off, e.g. older TS).
 static mut REGION_EXCLUDE_LO: u32 = 0;
@@ -280,7 +278,7 @@ static mut JIT_INDIRECT_REGION_MAX_PAGES: u32 = 8;
 
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
-// Block-chaining Phase 0 — dispatch characterisation toggle (see plan/block-chaining.md).
+// Block-chaining dispatch characterisation toggle.
 // When enabled, the JIT emits the always-on dispatch-characterisation counters (BLOCK_EXECUTION
 // and MODULE_EXIT_*) and the runtime increments MODULE_REENTRY / MODULE_EXIT_INDIRECT. The
 // codegen-emitted counters are gated at COMPILE time, so enable this BEFORE the workload compiles
@@ -321,7 +319,7 @@ static mut FASTMEM_SPECULATED_LOADS_COMPILED: u32 = 0;
 static mut FASTMEM_DEOPT_RECOMPILES: u32 = 0;
 static mut FASTMEM_THRASH_LATCHED: bool = false;
 
-// ── Fastmem WRITE map (Track 2b Phase W, plan/2b-codegen-quality.md §1.2) ─────────
+// ── Fastmem WRITE map ─────────────────────────────────────────────────────────────
 // One byte per 4 KB VA page across the full 4 GB space (1 MB static). The JIT store
 // fast path (codegen::gen_fastmem_write_map) accepts a page IFF its byte == 1, so the
 // byte is a bitfield where every restriction independently vetoes the fast path:
@@ -330,8 +328,8 @@ static mut FASTMEM_THRASH_LATCHED: bool = false;
 //   bit2  WRITE_WATCH    debug write-watch armed on this page       — owner: rust dbg_set_write_watch
 // Unlike read speculation this carries NO stale window and NO generation guard: the map
 // is DATA, read per store, updated synchronously at the same choke points that keep the
-// TLB honest, so compiled code never goes stale (§1.3). A stale-writable byte on an
-// RO/CoW/code page would be silent memory corruption (the July class), so the ONLY safe
+// TLB honest, so compiled code never goes stale. A stale-writable byte on an
+// RO/CoW/code page would be silent memory corruption, so the ONLY safe
 // failure direction is leaving a byte != 1 (slow path, byte-precise). Init all zeros =
 // conservative = correct; TS marks RW ranges as regions register/commit during boot.
 pub const FASTMEM_WRITE_MAP_LEN: usize = 1 << 20; // 4 GB / 4 KB pages, one byte each
@@ -350,13 +348,12 @@ static mut FASTMEM_WRITE_MAP_MAX_PAGE: u32 = 0;
 static mut FASTMEM_WRITE_EXCLUDE_LO_PAGE: u32 = 0;
 static mut FASTMEM_WRITE_EXCLUDE_HI_PAGE: u32 = 0;
 
-// ── DOD dispatch metadata (RFC plan/dod-dispatch-flatten-rfc.md, Part 1) ──────────
+// ── DOD dispatch metadata ─────────────────────────────────────────────────────────
 // Replaces the Box<Code> layout behind the old `cpu::tlb_code` pointer array. The
 // hot resolvers (jit_find_cache_entry* — called on EVERY guest ret/indirect jump,
-// hit or miss) used to walk THREE dependent loads, two through heap pointers:
+// hit or miss) previously walked THREE dependent loads, two through heap pointers:
 //   tlb_code[page] → *Box<Code> → .state_table[offset]
-// measured at 40-130ns/call (cache-miss-bound pointer chase; 12.6% of worker busy
-// on NFSU in-race, 2026-07-09 trace). The SoA replacement derives every address
+// a cache-miss-bound pointer chase. The SoA replacement derives every address
 // from `page` alone — the loads are INDEPENDENT and issue in parallel:
 //   DISPATCH_META[page]                        ; packed word, dense 8 MB array
 //   DISPATCH_SLABS[slab*0x1000 + (addr&0xFFF)] ; dense u16 pool, no chase
@@ -851,9 +848,9 @@ pub const BRTABLE_CUTOFF: usize = 10;
 // needs to be synced to const.js
 pub const WASM_TABLE_SIZE: u32 = 900;
 
-// Crash-hunt 2026-07-10: light the invariant checks up in debug builds — the
-// retail-NFSU corruption class (silent ExitProcess via #PF on garbage state)
-// needs the free/publish discipline asserted loudly, not assumed.
+// Light the invariant checks up in debug builds — the corruption class
+// (silent ExitProcess via #PF on garbage state) needs the free/publish
+// discipline asserted loudly, not assumed.
 pub const CHECK_JIT_STATE_INVARIANTS: bool = cfg!(debug_assertions);
 
 const MAX_INSTRUCTION_LENGTH: u32 = 16;
@@ -1017,7 +1014,7 @@ pub struct BasicBlock {
     pub ty: BasicBlockType,
     pub has_sti: bool,
     pub number_of_instructions: u32,
-    /// RET-target speculation (Block B mechanism 2, superblock lite): for an AbsoluteEip
+    /// RET-target speculation (superblock lite): for an AbsoluteEip
     /// block that is a genuine RET of a small leaf function called from within this
     /// module, the (virt, phys) return addresses of its module-local call sites. The
     /// emitter turns each into `if eip == virt { target_block = <dispatcher idx>;
@@ -1117,7 +1114,7 @@ pub struct JitContext<'a> {
     pub elide_current_flags: bool,
     pub instruction_counter: WasmLocal,
     pub fastmem_generation: Option<u64>,
-    /// Track 2b Phase W: emit the per-page-map store fast path for this unit.
+    /// Emit the per-page-map store fast path for this unit.
     pub fastmem_writes: bool,
     pub x87_local_cache: [Option<X87LocalCacheSlot>; 8],
     pub push32_write_cache: Option<Push32WriteCache>,
@@ -1430,7 +1427,7 @@ pub fn jit_find_cache_entry_in_page(
 
     profiler::stat_increment(stat::INDIRECT_JUMP_NO_ENTRY);
 
-    // Block-chaining Phase 0: an indirect jmp/call (AbsoluteEip) whose target is not in this
+    // Block-chaining: an indirect jmp/call (AbsoluteEip) whose target is not in this
     // module → real exit to main_loop. eip was computed at runtime, so not statically chainable.
     if dispatch_stats_enabled() {
         profiler::stat_increment_always(stat::MODULE_EXIT_INDIRECT);
@@ -1445,7 +1442,7 @@ pub fn jit_find_cache_entry_in_page(
 #[no_mangle]
 pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32 {
     // same quantum as do_many_cycles_native (limit==0 urgent exit and in_hlt still bail) —
-    // this is what keeps the async-park/spin-loop invariant (CLAUDE.md §3.5): an urgent
+    // this is what keeps the async-park/spin-loop invariant: an urgent
     // exit request zeroes the budget, so we never chain past it.
     let limit = hypercall::read_cycle_limit();
     let elapsed = (*global_pointers::instruction_counter)
@@ -1537,7 +1534,7 @@ fn jit_find_basic_blocks(
         // stub pages are full of OUT traps and must stay standalone modules. This must
         // gate EVERY growth edge, not just profiled indirect targets — direct IAT-style
         // CALLs into stubs reached CALLBACK_STUB pages once the tier-2 page budget grew
-        // past the default (fatal 0x3003 mid-race within ~1 min, 2026-07-08).
+        // past the default (fatal 0x3003).
         // `!pages.is_empty()` is load-bearing: the INITIAL entry points are seeded
         // through follow_jump with an empty page set — gating those blocks stub-page
         // modules from compiling at all (their dispatch then hits `unreachable` at the
@@ -1839,7 +1836,7 @@ fn jit_find_basic_blocks(
                     if analysis.absolute_jump {
                         current_block.ty = BasicBlockType::AbsoluteEip;
 
-                        // Tier-2R (E2b): grow the region across this indirect
+                        // Tier-2R: grow the region across this indirect
                         // edge using profiled targets. Targets that join the
                         // region are marked as entries so the runtime
                         // jit_find_cache_entry_in_page re-dispatch stays
@@ -1866,8 +1863,7 @@ fn jit_find_basic_blocks(
                                 // Seeding such an offset as a dispatcher entry makes
                                 // the runtime dispatch ENTER a misdecoded block —
                                 // wrong ModRM/base → stores through garbage/NULL
-                                // pointers at random guest sites (retail NFSU died
-                                // in-race within minutes, 2026-07-08). Direct edges
+                                // pointers at random guest sites. Direct edges
                                 // only ever mark interpreter-registered boundaries;
                                 // hold profiled targets to the same standard: the
                                 // exact offset must be a registered entry point of
@@ -1955,7 +1951,7 @@ fn jit_find_basic_blocks(
         }
     }
 
-    // RET-target speculation post-pass (Block B mechanism 2). For every module-local
+    // RET-target speculation post-pass. For every module-local
     // call site (a Normal block whose jump target isn't its fall-through AND whose
     // fall-through was registered as an entry — the CALL discovery shape at the
     // Jump{condition:None} arm above), walk the callee's blocks within a bounded
@@ -2522,7 +2518,7 @@ fn jit_generate_module(
     builder.const_i32(0);
     let instruction_counter = builder.set_new_local();
 
-    // DOD RFC part 2 (idx 21): lazy-flag tuple lives in wasm locals for the whole
+    // Flag-locals (idx 21): lazy-flag tuple lives in wasm locals for the whole
     // module — initialized from the memory globals here, spilled back at every
     // exit epilogue and around every non-whitelisted helper call (builder funnel).
     if flag_locals_enabled() {
@@ -2710,7 +2706,7 @@ fn jit_generate_module(
                         BasicBlockType::AbsoluteEip => {},
                     };
                     codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
-                    // Phase 0: STI forces a module exit (one instruction must run before handle_irqs).
+                    // STI forces a module exit (one instruction must run before handle_irqs).
                     // Not a chainable dispatch — count as dynamic.
                     codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_DYNAMIC);
                     codegen::gen_move_registers_from_locals_to_memory(ctx);
@@ -2725,12 +2721,12 @@ fn jit_generate_module(
                         // Exit this function
                         codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
-                        // Phase 0: terminating instruction set eip at runtime (ret/int/iret/far jmp)
+                        // Terminating instruction set eip at runtime (ret/int/iret/far jmp)
                         codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_DYNAMIC);
                         ctx.builder.br(ctx.exit_label);
                     },
                     BasicBlockType::AbsoluteEip => {
-                        // Tier-2 Phase 0: indirect-target histogram for watched pages.
+                        // Indirect-target histogram for watched pages.
                         // Records (terminal instruction addr, runtime eip) via an import
                         // into the generated module; emitted only when the page is watched.
                         if trace_profiler::is_page_watched(Page::page_of(block.addr)) {
@@ -2738,7 +2734,7 @@ fn jit_generate_module(
                             codegen::gen_get_eip(ctx.builder);
                             ctx.builder.call_fn2("trace2_record_indirect");
                         }
-                        // RET-target speculation (Block B mechanism 2): a leaf's RET
+                        // RET-target speculation: a leaf's RET
                         // whose module-local call sites are known compares the runtime
                         // eip against each return address and re-enters the module
                         // dispatcher directly, skipping the helper call below. Return
@@ -2776,7 +2772,7 @@ fn jit_generate_module(
                         // branch on the hit path.
                         ctx.builder.br_if(main_loop_label);
 
-                        // RET/indirect dynamic chaining (Block B mechanism 1): the in-module
+                        // RET/indirect dynamic chaining: the in-module
                         // re-dispatch missed, but the runtime eip may hit ANOTHER compiled
                         // module — tail-call straight into it instead of round-tripping
                         // through main_loop. Same flush + packed-slot convention as
@@ -2834,7 +2830,7 @@ fn jit_generate_module(
                         }
 
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
-                        // Phase 0: direct unconditional JMP whose target is outside this module —
+                        // Direct unconditional JMP whose target is outside this module —
                         // successor eip is a compile-time constant (jump_offset). Chainable.
                         gen_chain_or_exit_to_known_successor(
                             ctx,
@@ -3140,7 +3136,7 @@ fn jit_generate_module(
                                     ctx.builder,
                                     stat::CONDITIONAL_JUMP_EXIT,
                                 );
-                                // Phase 0: conditional JMP leaving the module — successor eip is a
+                                // Conditional JMP leaving the module — successor eip is a
                                 // compile-time constant (taken=jump_offset, not-taken=end_addr). Chainable.
                                 gen_chain_or_exit_to_known_successor(
                                     ctx,
@@ -3429,8 +3425,7 @@ fn jit_generate_module(
         // the runtime instruction_pointer, so the recoverable move is a clean
         // module exit: the interpreter re-resolves the eip through the normal
         // cache path (worst case: recompile). `unreachable` turned this race
-        // into a fatal wasm trap (retail NFSU mid-race with indirect regions,
-        // 2026-07-08). Debug builds still flag it via check_dispatcher_target.
+        // into a fatal wasm trap. Debug builds still flag it via check_dispatcher_target.
         ctx.builder.br(ctx.exit_label);
     }
     {
@@ -3551,12 +3546,12 @@ fn jit_generate_basic_block(
     ctx.builder.add_i32();
     ctx.builder.set_local(&ctx.instruction_counter);
 
-    // Block-chaining Phase 0: count every basic-block execution. INTRA_MODULE_EDGE is derived as
+    // Block-chaining: count every basic-block execution. INTRA_MODULE_EDGE is derived as
     // BLOCK_EXECUTION - MODULE_REENTRY in the readout (each module run executes one entry block via
     // dispatch; every further block it runs was reached by an in-module edge).
     codegen::gen_dispatch_stat_increment(ctx.builder, stat::BLOCK_EXECUTION);
 
-    // Tier-2 trace-compiler Phase 0 (plan/tier2-trace-compiler.md Step B): per-block exec
+    // Tier-2 trace-compiler: per-block exec
     // counter + CFG registration for watched pages. Emits one fixed-address u64 increment;
     // nothing is emitted for unwatched pages (zero cost when profiling is off).
     if trace_profiler::is_enabled() && trace_profiler::is_page_watched(Page::page_of(block.addr)) {
@@ -3753,7 +3748,7 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
         }
     }
 
-    // Release-safe double-free guard (root-caused 2026-07-10, see
+    // Release-safe double-free guard (see
     // free_wasm_module_forest): a second push would hand the SAME table slot to
     // two future modules — silent cross-module dispatch corruption. The debug
     // assert above screams first; release skips loudly and keeps the state sane.
@@ -3838,13 +3833,11 @@ fn free_wasm_module_tree(ctx: &mut JitState, root: WasmTableIndex) {
 /// page (primary + its captured hidden list) can reach each other: a sibling
 /// page sharing the primary carries the same hidden index in its own list, so
 /// the primary's tree walk already frees it. Walking each root with a fresh
-/// `seen` set (the pre-2026-07-10 shape) double-freed such shared indices —
-/// the free list then held the index TWICE, two later modules were handed the
-/// SAME wasm table slot, and dispatch_meta of the first pointed into the
-/// second: cross-module dispatch = the retail-NFSU silent-ExitProcess class
+/// `seen` set would double-free such shared indices —
+/// the free list would then hold the index TWICE, two later modules would be handed the
+/// SAME wasm table slot, and dispatch_meta of the first would point into the
+/// second: cross-module dispatch corruption = the silent-ExitProcess class
 /// (garbage-register #PF / wild EIP into data / stale brtable traps).
-/// Root-caused live 2026-07-10: debug assert at free_wasm_table_index fired
-/// under jit_clear_cache → jit_dirty_page_ctx → free_wasm_module_tree.
 fn free_wasm_module_forest(ctx: &mut JitState, roots: Vec<WasmTableIndex>) {
     // Hidden entries cannot be promoted; free them with the removed primary.
     let mut seen = HashSet::new();

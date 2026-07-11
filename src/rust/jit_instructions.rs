@@ -221,9 +221,8 @@ fn sse_read128_xmm_xmm_imm(ctx: &mut JitContext, name: &str, r1: u32, r2: u32, i
 }
 fn sse_mov_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32) {
     codegen::gen_mark_fpu_simd_dirty_once(ctx);
-    // BottleShip SIMD Phase 1: copy full 128-bit XMM register in ONE
-    // v128.load+v128.store instead of 2× i64 load/store pairs. Halves the
-    // WASM op count for every MOVAPD/MOVAPS/MOVDQA register-to-register move.
+    // Copy the full 128-bit XMM register in one v128.load+v128.store
+    // (MOVAPD/MOVAPS/MOVDQA reg-to-reg).
     ctx.builder
         .const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
     ctx.builder
@@ -232,22 +231,15 @@ fn sse_mov_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32) {
     ctx.builder.store_aligned_v128(0);
 }
 
-/// BottleShip SIMD Phase 2a: inline bitwise v128 op for reg/reg SSE2
-/// ANDPD/ANDPS/ORPD/ORPS/XORPD/XORPS. Replaces a `call_fn2(instr_NNN)`
-/// round-trip (which internally does read_xmm128 + compute + write_xmm128,
-/// ~8-10 WASM ops plus function-call overhead) with ~7 inline ops.
-///
+/// Inline bitwise v128 op for reg/reg SSE2 ANDPD/ANDPS/ORPD/ORPS/XORPD/XORPS.
 /// Semantics mirror `pand_r128(source=r1, dest=r2)`: r2 = r1 OP r2.
 #[repr(u8)]
 enum SseBitOp { And, Or, Xor }
 
 #[repr(u8)]
-#[allow(dead_code)]
 enum SseI64x2Op { Add, Sub }
 
-/// Phase 2c: inline i64x2 arithmetic for PADDQ/PSUBQ reg/reg. Same op-count
-/// reduction as Phase 2a: replaces call_fn2(Rust helper roundtrip) with
-/// load+load+op+store = 4 ops total (+2 const_i32 for addresses).
+/// Inline i64x2 arithmetic for PADDQ/PSUBQ reg/reg (load+load+op+store).
 fn sse_i64x2_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseI64x2Op) {
     codegen::gen_mark_fpu_simd_dirty_once(ctx);
     ctx.builder
@@ -268,17 +260,11 @@ fn sse_i64x2_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseI64x2Op) {
 #[repr(u8)]
 enum SseScalarOp { Add, Sub, Mul, Div }
 
-/// BottleShip SIMD Phase 2b: scalar SSE2 arithmetic (MULSD/ADDSD/SUBSD/
-/// DIVSD + 32-bit MULSS/ADDSS/SUBSS/DIVSS) via PURE SCALAR f64/f32.
-///
-/// Scalar SSE2 ops only touch the low lane of the XMM register. v86's
-/// current codegen does `call_fn2(Rust helper)` which internally builds a
-/// reg128 struct, does scalar f64 op, and writes result back — many ops
-/// plus a WASM→Rust call. We replace with ~5 inline WASM ops: two scalar
-/// f64 loads, scalar f64 op, f64 store to low 8 bytes. The upper 8 bytes
-/// of the XMM are PHYSICALLY UNTOUCHED in memory — no replace_lane
-/// needed. This is both correct (preserves upper lane per x86 spec) and
-/// the cheapest possible emission.
+/// Scalar SSE2 arithmetic (MULSD/ADDSD/SUBSD/DIVSD, 32-bit MULSS/ADDSS/SUBSS/DIVSS)
+/// via pure scalar f64/f32: two scalar loads, the op, and an f64 store to the low 8
+/// bytes. The upper 8 bytes of the XMM are physically untouched in memory (no
+/// replace_lane), which is required — scalar SSE ops preserve the upper lane per the
+/// x86 spec.
 fn sse_scalar_f64_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseScalarOp) {
     codegen::gen_mark_fpu_simd_dirty_once(ctx);
     // r2_lo = r2_lo OP r1_lo; upper 64 bits of r2 untouched.
@@ -3615,7 +3601,7 @@ fn fpu_op_from_name(name: &str) -> codegen::FpuFastBinOp {
         "fpu_fsubr" => codegen::FpuFastBinOp::SubR,
         "fpu_fdiv" => codegen::FpuFastBinOp::Div,
         "fpu_fdivr" => codegen::FpuFastBinOp::DivR,
-        _ => codegen::FpuFastBinOp::Add,
+        _ => unreachable!("fpu_op_from_name: unmapped op {}", name),
     }
 }
 

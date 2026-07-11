@@ -16,8 +16,6 @@
 //!   0x02C: hc_insn_at_time_update u32 — instruction_counter snapshot for QPC interpolation
 //!   0x030: hc_mips_estimate     u32 — instructions per microsecond
 //!   0x034: hc_current_thread_id u32 — current thread ID (for CS ownership)
-//!   0x038: hc_pending_wake_count u32 — number of pending wakeAddress calls
-//!   0x03C: hc_pending_wake_addrs [u32; 16] — addresses for pending wakeAddress
 //!   0x080: hc_cursor_x          i32 — mouse X position (written by JS)
 //!   0x084: hc_cursor_y          i32 — mouse Y position (written by JS)
 //!   0x088: hc_window_x          i32 — main window X offset (written by JS)
@@ -28,6 +26,7 @@
 //!   0x09C: hc_has_runnable_peers      u32 — 1 if other threads are READY/RUNNING (written by JS)
 //!   0x0A0: hc_sleep_starvation_counter u32 — consecutive WASM-handled Sleep(0) calls with peers
 //!   0x0A4: hc_sleep_starvation_limit   u32 — max consecutive before JS fallthrough
+//!   0x0B0: hc_rand_seed         u32 — RNG seed for handle_rand
 //!   0x100: hc_dispatch_table    [u8; 4096] — dispatch_table[functionId] = handler_id
 //!   0x1100: hc_fls_allocated    [u8; 129] — FLS slot allocation bitmap (written by JS, slot 0 unused)
 //!   0x1184: hc_fls_values       [u32; 129] — FLS slot values (written by JS)
@@ -100,26 +99,10 @@ const OFF_HC_FLS_ALLOCATED: usize = 0x1100;
 const OFF_HC_FLS_VALUES: usize = 0x1184;
 const HC_FLS_SLOT_COUNT: usize = 129;
 
-// Arena slab control block (HeapAlloc/HeapFree fast path).
-// NOTE: these 0x1400-based PAGE offsets are now vestigial (legacy mode only) — the live
-// control block lives in GUEST RAM at hc_slab_ctl_ptr and is accessed via SLAB_REL_* below.
-// Kept for the documented page layout / JS-side legacy fallback. See plan/slab-d2-handoff.md.
-#[allow(dead_code)]
-const OFF_HC_SLAB_BASE: usize = 0x1400;
-#[allow(dead_code)]
-const OFF_HC_SLAB_END: usize = 0x1404;
-#[allow(dead_code)]
-const OFF_HC_SLAB_BUMP: usize = 0x1408;
-#[allow(dead_code)]
-const OFF_HC_SLAB_GENERATION: usize = 0x140C;
-#[allow(dead_code)]
-const OFF_HC_SLAB_ALLOC_COUNT: usize = 0x1410;
-#[allow(dead_code)]
-const OFF_HC_SLAB_FREE_COUNT: usize = 0x1414;
-#[allow(dead_code)]
-const OFF_HC_SLAB_FALLBACK_COUNT: usize = 0x1418;
-#[allow(dead_code)]
-const OFF_HC_SLAB_FREELIST: usize = 0x1420; // 9 × u32
+// Arena slab control block (HeapAlloc/HeapFree fast path). The live control block lives in
+// GUEST RAM at hc_slab_ctl_ptr and is accessed via SLAB_REL_* below; the legacy 0x1400-based
+// page layout is documented in the header block above and mirrored on the JS side.
+// See plan/slab-d2-handoff.md.
 const OFF_HC_SLAB_CTL_PTR: usize = 0x1444; // guest addr of slab control block (0 = legacy page)
 const OFF_HC_EVENT_TABLE: usize = 0x1448;
 

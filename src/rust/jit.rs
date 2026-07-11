@@ -70,11 +70,10 @@ static mut JIT_DISABLED: bool = false;
 static mut MAX_PAGES: u32 = 3;
 
 static mut JIT_USE_LOOP_SAFETY: bool = true;
-static mut JIT_BLOCK_CHAINING: bool = false;
 // RET/AbsoluteEip dynamic chaining (Block B mechanism 1, see
 // plan/stateblock-arena-and-superblocks-vision.md): when the in-module AbsoluteEip
 // re-dispatch misses, attempt a cross-module tail-call at the runtime eip instead of
-// exiting to main_loop. Gated at COMPILE time (like JIT_BLOCK_CHAINING) — toggle via
+// exiting to main_loop. Gated at COMPILE time — toggle via
 // set_jit_config(12) and clear the JIT cache.
 static mut JIT_RET_CHAINING: bool = false;
 // RET-target speculation (Block B mechanism 2, superblock lite): annotate the RET of a
@@ -289,7 +288,6 @@ pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 // via profiler_dispatch_stat_get. OFF by default — zero cost on the production path.
 pub static mut DISPATCH_STATS: bool = false;
 pub fn dispatch_stats_enabled() -> bool { unsafe { DISPATCH_STATS } }
-fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
 fn ret_chaining_enabled() -> bool { unsafe { JIT_RET_CHAINING } }
 fn ret_speculation_enabled() -> bool { unsafe { JIT_RET_SPECULATION } }
 fn dead_flag_elision_enabled() -> bool { unsafe { JIT_DEAD_FLAG_ELISION } }
@@ -477,12 +475,7 @@ pub fn dispatch_meta_clear(page: u32) -> bool {
     }
 }
 
-// Bases exported for the D2 inline-lookup codegen (JIT modules share this linear
-// memory) and the TS stats verb.
-#[no_mangle]
-pub fn dispatch_meta_base() -> u32 { unsafe { &DISPATCH_META[0] as *const u64 as u32 } }
-#[no_mangle]
-pub fn dispatch_slabs_base() -> u32 { unsafe { &DISPATCH_SLABS[0] as *const u16 as u32 } }
+// Dispatch-slab occupancy counters exported for the TS stats verb.
 #[no_mangle]
 pub fn dispatch_slab_high_water() -> u32 { unsafe { DISPATCH_SLAB_HIGH_WATER } }
 #[no_mangle]
@@ -824,19 +817,6 @@ pub fn fastmem_get_deopt_recompiles() -> u32 { unsafe { FASTMEM_DEOPT_RECOMPILES
 pub fn fastmem_get_thrash_latched() -> u32 { unsafe { FASTMEM_THRASH_LATCHED as u32 } }
 
 #[no_mangle]
-pub fn fastmem_reset_stats() {
-    unsafe {
-        FASTMEM_BUMPS_BY_SOURCE = [0; FASTMEM_BUMP_SOURCE_COUNT];
-        FASTMEM_SPECULATED_LOADS_COMPILED = 0;
-        FASTMEM_DEOPT_RECOMPILES = 0;
-        FASTMEM_THRASH_LATCHED = false;
-        FASTMEM_THRASH_WINDOW_START = *global_pointers::instruction_counter;
-        FASTMEM_THRASH_WINDOW_BUMPS = 0;
-        FASTMEM_SPECULATED_STORES_COMPILED = 0;
-    }
-}
-
-#[no_mangle]
 pub fn x87_locals_get_cache_load_sites_compiled() -> u32 {
     unsafe { X87_LOCAL_CACHE_LOAD_SITES_COMPILED }
 }
@@ -850,28 +830,11 @@ pub fn x87_locals_get_cache_invalidates_compiled() -> u32 {
 }
 
 #[no_mangle]
-pub fn x87_locals_reset_stats() {
-    unsafe {
-        X87_LOCAL_CACHE_LOAD_SITES_COMPILED = 0;
-        X87_LOCAL_CACHE_STORES_COMPILED = 0;
-        X87_LOCAL_CACHE_INVALIDATES_COMPILED = 0;
-    }
-}
-
-#[no_mangle]
 pub fn push_run_get_sites_compiled() -> u32 { unsafe { PUSH_RUN_SITES_COMPILED } }
 
 #[no_mangle]
 pub fn push_run_get_reuse_branches_compiled() -> u32 {
     unsafe { PUSH_RUN_REUSE_BRANCHES_COMPILED }
-}
-
-#[no_mangle]
-pub fn push_run_reset_stats() {
-    unsafe {
-        PUSH_RUN_SITES_COMPILED = 0;
-        PUSH_RUN_REUSE_BRANCHES_COMPILED = 0;
-    }
 }
 
 #[no_mangle]
@@ -931,7 +894,6 @@ struct PageInfo {
     hidden_wasm_table_indices: Vec<WasmTableIndex>,
     entry_points: Vec<(u16, u16)>,
     state_flags: CachedStateFlags,
-    fastmem_generation: u64,
 }
 
 enum CompilingPageState {
@@ -1421,7 +1383,6 @@ pub fn jit_find_cache_entry(phys_address: u32, state_flags: CachedStateFlags) ->
             state_flags: s,
             entry_points,
             hidden_wasm_table_indices: _,
-            fastmem_generation: _,
         }) => {
             if *s == state_flags {
                 let page_offset = phys_address as u16 & 0xFFF;
@@ -1478,51 +1439,9 @@ pub fn jit_find_cache_entry_in_page(
     return -1;
 }
 
-#[no_mangle]
-pub unsafe fn jit_find_cache_entry_for_chaining(state_flags: u32) -> i32 {
-    // same quantum as do_many_cycles_native (limit==0 urgent exit and in_hlt still bail)
-    let limit = hypercall::read_cycle_limit();
-    let elapsed = (*global_pointers::instruction_counter)
-        .wrapping_sub(cpu::jit_cycle_start_instruction_counter);
-
-    if limit == 0 || elapsed >= limit || *global_pointers::in_hlt {
-        if dispatch_stats_enabled() {
-            profiler::stat_increment_always(stat::MODULE_EXIT_CHAINABLE);
-            profiler::stat_increment_always(stat::MODULE_CHAIN_BUDGET_EXIT);
-        }
-        return -1;
-    }
-
-    let virt_address = *global_pointers::instruction_pointer as u32;
-    let state_flags = CachedStateFlags::of_u32(state_flags);
-
-    // DOD SoA lookup (no pointer chase; stale-generation units self-deopt on entry).
-    let meta = dispatch_meta_get(virt_address >> 12);
-    if meta != 0 && dispatch_meta_state_flags(meta) == state_flags.to_u32() {
-        let unit_state = dispatch_state_lookup(meta, virt_address);
-        if unit_state != u16::MAX {
-            if dispatch_stats_enabled() {
-                profiler::stat_increment_always(stat::MODULE_CHAINED_EDGE);
-            }
-
-            let table_slot =
-                dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
-            return table_slot << 16 | unit_state as i32;
-        }
-    }
-
-    if dispatch_stats_enabled() {
-        profiler::stat_increment_always(stat::MODULE_EXIT_CHAINABLE);
-        profiler::stat_increment_always(stat::MODULE_CHAIN_MISS);
-    }
-    -1
-}
-
-/// RET/AbsoluteEip variant of jit_find_cache_entry_for_chaining (same budget guard, same
-/// tlb_code lookup at the runtime eip, same packed return convention) with its own
-/// RET_CHAIN_HIT/RET_CHAIN_MISS stats — kept separate so the Phase-0 dispatch
-/// characterisation (MODULE_EXIT_CHAINABLE/MODULE_CHAIN_*) keeps meaning "statically
-/// chainable direct-jump exits" and isn't polluted by dynamic-eip exits.
+/// RET/AbsoluteEip dynamic chaining: budget-guarded tlb_code lookup at the runtime eip,
+/// returning the packed (table_slot << 16 | unit_state) target convention, with its own
+/// RET_CHAIN_HIT/RET_CHAIN_MISS stats.
 #[no_mangle]
 pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32 {
     // same quantum as do_many_cycles_native (limit==0 urgent exit and in_hlt still bail) —
@@ -2405,7 +2324,6 @@ fn jit_analyze_and_generate(
             .or_insert_with(|| PageInfo {
                 wasm_table_index,
                 state_flags,
-                fastmem_generation: fastmem_generation.unwrap_or(0),
                 entry_points: Vec::new(),
                 hidden_wasm_table_indices: Vec::new(),
             });
@@ -2422,7 +2340,6 @@ fn jit_analyze_and_generate(
         page_info.entry(p).or_insert_with(|| PageInfo {
             wasm_table_index,
             state_flags,
-            fastmem_generation: fastmem_generation.unwrap_or(0),
             entry_points: Vec::new(),
             hidden_wasm_table_indices: Vec::new(),
         });
@@ -2555,7 +2472,6 @@ pub fn update_tlb_code(virt_page: Page, phys_page: Page) {
             entry_points,
             state_flags,
             hidden_wasm_table_indices: _,
-            fastmem_generation: _,
         }) => set_tlb_code(virt_page, *wasm_table_index, entry_points, *state_flags),
         None => cpu::clear_tlb_code(phys_page.to_u32() as i32),
     };
@@ -2573,41 +2489,15 @@ pub fn set_tlb_code(
     dispatch_meta_set(virt_page, wasm_table_index, entries, state_flags);
 }
 
+// Statically-chainable direct-jump exit: record the exit as chainable and branch to the
+// module exit label (main_loop re-dispatch). (Static block-chaining was removed; the live
+// cross-module chaining mechanism is the dynamic RET path, set_jit_config idx 12.)
 fn gen_chain_or_exit_to_known_successor(
     ctx: &mut JitContext,
-    state_flags: CachedStateFlags,
-    last_instruction_addr: u32,
+    _state_flags: CachedStateFlags,
+    _last_instruction_addr: u32,
 ) {
-    if !block_chaining_enabled() {
-        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
-        ctx.builder.br(ctx.exit_label);
-        return;
-    }
-
-    codegen::gen_move_registers_from_locals_to_memory(ctx);
-    codegen::gen_update_instruction_counter(ctx);
-    ctx.builder.const_i32(0);
-    ctx.builder.set_local(&ctx.instruction_counter);
-
-    ctx.builder.const_i32(state_flags.to_u32() as i32);
-    ctx.builder.call_fn1_ret("jit_find_cache_entry_for_chaining");
-    let packed_target = ctx.builder.tee_new_local();
-
-    ctx.builder.get_local(&packed_target);
-    ctx.builder.const_i32(0);
-    ctx.builder.ge_i32();
-    ctx.builder.if_void();
-    ctx.builder.get_local(&packed_target);
-    ctx.builder.const_i32(0xFFFF);
-    ctx.builder.and_i32();
-    ctx.builder.get_local(&packed_target);
-    ctx.builder.const_i32(16);
-    ctx.builder.shr_u_i32();
-    ctx.builder.return_call_indirect_fn1();
-    ctx.builder.block_end();
-
-    ctx.builder.free_local(packed_target);
-    codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
     ctx.builder.br(ctx.exit_label);
 }
 
@@ -3976,7 +3866,6 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
         hidden_wasm_table_indices,
         state_flags: _,
         entry_points: _,
-        fastmem_generation: _,
     }) = ctx.pages.remove(&page)
     {
         profiler::stat_increment(stat::INVALIDATE_PAGE_HAD_CODE);
@@ -4233,7 +4122,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         1 => MAX_PAGES = value,
         2 => JIT_USE_LOOP_SAFETY = value != 0,
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
-        4 => JIT_BLOCK_CHAINING = value != 0,
+        // idx 4 retired (static block-chaining removed; use idx 12 dynamic RET chaining)
         5 => JIT_DEAD_FLAG_ELISION = value != 0,
         6 => JIT_INDIRECT_REGIONS = value != 0,
         7 => JIT_INDIRECT_REGION_MIN_SHARE = value,
@@ -4261,7 +4150,6 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         1 => MAX_PAGES as u32,
         2 => JIT_USE_LOOP_SAFETY as u32,
         3 => MAX_EXTRA_BASIC_BLOCKS as u32,
-        4 => JIT_BLOCK_CHAINING as u32,
         5 => JIT_DEAD_FLAG_ELISION as u32,
         6 => JIT_INDIRECT_REGIONS as u32,
         7 => JIT_INDIRECT_REGION_MIN_SHARE,

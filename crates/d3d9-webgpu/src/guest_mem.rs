@@ -9,10 +9,6 @@
 /// Guest-memory accessor table. All functions take guest virtual addresses as `i32`
 /// (matching the host emulator's convention for 32-bit guests).
 pub struct GuestMem {
-    /// Read 4 bytes at `addr`. `Err(())` on page fault / unmapped.
-    pub read_u32: fn(addr: i32) -> Result<i32, ()>,
-    /// Read 1 byte at `addr`. `Err(())` on page fault / unmapped.
-    pub read_u8: fn(addr: i32) -> Result<i32, ()>,
     /// Bulk-copy `len` bytes from guest `addr` into `dst` (crate-owned memory).
     /// Returns `false` if any part of the range faulted — the destination contents are
     /// then unspecified and the caller must treat the operation as failed.

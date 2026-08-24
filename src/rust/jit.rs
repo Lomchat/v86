@@ -142,8 +142,19 @@ static mut TIER2_MAX_PAGES: u32 = 8;
 // acceptance set; A/B via set_jit_config idx 18 + JIT cache clear (shape is baked in
 // at module compile time).
 static mut JIT_FASTMEM_READ_SPLIT: bool = true;
-const TIER2_PAGE_SET_CAP: usize = 256;
+// Total guest-code pages allowed to retain their tier-2 marking. BFME exhausts
+// the former hard-coded 256-page ceiling before entering sustained gameplay,
+// permanently starving later hot modules because tier2_pages intentionally
+// survives cache clears. Keep the cap bounded but runtime-visible (idx 20) so
+// browser A/Bs can distinguish useful coverage from compilation/code-memory cost.
+static mut TIER2_PAGE_SET_CAP: u32 = 256;
 static mut MODULE_EXEC_COUNTS: [u32; 0x10000] = [0; 0x10000];
+// Mirrored from JitState::tier2_pages so cycle_internal can skip the exported
+// note function entirely once the retained page set is full. Calling even the
+// threshold==0 fast path for every compiled-module entry is measurable in BFME
+// (~2% of the worker on a saturated menu). The comparison remains dynamic: if
+// diagnostics raise TIER2_PAGE_SET_CAP later, tracking resumes automatically.
+static mut TIER2_PAGE_COUNT: u32 = 0;
 
 // Tier-2 observability (read via dbg.tier2Stats()): without these there is no way to
 // tell "promotions landed" apart from "promotions starved by the page-set cap" — the
@@ -163,6 +174,11 @@ pub fn jit_get_tier2_promotions() -> u32 {
 #[no_mangle]
 pub fn jit_get_tier2_blocked_by_cap() -> u32 {
     unsafe { TIER2_BLOCKED_BY_CAP }
+}
+
+#[inline(always)]
+pub fn jit_tier2_tracking_active() -> bool {
+    unsafe { JIT_TIER2_THRESHOLD != 0 && TIER2_PAGE_COUNT < TIER2_PAGE_SET_CAP }
 }
 /// i-th tier-2 page address (page<<12), 0 when i >= count. Iteration order is the
 /// HashSet's (arbitrary but stable between mutations) — callers use this to feed
@@ -212,14 +228,17 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
     if pages.iter().all(|p| ctx.tier2_pages.contains(p)) {
         return false;
     }
-    if ctx.tier2_pages.len() + pages.len() > TIER2_PAGE_SET_CAP {
+    if ctx.tier2_pages.len() + pages.len() > unsafe { TIER2_PAGE_SET_CAP as usize } {
         unsafe { TIER2_BLOCKED_BY_CAP += 1 };
         return false;
     }
     for p in &pages {
         ctx.tier2_pages.insert(*p);
     }
-    unsafe { TIER2_PROMOTIONS += 1 };
+    unsafe {
+        TIER2_PAGE_COUNT = ctx.tier2_pages.len() as u32;
+        TIER2_PROMOTIONS += 1;
+    }
     free_wasm_module_tree(&mut ctx, index);
     true
 }
@@ -871,6 +890,13 @@ impl DerefMut for JitStateRef {
 #[no_mangle]
 pub fn rust_init() {
     dispatch_meta_init();
+
+    unsafe {
+        TIER2_PAGE_COUNT = 0;
+        TIER2_PROMOTIONS = 0;
+        TIER2_BLOCKED_BY_CAP = 0;
+        MODULE_EXEC_COUNTS = [0; 0x10000];
+    }
 
     let _ = JIT_STATE
         .try_lock()
@@ -4131,6 +4157,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         17 => TIER2_MAX_PAGES = value,
         18 => JIT_FASTMEM_READ_SPLIT = value != 0,
         19 => JIT_FASTMEM_WRITES = value != 0,
+        20 => TIER2_PAGE_SET_CAP = value.clamp(1, 4096),
         21 => JIT_FLAG_LOCALS = value != 0,
         _ => dbg_assert!(false),
     }
@@ -4158,6 +4185,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         17 => TIER2_MAX_PAGES,
         18 => JIT_FASTMEM_READ_SPLIT as u32,
         19 => JIT_FASTMEM_WRITES as u32,
+        20 => TIER2_PAGE_SET_CAP,
         21 => JIT_FLAG_LOCALS as u32,
         _ => 0,
     }

@@ -3113,7 +3113,9 @@ pub unsafe fn cycle_internal() {
                     // tier-2 threshold and was freed — don't dispatch into it; run
                     // interpreted this slice and let hotness recompile it with the
                     // tier-2 budget.
-                    if jit::jit_tier2_note_execution(unit_index) {
+                    if jit::jit_tier2_tracking_active()
+                        && jit::jit_tier2_note_execution(unit_index)
+                    {
                         profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_CODE);
                     }
                     else {
@@ -4491,6 +4493,20 @@ pub unsafe fn read_tsc() -> u64 {
     };
     tsc_last_value = result;
     result
+}
+
+/// JIT-visible RDTSC variant. Compiled regions keep their retired-instruction
+/// count in a WASM local until exit, while the unified virtual clock reads the
+/// architectural counter. Temporarily expose the pending count so RDTSC inside
+/// a long region advances correctly, then restore the global to avoid committing
+/// those instructions twice at the module epilogue.
+#[no_mangle]
+pub unsafe fn read_tsc_jit(pending_instructions: i32) -> u64 {
+    let pending = pending_instructions as u32;
+    *instruction_counter = (*instruction_counter).wrapping_add(pending);
+    let value = read_tsc();
+    *instruction_counter = (*instruction_counter).wrapping_sub(pending);
+    value
 }
 
 pub unsafe fn vm86_mode() -> bool { return *flags & FLAG_VM == FLAG_VM; }

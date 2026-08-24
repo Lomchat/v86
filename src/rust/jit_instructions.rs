@@ -5187,7 +5187,8 @@ pub fn instr_0F31_jit(ctx: &mut JitContext) {
 
     ctx.builder.or_i32();
     ctx.builder.if_void();
-    ctx.builder.call_fn0_ret_i64("read_tsc");
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.call_fn1_ret_i64("read_tsc_jit");
 
     let tsc = ctx.builder.tee_new_local_i64();
     ctx.builder.wrap_i64_to_i32();

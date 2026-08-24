@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod fpu;
 pub mod global_pointers;
 pub mod hypercall;
+pub mod hypercall_bfme;
 pub mod hypercall_eagl;
 pub mod hypercall_rtti;
 pub mod instructions;

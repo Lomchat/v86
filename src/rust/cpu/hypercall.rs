@@ -350,7 +350,9 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         //    dispatch byte alone. Engine-specific handlers do NOT live in this
         //    file — the whole band delegates to the engine module(s); a second
         //    engine graduates this into a dedicated band router. ──
-        128..=255 => super::hypercall_eagl::dispatch_inner_loop(handler_id),
+        128..=134 => super::hypercall_eagl::dispatch_inner_loop(handler_id),
+        135..=139 => super::hypercall_bfme::dispatch_inner_loop(handler_id),
+        140..=255 => false,
         _ => false,
     };
 
@@ -1918,9 +1920,6 @@ unsafe fn handle_release_mutex() -> bool {
     if mux & MUX_VALID == 0 {
         return false;
     }
-    if mux & MUX_HAS_WAITERS != 0 {
-        return false;
-    }
     if mux & MUX_ABANDONED != 0 {
         return false;
     }
@@ -1932,8 +1931,15 @@ unsafe fn handle_release_mutex() -> bool {
 
     let rec = (mux & MUX_REC_MASK) >> MUX_REC_SHIFT;
     if rec > 1 {
+        // Releasing one level of a recursive mutex cannot make it available, so
+        // no waiter can be woken yet.  Keep this case in WASM even when the
+        // scheduler's waiter bit is set; only the final release needs JS to
+        // choose and wake a waiting thread.
         write_mutex_mirror(slot, (mux & !MUX_REC_MASK) | ((rec - 1) << MUX_REC_SHIFT));
     } else {
+        if mux & MUX_HAS_WAITERS != 0 {
+            return false;
+        }
         write_mutex_mirror(slot, mux & !(MUX_OWNER_MASK | MUX_REC_MASK));
     }
     write_reg32(EAX, 1);
@@ -1982,25 +1988,36 @@ unsafe fn handle_wait_for_single_object() -> bool {
     if mux & MUX_VALID == 0 {
         return false;
     }
-    if mux & MUX_HAS_WAITERS != 0 {
-        return false;
-    }
     if mux & MUX_ABANDONED != 0 {
         return false;
     }
 
     let owner = mux & MUX_OWNER_MASK;
-    if owner == 0 || owner == current {
+    if owner == current {
         let rec = (mux & MUX_REC_MASK) >> MUX_REC_SHIFT;
-        if owner == current && rec >= MUX_REC_MAX {
+        if rec >= MUX_REC_MAX {
             return false;
         }
-        let new_owner = if owner == 0 { current } else { owner };
-        let new_rec = if owner == 0 { 1 } else { rec + 1 };
+        // Recursive acquisition by the owner never competes with queued
+        // waiters: Windows must grant it immediately or the owner could not
+        // unwind and release the mutex.  Avoid a JS round-trip in that case.
+        let new_rec = rec + 1;
         if new_rec > MUX_REC_MAX {
             return false;
         }
-        let new_mux = MUX_VALID | new_owner | (new_rec << MUX_REC_SHIFT);
+        let new_mux = (mux & !MUX_REC_MASK) | (new_rec << MUX_REC_SHIFT);
+        write_mutex_mirror(slot, new_mux);
+        write_reg32(EAX, 0);
+        return true;
+    }
+
+    if owner == 0 {
+        // A queued waiter has priority over a fresh acquirer.  Let JS perform
+        // the scheduler hand-off instead of stealing the now-free mutex.
+        if mux & MUX_HAS_WAITERS != 0 {
+            return false;
+        }
+        let new_mux = MUX_VALID | current | (1 << MUX_REC_SHIFT);
         write_mutex_mirror(slot, new_mux);
         write_reg32(EAX, 0);
         return true;
@@ -2300,4 +2317,3 @@ unsafe fn handle_rt_dynamic_cast() -> bool {
         RtDynamicCastResult::FailBadCast => false,
     }
 }
-

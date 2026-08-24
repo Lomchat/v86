@@ -552,3 +552,34 @@ impl PartialOrd for F80 {
         a.partial_cmp(&b)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{F80, RoundingMode};
+
+    fn f80(value: f64) -> F80 {
+        F80::of_f64(value.to_bits())
+    }
+
+    #[test]
+    fn truncate_i64_is_toward_zero_regardless_of_control_rounding() {
+        for mode in [
+            RoundingMode::NearEven,
+            RoundingMode::Floor,
+            RoundingMode::Ceil,
+            RoundingMode::Trunc,
+        ] {
+            F80::set_rounding_mode(mode);
+            assert_eq!(f80(3.9).truncate_to_i64(), 3);
+            assert_eq!(f80(-3.9).truncate_to_i64(), -3);
+        }
+    }
+
+    #[test]
+    fn truncate_i64_returns_x87_indefinite_for_invalid_or_overflow() {
+        assert_eq!(f80(f64::NAN).truncate_to_i64(), i64::MIN);
+        assert_eq!(f80(f64::INFINITY).truncate_to_i64(), i64::MIN);
+        assert_eq!(f80(f64::NEG_INFINITY).truncate_to_i64(), i64::MIN);
+        assert_eq!(f80(9_223_372_036_854_775_808.0).truncate_to_i64(), i64::MIN);
+    }
+}

@@ -59,7 +59,9 @@ use crate::cpu::cpu::{
     read_reg32, safe_read32s, safe_write32, write_reg32, EAX, EDX, ESP,
 };
 use crate::cpu::hypercall_rtti::{rt_dynamic_cast, RtDynamicCastResult};
-use crate::cpu::fpu::{fpu_get_st0, fpu_get_sti, fpu_pop, fpu_push, fpu_write_st};
+use crate::cpu::fpu::{
+    fpu_get_st0, fpu_get_sti, fpu_pop, fpu_push, fpu_truncate_to_i64, fpu_write_st,
+};
 use crate::cpu::global_pointers::{fpu_stack_ptr, instruction_counter};
 use crate::softfloat::F80;
 
@@ -351,8 +353,8 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         //    file — the whole band delegates to the engine module(s); a second
         //    engine graduates this into a dedicated band router. ──
         128..=134 => super::hypercall_eagl::dispatch_inner_loop(handler_id),
-        135..=139 => super::hypercall_bfme::dispatch_inner_loop(handler_id),
-        140..=255 => false,
+        135..=146 => super::hypercall_bfme::dispatch_inner_loop(handler_id),
+        147..=255 => false,
         _ => false,
     };
 
@@ -829,9 +831,11 @@ unsafe fn read_stack_f64(addr: i32) -> f64 {
 /// frozen splash countdown / racing storybook / audio underrun (all one defect). Must be int64.
 unsafe fn handle_ftol() -> bool {
     let st0 = fpu_get_st0();
-    let val = f64::from_bits(st0.to_f64());
+    // Use the same F80 conversion primitive as x87 FISTTP. Going through a
+    // Rust f64 cast would incorrectly saturate overflow to INT64_MAX; x87 and
+    // MSVC `_ftol2_sse` return the indefinite integer INT64_MIN instead.
+    let v = fpu_truncate_to_i64(st0);
     fpu_pop();
-    let v = val as i64; // Rust float->int `as` truncates toward zero and saturates on overflow
     write_reg32(EAX, v as i32);          // low 32
     write_reg32(EDX, (v >> 32) as i32);  // high 32
     true

@@ -653,9 +653,10 @@ unsafe fn handle_enter_critical_section() -> bool {
     false
 }
 
-/// LeaveCriticalSection — handles both recursive and full release.
-/// If LockSemaphore (CS+16) != 0, returns false so JS handles release + SetEvent.
-/// If LockSemaphore == 0 (no waiters ever), releases entirely in WASM (zero JS overhead).
+/// LeaveCriticalSection — handles recursive and waiter-free full release.
+/// A LockSemaphore persists after its first contention, so its mere presence
+/// does not require JS. The authoritative event mirror tells us whether a real
+/// waiter exists; only that case falls through for wake/ownership transfer.
 ///
 /// CRITICAL: Must verify OwningThread matches current thread. Without this check,
 /// a non-owner thread calling LeaveCS (game bug or race) silently releases the CS,
@@ -693,18 +694,26 @@ unsafe fn handle_leave_critical_section() -> bool {
         return true;
     }
 
-    // Check LockSemaphore at offset 16 BEFORE releasing.
-    // If event handle exists, waiters may be present — fall to JS for SetEvent.
+    // Check LockSemaphore at offset 16 BEFORE releasing. Persistent valid event
+    // handles with no mirrored waiters are safe to ignore: no wake is needed.
     let lock_sem = match safe_read32s(ptr + 16) {
         Ok(v) => v as u32,
         Err(_) => return false,
     };
     if lock_sem != 0 {
-        // JS handles: release CS fields + SetEvent(lockSem) + ownership transfer
-        return false;
+        let slot = match kernel_handle_slot(lock_sem) {
+            Some(v) => v,
+            None => return false,
+        };
+        let flags = *hp_ptr().add(OFF_HC_EVENT_TABLE + slot as usize);
+        if flags & EVT_VALID == 0 || flags & EVT_HAS_WAITERS != 0 {
+            // Invalid/stale handles need JS normalization; live waiters need
+            // SetEvent plus scheduler ownership transfer.
+            return false;
+        }
     }
 
-    // No LockSemaphore — no waiter has ever contended. Release fully in WASM.
+    // No current waiter — release fully in WASM even if a semaphore remains.
     if safe_write32(ptr + 4, -1).is_err() { return false; }  // LockCount = -1 (free)
     if safe_write32(ptr + 8, 0).is_err() { return false; }   // RecursionCount = 0
     if safe_write32(ptr + 12, 0).is_err() { return false; }  // OwningThread = 0

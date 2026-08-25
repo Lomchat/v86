@@ -112,7 +112,7 @@ function run({ inline, crossPage = false })
             const cpu = emulator.v86.cpu;
             cpu.reboot_internal();
             cpu.reset_memory();
-            cpu.set_jit_config(22, inline ? 1 : 0);
+            if(inline !== undefined) cpu.set_jit_config(22, inline ? 1 : 0);
             if(crossPage) cpu.set_jit_config(1, 1);
             cpu.jit_clear_cache?.();
             cpu.load_multiboot(buildImage(iterations, crossPage).buffer);
@@ -130,6 +130,13 @@ function assertCorrect(result, iterations)
     {
         throw new Error(`incorrect execution: ${JSON.stringify(result)}, expected ebx=${COLD_MAGIC} edx=${expected}`);
     }
+}
+
+const defaultOn = await run({ inline:undefined });
+assertCorrect(defaultOn, ITERATIONS);
+if(defaultOn.inline !== 1)
+{
+    throw new Error(`inline dispatch must default ON in v86: ${JSON.stringify(defaultOn)}`);
 }
 
 const missOff = await run({ inline:false, crossPage:true });
@@ -153,6 +160,7 @@ const median = values => {
 const offMs = median(samples.filter(x => !x.inline).map(x => x.elapsedMs));
 const onMs = median(samples.filter(x => x.inline).map(x => x.elapsedMs));
 
+console.log("jit-inline-dispatch-default " + JSON.stringify(defaultOn));
 console.log("jit-inline-dispatch-miss " + JSON.stringify({ off:missOff, on:missOn }));
 console.log("jit-inline-dispatch-samples " + JSON.stringify(samples));
 console.log("jit-inline-dispatch-summary " + JSON.stringify({

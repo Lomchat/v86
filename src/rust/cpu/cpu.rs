@@ -3082,6 +3082,7 @@ pub unsafe fn run_instruction0f_32(opcode: i32) { gen::interpreter0f::run(opcode
 pub unsafe fn cycle_internal() {
     profiler::stat_increment(stat::CYCLE_INTERNAL);
     let mut jit_entry = None;
+    let mut tier2_profile_exit = false;
     let initial_eip = *instruction_pointer;
     // dbg_on_instruction stays: it's gated by DBG_ENABLED (off by default), the guest debugger's
     // interpreter hook.
@@ -3118,12 +3119,17 @@ pub unsafe fn cycle_internal() {
                     // tier-2 threshold and was freed — don't dispatch into it; run
                     // interpreted this slice and let hotness recompile it with the
                     // tier-2 budget.
-                    if jit::jit_tier2_tracking_active()
-                        && jit::jit_tier2_note_execution(unit_index)
-                    {
+                    let tier2_result = if jit::jit_tier2_tracking_active() {
+                        jit::jit_tier2_note_execution(unit_index)
+                    }
+                    else {
+                        0
+                    };
+                    if tier2_result & 1 != 0 {
                         profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_CODE);
                     }
                     else {
+                        tier2_profile_exit = tier2_result & 2 != 0;
                         jit_entry = Some((unit_index, unit_state));
                     }
                 }
@@ -3179,6 +3185,10 @@ pub unsafe fn cycle_internal() {
         #[cfg(debug_assertions)]
         {
             in_jit = false;
+        }
+
+        if tier2_profile_exit {
+            jit::jit_tier2_note_sampled_exit(wasm_table_index, *instruction_pointer as u32);
         }
 
         // Block-chaining: a compiled module just returned control to the dispatch loop.

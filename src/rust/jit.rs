@@ -161,6 +161,13 @@ static mut JIT_FASTMEM_READ_SPLIT: bool = true;
 // browser A/Bs can distinguish useful coverage from compilation/code-memory cost.
 static mut TIER2_PAGE_SET_CAP: u32 = 256;
 static mut MODULE_EXEC_COUNTS: [u32; 0x10000] = [0; 0x10000];
+// Counting every module re-entry is disproportionately expensive for workloads
+// made of tiny cross-module blocks. Sample dispatcher entries and add the
+// reciprocal weight. The sample is derived from the architectural instruction
+// counter: rejected entries perform no profiler-owned write. Multiplicative
+// mixing plus the slot id avoids a plain modulo alias with periodic module cycles.
+const TIER2_SAMPLE_SHIFT: u32 = 8;
+const TIER2_SAMPLE_WEIGHT: u32 = 1 << TIER2_SAMPLE_SHIFT;
 // Mirrored from JitState::tier2_pages so cycle_internal can skip the exported
 // note function entirely once the retained page set is full. Calling even the
 // threshold==0 fast path for every compiled-module entry is measurable in BFME
@@ -174,6 +181,83 @@ static mut TIER2_PAGE_COUNT: u32 = 0;
 // zero FPS delta because the cap, not the threshold, was the limiter candidate).
 static mut TIER2_PROMOTIONS: u32 = 0;
 static mut TIER2_BLOCKED_BY_CAP: u32 = 0;
+
+// Profile-guided Tier-2 region formation. The profiler observes only the sampled
+// module entries after a module has crossed 75% of the promotion threshold. The
+// sampling decision is folded into the existing Tier-2 hotness update: ordinary
+// exits execute no extra profile check. Each live wasm-table slot keeps a bounded
+// Misra-Gries table of runtime successor EIPs. Slots are cleared on allocation/free,
+// so table-index reuse can never blend unrelated guest code. The first stage is
+// deliberately observation-only; region formation consumes this data below when
+// JIT_TIER2_REGIONS is on.
+static mut JIT_TIER2_REGIONS: bool = true;
+const TIER2_PROFILE_TARGETS: usize = 8;
+const TIER2_PROFILE_SAMPLE_CAP: u32 = 4096;
+static mut TIER2_EXIT_TARGETS: [[u32; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize] =
+    [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
+static mut TIER2_EXIT_COUNTS: [[u32; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize] =
+    [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
+static mut TIER2_PROFILE_SAMPLES: [u32; WASM_TABLE_SIZE as usize] =
+    [0; WASM_TABLE_SIZE as usize];
+static mut TIER2_PROFILED_EXITS: u32 = 0;
+static mut TIER2_REGION_PROMOTIONS: u32 = 0;
+static mut TIER2_REGION_SEEDS: u32 = 0;
+
+#[inline(always)]
+pub fn jit_tier2_note_sampled_exit(wasm_table_index: u16, target_eip: u32) {
+    unsafe {
+        let slot = wasm_table_index as usize;
+        debug_assert!(slot < WASM_TABLE_SIZE as usize);
+        TIER2_PROFILE_SAMPLES[slot] += 1;
+        TIER2_PROFILED_EXITS = TIER2_PROFILED_EXITS.wrapping_add(1);
+        let targets = &mut TIER2_EXIT_TARGETS[slot];
+        let counts = &mut TIER2_EXIT_COUNTS[slot];
+        for i in 0..TIER2_PROFILE_TARGETS {
+            if counts[i] != 0 && targets[i] == target_eip {
+                counts[i] = counts[i].saturating_add(1);
+                return;
+            }
+        }
+        for i in 0..TIER2_PROFILE_TARGETS {
+            if counts[i] == 0 {
+                targets[i] = target_eip;
+                counts[i] = 1;
+                return;
+            }
+        }
+        // Misra-Gries eviction: bounded memory and no hash-table work in the hot
+        // dispatcher. A genuinely hot successor survives arbitrary cold noise.
+        for count in counts.iter_mut() {
+            *count -= 1;
+        }
+    }
+}
+
+#[no_mangle]
+pub fn jit_get_tier2_profiled_exits() -> u32 { unsafe { TIER2_PROFILED_EXITS } }
+#[no_mangle]
+pub fn jit_get_tier2_region_promotions() -> u32 { unsafe { TIER2_REGION_PROMOTIONS } }
+#[no_mangle]
+pub fn jit_get_tier2_region_seeds() -> u32 { unsafe { TIER2_REGION_SEEDS } }
+
+#[no_mangle]
+pub fn jit_reset_tier2_state() {
+    let mut ctx = get_jit_state();
+    ctx.tier2_pages.clear();
+    ctx.tier2_regions.clear();
+    unsafe {
+        TIER2_PAGE_COUNT = 0;
+        TIER2_PROMOTIONS = 0;
+        TIER2_BLOCKED_BY_CAP = 0;
+        TIER2_PROFILED_EXITS = 0;
+        TIER2_REGION_PROMOTIONS = 0;
+        TIER2_REGION_SEEDS = 0;
+        MODULE_EXEC_COUNTS = [0; 0x10000];
+        TIER2_EXIT_TARGETS = [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
+        TIER2_EXIT_COUNTS = [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
+        TIER2_PROFILE_SAMPLES = [0; WASM_TABLE_SIZE as usize];
+    }
+}
 
 #[no_mangle]
 pub fn jit_get_tier2_page_count() -> u32 {
@@ -206,22 +290,43 @@ pub fn jit_get_tier2_page_at(i: u32) -> u32 {
     }
 }
 
-/// Called from cycle_internal on every compiled-module entry. Returns true when the
-/// module was just promoted to tier-2 AND freed — the caller must not dispatch into it
-/// (run interpreted this slice; hotness recompiles it with the tier-2 budget).
-#[no_mangle]
-pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
+/// Called from cycle_internal on every compiled-module entry. Bit 0 means that the
+/// module was just promoted and freed (the caller must not dispatch into it); bit 1
+/// asks the caller to record the EIP reached by this sampled execution. Folding the
+/// latter into the existing 1/256 hotness sample avoids a new per-exit profiler tax.
+#[inline(always)]
+pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
     let threshold = unsafe { JIT_TIER2_THRESHOLD };
     if threshold == 0 {
-        return false;
+        return 0;
     }
+    let weight = if threshold >= TIER2_SAMPLE_WEIGHT {
+        let sample = unsafe {
+            (*global_pointers::instruction_counter as u32)
+                .wrapping_mul(0x9E37_79B9)
+                ^ (wasm_table_index as u32).wrapping_mul(0x85EB_CA6B)
+        };
+        if sample >> (32 - TIER2_SAMPLE_SHIFT) != 0 {
+            return 0;
+        }
+        TIER2_SAMPLE_WEIGHT
+    }
+    else {
+        1
+    };
     let count = unsafe {
         let c = &mut (*std::ptr::addr_of_mut!(MODULE_EXEC_COUNTS))[wasm_table_index as usize];
-        *c += 1;
+        *c = c.saturating_add(weight);
         *c
     };
+    let sample_exit = unsafe {
+        JIT_TIER2_REGIONS
+            && TIER2_PAGE_COUNT < TIER2_PAGE_SET_CAP
+            && count >= threshold / 4 * 3
+            && TIER2_PROFILE_SAMPLES[wasm_table_index as usize] < TIER2_PROFILE_SAMPLE_CAP
+    };
     if count < threshold {
-        return false;
+        return if sample_exit { 2 } else { 0 };
     }
     unsafe { MODULE_EXEC_COUNTS[wasm_table_index as usize] = 0 };
 
@@ -234,25 +339,103 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
         .map(|(p, _)| *p)
         .collect();
     if pages.is_empty() {
-        return false;
+        return 0;
     }
     // Already fully tier-2? Nothing to gain from another free/recompile churn.
     if pages.iter().all(|p| ctx.tier2_pages.contains(p)) {
-        return false;
+        return 0;
     }
-    if ctx.tier2_pages.len() + pages.len() > unsafe { TIER2_PAGE_SET_CAP as usize } {
+    let mut promoted_pages: HashSet<Page> = pages.iter().copied().collect();
+    let mut region_seeds = Vec::new();
+
+    if unsafe { JIT_TIER2_REGIONS } {
+        let source_state = ctx
+            .pages
+            .values()
+            .find(|info| info.wasm_table_index == index)
+            .map(|info| info.state_flags);
+        let mut candidates: Vec<(u32, u32)> = unsafe {
+            TIER2_EXIT_TARGETS[wasm_table_index as usize]
+                .iter()
+                .copied()
+                .zip(TIER2_EXIT_COUNTS[wasm_table_index as usize].iter().copied())
+                .filter(|&(_, count)| count != 0)
+                .collect()
+        };
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: u64 = candidates.iter().map(|&(_, count)| count as u64).sum();
+
+        for (target, hits) in candidates {
+            if total == 0
+                || hits as u64 * 100 < total * 5
+                || region_target_excluded(target)
+            {
+                continue;
+            }
+            let phys = match cpu::translate_address_read_no_side_effects(target as i32) {
+                Ok(phys) => phys,
+                Err(()) => continue,
+            };
+            let target_page = Page::page_of(phys);
+            let target_info = match ctx.pages.get(&target_page) {
+                Some(info)
+                    if Some(info.state_flags) == source_state
+                        && info.wasm_table_index != index
+                        && info
+                            .entry_points
+                            .iter()
+                            .any(|&(offset, _)| offset == phys as u16 & 0xFFF) => info,
+                _ => continue,
+            };
+            let target_index = target_info.wasm_table_index;
+            let target_pages: Vec<Page> = ctx
+                .pages
+                .iter()
+                .filter(|(_, info)| info.wasm_table_index == target_index)
+                .map(|(page, _)| *page)
+                .collect();
+            let added = target_pages
+                .iter()
+                .filter(|page| !promoted_pages.contains(page))
+                .count();
+            if promoted_pages.len() + added > unsafe { TIER2_MAX_PAGES as usize } {
+                continue;
+            }
+            promoted_pages.extend(target_pages);
+            region_seeds.push(target as i32);
+        }
+    }
+
+    let newly_promoted = promoted_pages
+        .iter()
+        .filter(|page| !ctx.tier2_pages.contains(page))
+        .count();
+    if ctx.tier2_pages.len() + newly_promoted > unsafe { TIER2_PAGE_SET_CAP as usize } {
         unsafe { TIER2_BLOCKED_BY_CAP += 1 };
-        return false;
+        return 0;
     }
-    for p in &pages {
+    for p in &promoted_pages {
         ctx.tier2_pages.insert(*p);
+    }
+    if unsafe { JIT_TIER2_REGIONS } && !region_seeds.is_empty() {
+        let region = Tier2Region {
+            pages: promoted_pages.clone(),
+            seeds: region_seeds.clone(),
+        };
+        for page in &pages {
+            ctx.tier2_regions.insert(*page, region.clone());
+        }
+        unsafe {
+            TIER2_REGION_PROMOTIONS += 1;
+            TIER2_REGION_SEEDS += region_seeds.len() as u32;
+        }
     }
     unsafe {
         TIER2_PAGE_COUNT = ctx.tier2_pages.len() as u32;
         TIER2_PROMOTIONS += 1;
     }
     free_wasm_module_tree(&mut ctx, index);
-    true
+    1
 }
 static mut JIT_DEAD_FLAG_ELISION: bool = false;
 static mut JIT_FASTMEM_READS: bool = false;
@@ -1107,6 +1290,12 @@ pub fn rust_init() {
         TIER2_PAGE_COUNT = 0;
         TIER2_PROMOTIONS = 0;
         TIER2_BLOCKED_BY_CAP = 0;
+        TIER2_PROFILED_EXITS = 0;
+        TIER2_REGION_PROMOTIONS = 0;
+        TIER2_REGION_SEEDS = 0;
+        TIER2_EXIT_TARGETS = [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
+        TIER2_EXIT_COUNTS = [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
+        TIER2_PROFILE_SAMPLES = [0; WASM_TABLE_SIZE as usize];
         MODULE_EXEC_COUNTS = [0; 0x10000];
     }
 
@@ -1131,6 +1320,12 @@ struct PageInfo {
     state_flags: CachedStateFlags,
 }
 
+#[derive(Clone)]
+struct Tier2Region {
+    pages: HashSet<Page>,
+    seeds: Vec<i32>,
+}
+
 enum CompilingPageState {
     Compiling { pages: HashMap<Page, PageInfo> },
     CompilingWritten,
@@ -1152,6 +1347,9 @@ struct JitState {
     // Survives jit_clear_cache (the pages are still the hot ones); dies with the wasm
     // instance (per game load).
     tier2_pages: HashSet<Page>,
+    // Profile-selected unions of already-hot Tier-1 modules. Keyed by every
+    // source page so whichever source entry triggers recompilation sees the plan.
+    tier2_regions: HashMap<Page, Tier2Region>,
 }
 
 fn check_jit_state_invariants(ctx: &mut JitState) {
@@ -1220,6 +1418,7 @@ impl JitState {
             wasm_table_index_free_list: Vec::from_iter(wasm_table_indices),
             compiling: None,
             tier2_pages: HashSet::new(),
+            tier2_regions: HashMap::new(),
         }
     }
 }
@@ -1745,6 +1944,7 @@ fn jit_find_basic_blocks(
     ctx: &mut JitState,
     entry_points: HashSet<i32>,
     cpu: CpuContext,
+    tier2_region: Option<&Tier2Region>,
 ) -> Vec<BasicBlock> {
     fn follow_jump(
         virt_target: i32,
@@ -1752,6 +1952,7 @@ fn jit_find_basic_blocks(
         pages: &mut HashSet<Page>,
         page_blacklist: &mut HashSet<Page>,
         max_pages: u32,
+        tier2_region: Option<&Tier2Region>,
         marked_as_entry: &mut HashSet<i32>,
         to_visit_stack: &mut Vec<i32>,
     ) -> Option<u32> {
@@ -1767,6 +1968,14 @@ fn jit_find_basic_blocks(
         };
 
         let phys_page = Page::page_of(phys_target);
+
+        // A profile-guided Tier-2 compile is a union of known-hot Tier-1 modules,
+        // not an unconstrained wider BFS. Edges leaving that selected union stay
+        // ordinary side exits, which bounds code size and avoids pulling cold call
+        // trees into the generated wasm function.
+        if tier2_region.map_or(false, |region| !region.pages.contains(&phys_page)) {
+            return None;
+        }
 
         // Never GROW a module INTO the thunk/callback/spin bucket (REGION_EXCLUDE_*):
         // stub pages are full of OUT traps and must stay standalone modules. This must
@@ -1806,6 +2015,7 @@ fn jit_find_basic_blocks(
                 if entry_points
                     .iter()
                     .all(|entry_point| existing_entry_points.contains(entry_point))
+                    && tier2_region.is_none()
                 {
                     page_blacklist.insert(phys_page);
                     return None;
@@ -1861,7 +2071,9 @@ fn jit_find_basic_blocks(
     // compilation-wide cap so dispatchers can absorb hot targets. Non-dispatcher
     // modules rarely reach it (hot direct-jump chains are short); it stays far
     // below the global-MAX_PAGES=48 setting that OOM'd V8.
-    let max_pages = if cpu.state_flags.is_32() {
+    let max_pages = if let Some(region) = tier2_region {
+        region.pages.len() as u32
+    } else if cpu.state_flags.is_32() {
         let base = if unsafe { JIT_INDIRECT_REGIONS } {
             unsafe { MAX_PAGES.max(JIT_INDIRECT_REGION_MAX_PAGES) }
         } else {
@@ -1879,6 +2091,7 @@ fn jit_find_basic_blocks(
             &mut pages,
             &mut page_blacklist,
             max_pages,
+            tier2_region,
             &mut marked_as_entry,
             &mut to_visit_stack,
         );
@@ -2011,6 +2224,7 @@ fn jit_find_basic_blocks(
                             &mut pages,
                             &mut page_blacklist,
                             max_pages,
+                            tier2_region,
                             &mut marked_as_entry,
                             &mut to_visit_stack,
                         ),
@@ -2050,6 +2264,7 @@ fn jit_find_basic_blocks(
                             &mut pages,
                             &mut page_blacklist,
                             max_pages,
+                            tier2_region,
                             &mut marked_as_entry,
                             &mut to_visit_stack,
                         ),
@@ -2128,6 +2343,7 @@ fn jit_find_basic_blocks(
                                     &mut pages,
                                     &mut page_blacklist,
                                     max_pages,
+                                    tier2_region,
                                     &mut marked_as_entry,
                                     &mut to_visit_stack,
                                 )
@@ -2403,11 +2619,16 @@ fn jit_analyze_and_generate(
         cpu::translate_address_read_no_side_effects(virt_entry_point).unwrap() == phys_entry_point
     );
     let virt_page = Page::page_of(virt_entry_point as u32);
-    let entry_points: HashSet<i32> = entry_points
+    let mut entry_points: HashSet<i32> = entry_points
         .iter()
         .map(|e| virt_page.to_address() as i32 | *e as i32)
         .collect();
-    let basic_blocks = jit_find_basic_blocks(ctx, entry_points, cpu.clone());
+    let tier2_region = ctx.tier2_regions.get(&page).cloned();
+    if let Some(region) = &tier2_region {
+        entry_points.extend(region.seeds.iter().copied());
+    }
+    let basic_blocks =
+        jit_find_basic_blocks(ctx, entry_points, cpu.clone(), tier2_region.as_ref());
 
     let mut pages = HashSet::new();
 
@@ -4259,7 +4480,15 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
     // the null-function crash of the first landing — see the RET_CACHE comment). Also
     // reset the tier-2 execution counter for the recycled index (B3).
     ret_cache_invalidate_all();
-    unsafe { MODULE_EXEC_COUNTS[wasm_table_index.to_u16() as usize] = 0 };
+    unsafe {
+        let slot = wasm_table_index.to_u16() as usize;
+        MODULE_EXEC_COUNTS[slot] = 0;
+        if slot < WASM_TABLE_SIZE as usize {
+            TIER2_EXIT_TARGETS[slot] = [0; TIER2_PROFILE_TARGETS];
+            TIER2_EXIT_COUNTS[slot] = [0; TIER2_PROFILE_TARGETS];
+            TIER2_PROFILE_SAMPLES[slot] = 0;
+        }
+    }
 
     // It is not strictly necessary to clear the function, but it will fail more predictably if we
     // accidentally use the function and may garbage collect unused modules earlier
@@ -4342,6 +4571,11 @@ fn free_wasm_module_forest(ctx: &mut JitState, roots: Vec<WasmTableIndex>) {
 
 /// Register a write in this page: Delete all present code
 fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
+    // A region is valid only for the exact code bytes/modules from which it was
+    // learned. Any member page becoming dirty invalidates the complete plan;
+    // ordinary hotness can learn a fresh one from the replacement code.
+    ctx.tier2_regions
+        .retain(|_, region| !region.pages.contains(&page));
     let mut did_have_code = false;
 
     if let Some(PageInfo {
@@ -4628,6 +4862,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         20 => TIER2_PAGE_SET_CAP = value.clamp(1, 4096),
         21 => JIT_FLAG_LOCALS = value != 0,
         22 => JIT_INLINE_INTRA_MODULE_DISPATCH = value != 0,
+        23 => JIT_TIER2_REGIONS = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -4658,6 +4893,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         20 => TIER2_PAGE_SET_CAP,
         21 => JIT_FLAG_LOCALS as u32,
         22 => JIT_INLINE_INTRA_MODULE_DISPATCH as u32,
+        23 => JIT_TIER2_REGIONS as u32,
         _ => 0,
     }
 }

@@ -288,6 +288,11 @@ pub const DEBUG: bool = cfg!(debug_assertions);
 
 pub const LOOP_COUNTER: i32 = 100_003;
 pub static mut jit_cycle_start_instruction_counter: u32 = 0;
+// Snapshot taken once at do_many_cycles_native entry. Direct JIT tail chains run
+// on the same worker and cannot cross a thunk/module exit that changes the
+// hypercall budget, so they can use this value instead of re-decoding the shared
+// hypercall page on every tiny-block edge.
+pub static mut jit_cycle_limit_cached: u32 = 0;
 
 // should probably be kept in sync with APIC_TIMER_FREQ in apic.js
 pub const TSC_RATE: f64 = 1_000_000.0;
@@ -3487,6 +3492,7 @@ pub unsafe fn do_many_cycles_native() {
     let initial_instruction_counter = *instruction_counter;
     jit_cycle_start_instruction_counter = initial_instruction_counter;
     let limit = hypercall::read_cycle_limit();
+    jit_cycle_limit_cached = limit;
     // Park-address exit: the spin loop (JMP $ at the async-park address) is a PARKING
     // slot, not code — once EIP lands there, burning the rest of the slice budget
     // honestly executing it is pure waste (measured in-race on NFSU: 1.8B spin

@@ -5,19 +5,22 @@
 //   page0: dec ecx; jz done; jmp page1
 //   page1: jmp page0
 //
-// With tail-call support, JIT_BLOCK_CHAINING should produce CHAINED_EDGE > 0
-// while still halting with ecx == 0.
+// The retained implementation memoizes each exact target behind a table-generation
+// guard, performs the preemption guard directly in generated wasm, then spills
+// registers only for a proven tail-call.
+// This test A/Bs the exact same loop with config 4 OFF and ON, while checking
+// cold misses, budget exits, arithmetic state and the default kill switch.
 
 const { V86 } = await import("../build/libv86.mjs");
 
 const BASE = 0x100000;
 const ENTRY_OFF = 0x20;
 const PAGE1_OFF = 0x1000;
-const ITER = 800000;
+const ITER = 4_000_000;
 const MEM_SIZE = 16 * 1024 * 1024;
-const TIMEOUT_MS = 12000;
+const TIMEOUT_MS = 30000;
 
-function build_image()
+function build_image(iterations)
 {
     const buf = new Uint8Array(PAGE1_OFF + 16);
     const dv = new DataView(buf.buffer);
@@ -39,7 +42,7 @@ function build_image()
     const rel8 = n => { patches.push({ at: o, sz: 1, end: o + 1, to: n }); emit(0); };
     const rel32 = n => { patches.push({ at: o, sz: 4, end: o + 4, to: n }); emit(0, 0, 0, 0); };
 
-    emit(0xB9); u32(ITER);                 // mov ecx, ITER
+    emit(0xB9); u32(iterations);           // mov ecx, ITER
     label("page0");
     emit(0x49);                            // dec ecx
     emit(0x74); rel8("done");             // jz done
@@ -60,7 +63,7 @@ function build_image()
     return buf;
 }
 
-function run()
+function run(chaining, iterations = ITER)
 {
     return new Promise(resolve => {
         const emulator = new V86({
@@ -69,7 +72,7 @@ function run()
             disable_jit: 0,
             log_level: 0,
         });
-        let halted = false, timer;
+        let halted = false, timer, startedAt = 0;
         const finish = status => {
             clearTimeout(timer);
             try { emulator.stop(); } catch(e) {}
@@ -77,6 +80,7 @@ function run()
             const dget = cpu.wm.exports["profiler_dispatch_stat_get"];
             resolve({
                 status,
+                elapsedMs: performance.now() - startedAt,
                 ecx: cpu.reg32[1] >>> 0,
                 chaining: cpu.get_jit_config ? cpu.get_jit_config(4) >>> 0 : 0,
                 reentry: dget ? dget(1) : 0,
@@ -84,6 +88,11 @@ function run()
                 chainedEdge: dget ? dget(5) : 0,
                 budgetExit: dget ? dget(6) : 0,
                 miss: dget ? dget(7) : 0,
+                sites: cpu.wm.exports["jit_block_chain_sites_compiled"]?.() ?? -1,
+                exactHits: cpu.wm.exports["jit_exact_dispatch_hits"]?.() ?? -1,
+                exactMisses: cpu.wm.exports["jit_exact_dispatch_misses"]?.() ?? -1,
+                memoHighWater: cpu.wm.exports["jit_chain_memo_high_water"]?.() ?? -1,
+                memoOverflows: cpu.wm.exports["jit_chain_memo_overflows"]?.() ?? -1,
             });
         };
 
@@ -96,35 +105,66 @@ function run()
             cpu.reboot_internal();
             cpu.reset_memory();
             cpu.set_jit_config(1, 1); // MAX_PAGES=1, force cross-page module exits
+            const defaultChaining = cpu.get_jit_config(4) >>> 0;
+            if(defaultChaining !== 0)
+            {
+                finish(`BAD_DEFAULT_${defaultChaining}`);
+                return;
+            }
+            cpu.set_jit_config(4, chaining ? 1 : 0);
             cpu.wm.exports["set_dispatch_stats"]?.(1);
             cpu.wm.exports["profiler_init"]?.();
             cpu.jit_clear_cache?.();
-            cpu.load_multiboot(build_image().buffer);
+            cpu.load_multiboot(build_image(iterations).buffer);
             timer = setTimeout(() => { if(!halted) finish("HANG"); }, TIMEOUT_MS);
+            startedAt = performance.now();
             emulator.run();
         });
     });
 }
 
-const result = await run();
-console.log("jit-block-chaining " + JSON.stringify(result));
-
-if(result.status !== "halt" || result.ecx !== 0)
+const sequence = [false, true, true, false, false, true];
+const results = [];
+for(const chaining of sequence)
 {
-    console.error("FAIL: loop did not halt cleanly with ecx=0");
-    process.exit(1);
-}
+    const result = await run(chaining);
+    results.push(result);
+    console.log("jit-block-chaining-run " + JSON.stringify(result));
 
-if(result.chaining)
-{
-    if(result.chainedEdge <= 0)
+    if(result.status !== "halt" || result.ecx !== 0)
     {
-        console.error("FAIL: JIT_BLOCK_CHAINING enabled but CHAINED_EDGE stayed zero");
+        console.error("FAIL: loop did not halt cleanly with ecx=0");
+        process.exit(1);
+    }
+    if(chaining && (result.chaining !== 1 || result.chainedEdge <= 0 || result.sites <= 0))
+    {
+        console.error("FAIL: chaining was enabled but no direct edge/site was observed");
+        process.exit(1);
+    }
+    if(chaining && (result.exactHits <= 0 || result.memoHighWater <= 0 || result.memoOverflows !== 0))
+    {
+        console.error("FAIL: exact target memo did not fill cleanly");
+        process.exit(1);
+    }
+    if(!chaining && (result.chaining !== 0 || result.chainedEdge !== 0))
+    {
+        console.error("FAIL: disabled chaining executed a chained edge");
         process.exit(1);
     }
 }
-else {
-    console.log("SKIP effectiveness: WebAssembly tail-call support unavailable");
-}
+
+const median = values => {
+    const s = values.slice().sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)];
+};
+const offMs = median(results.filter(x => !x.chaining).map(x => x.elapsedMs));
+const onMs = median(results.filter(x => x.chaining).map(x => x.elapsedMs));
+const summary = {
+    iterations: ITER,
+    offMedianMs: +offMs.toFixed(2),
+    onMedianMs: +onMs.toFixed(2),
+    throughputGainPct: +((offMs / onMs - 1) * 100).toFixed(2),
+};
+console.log("jit-block-chaining " + JSON.stringify(summary));
 
 process.exit(0);

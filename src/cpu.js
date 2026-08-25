@@ -98,9 +98,14 @@ export function CPU(bus, wm, stop_idling)
     this.stop_idling = stop_idling;
     this.wm = wm;
     this.wasm_patch();
-    this.jit_block_chaining_supported =
-        return_call_indirect_supported() && !globalThis.DISABLE_JIT_BLOCK_CHAINING;
-    this.set_jit_config(4, this.jit_block_chaining_supported ? 1 : 0);
+    this.jit_block_chaining_supported = return_call_indirect_supported();
+    // Opt-in while the new inline-guarded implementation is being evaluated.
+    // Keeping support detection separate lets diagnostics enable config 4 after
+    // checking this property, without silently changing every v86 consumer.
+    this.set_jit_config(
+        4,
+        this.jit_block_chaining_supported && globalThis.ENABLE_JIT_BLOCK_CHAINING ? 1 : 0,
+    );
     // Default ON — kill-switch: globalThis.DISABLE_JIT_DEAD_FLAG_ELISION
     this.jit_dead_flag_elision_enabled = !globalThis.DISABLE_JIT_DEAD_FLAG_ELISION;
     this.set_jit_config(5, this.jit_dead_flag_elision_enabled ? 1 : 0);

@@ -70,6 +70,15 @@ static mut JIT_DISABLED: bool = false;
 static mut MAX_PAGES: u32 = 3;
 
 static mut JIT_USE_LOOP_SAFETY: bool = true;
+// Direct cross-module block chaining (idx 4). A direct JMP/Jcc whose successor
+// was excluded from the current generated module can tail-call the successor's
+// already-published module instead of returning through cycle_internal. Unlike
+// the retired first prototype, the target and preemption guards are emitted
+// directly in generated wasm and guest registers are spilled only after every
+// guard has succeeded. Kept opt-in until a real-game A/B justifies the extra
+// code at direct module exits.
+static mut JIT_BLOCK_CHAINING: bool = false;
+static mut BLOCK_CHAIN_SITES_COMPILED: u32 = 0;
 // RET/AbsoluteEip dynamic chaining: when the in-module AbsoluteEip
 // re-dispatch misses, attempt a cross-module tail-call at the runtime eip instead of
 // exiting to main_loop. Gated at COMPILE time — toggle via
@@ -109,10 +118,13 @@ const RET_CACHE_SIZE: usize = 512;
 static mut RET_CACHE: [(u32, u32, i32, u64); RET_CACHE_SIZE] = [(0, 0, -1, 0); RET_CACHE_SIZE];
 // Starts at 1 so zero-initialized entries can never match before their first fill.
 static mut RET_CACHE_EPOCH: u64 = 1;
+static mut CHAIN_TARGET_EPOCH: u32 = 1;
 
 pub fn ret_cache_invalidate_all() {
     unsafe {
         RET_CACHE_EPOCH += 1;
+        let next = CHAIN_TARGET_EPOCH.wrapping_add(1);
+        CHAIN_TARGET_EPOCH = if next == 0 { 1 } else { next };
     }
 }
 
@@ -317,6 +329,7 @@ pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 // via profiler_dispatch_stat_get. OFF by default — zero cost on the production path.
 pub static mut DISPATCH_STATS: bool = false;
 pub fn dispatch_stats_enabled() -> bool { unsafe { DISPATCH_STATS } }
+fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
 fn ret_chaining_enabled() -> bool { unsafe { JIT_RET_CHAINING } }
 fn ret_speculation_enabled() -> bool { unsafe { JIT_RET_SPECULATION } }
 fn dead_flag_elision_enabled() -> bool { unsafe { JIT_DEAD_FLAG_ELISION } }
@@ -410,6 +423,169 @@ static mut DISPATCH_SLAB_FREE_TOP: usize = 0;
 static mut DISPATCH_SLAB_HIGH_WATER: u32 = 0;
 static mut DISPATCH_SLAB_OVERFLOWS: u32 = 0;
 
+// Exact cross-module dispatch index. The page-local DOD table above deliberately
+// publishes one wasm module per virtual page, which is ideal for in-module RET
+// dispatch but hides older modules that are still alive through another page.
+// Direct JMP/Jcc chaining used to probe only that latest owner and therefore
+// missed roughly 92% of BFME's otherwise-chainable exits.
+//
+// This open-addressed side index retains every exact (virtual EIP, architectural
+// state) entry. Values carry the wasm-table generation, so recycling a table slot
+// invalidates all of its old entries in O(1); stale buckets are reclaimed by later
+// inserts. A matching older module is safe to use: exact EIP and state are equal,
+// and its normal fastmem-generation prologue still self-deopts stale translations.
+const EXACT_DISPATCH_BITS: usize = 20;
+const EXACT_DISPATCH_SIZE: usize = 1 << EXACT_DISPATCH_BITS;
+const EXACT_DISPATCH_MASK: usize = EXACT_DISPATCH_SIZE - 1;
+const EXACT_DISPATCH_MAX_PROBES: usize = 12;
+static mut EXACT_DISPATCH_KEYS: [u64; EXACT_DISPATCH_SIZE] = [0; EXACT_DISPATCH_SIZE];
+// generation:u32 | wasm_table_index:u16 | unit_state:u16. Zero is empty because
+// generated modules never use table index zero.
+static mut EXACT_DISPATCH_VALUES: [u64; EXACT_DISPATCH_SIZE] = [0; EXACT_DISPATCH_SIZE];
+static mut EXACT_DISPATCH_GENERATIONS: [u32; 1 << 16] = [0; 1 << 16];
+static mut EXACT_DISPATCH_INSERTS: u32 = 0;
+static mut EXACT_DISPATCH_HITS: u32 = 0;
+static mut EXACT_DISPATCH_MISSES: u32 = 0;
+static mut EXACT_DISPATCH_OVERFLOWS: u32 = 0;
+static mut EXACT_DISPATCH_PUBLISH_EPOCH: u32 = 1;
+
+// One generation-checked target memo per generated direct-exit site. A hot site
+// loads this single u64 and bypasses the exact hash entirely; only an empty or
+// stale memo calls the exact resolver. Slots are reset on full cache clears and
+// otherwise allocated monotonically, so live generated code never aliases them.
+const CHAIN_SITE_MEMO_COUNT: usize = 1 << 20;
+static mut CHAIN_SITE_MEMOS: [u64; CHAIN_SITE_MEMO_COUNT] = [0; CHAIN_SITE_MEMO_COUNT];
+static mut CHAIN_SITE_MEMO_NEXT: usize = 0;
+static mut CHAIN_SITE_MEMO_HIGH_WATER: u32 = 0;
+static mut CHAIN_SITE_MEMO_OVERFLOWS: u32 = 0;
+
+#[inline]
+fn exact_dispatch_hash(key: u64) -> usize {
+    let mut x = key as u32 ^ (key >> 32) as u32;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68B);
+    x ^= x >> 16;
+    x as usize & EXACT_DISPATCH_MASK
+}
+
+#[inline]
+unsafe fn exact_dispatch_value_is_live(value: u64) -> bool {
+    if value == 0 {
+        return false;
+    }
+    let table = ((value >> 16) & 0xFFFF) as usize;
+    let generation = (value >> 32) as u32;
+    table != 0 && EXACT_DISPATCH_GENERATIONS[table] == generation
+}
+
+unsafe fn exact_dispatch_insert(
+    virt_address: u32,
+    state_flags: CachedStateFlags,
+    wasm_table_index: WasmTableIndex,
+    unit_state: u16,
+) {
+    let table = wasm_table_index.to_u16() as usize;
+    dbg_assert!(table != 0 && unit_state != u16::MAX);
+    let key = (state_flags.to_u32() as u64) << 32 | virt_address as u64;
+    let generation = EXACT_DISPATCH_GENERATIONS[table];
+    let value = (generation as u64) << 32 | (table as u64) << 16 | unit_state as u64;
+    let start = exact_dispatch_hash(key);
+
+    for probe in 0..EXACT_DISPATCH_MAX_PROBES {
+        let slot = (start + probe) & EXACT_DISPATCH_MASK;
+        let old_value = EXACT_DISPATCH_VALUES[slot];
+        if old_value == value && EXACT_DISPATCH_KEYS[slot] == key {
+            return;
+        }
+        if old_value == 0 || !exact_dispatch_value_is_live(old_value) {
+            EXACT_DISPATCH_KEYS[slot] = key;
+            EXACT_DISPATCH_VALUES[slot] = value;
+            EXACT_DISPATCH_INSERTS = EXACT_DISPATCH_INSERTS.saturating_add(1);
+            let next = EXACT_DISPATCH_PUBLISH_EPOCH.wrapping_add(1);
+            EXACT_DISPATCH_PUBLISH_EPOCH = if next == 0 { 1 } else { next };
+            return;
+        }
+        // Keep an already-live exact translation, even if it belongs to an older
+        // module. It is semantically equivalent and avoids churn on page overwrite.
+        if EXACT_DISPATCH_KEYS[slot] == key {
+            return;
+        }
+    }
+
+    // A full probe window is only a performance miss; main_loop remains the exact
+    // correctness fallback. Keep the event visible for capacity tuning.
+    EXACT_DISPATCH_OVERFLOWS = EXACT_DISPATCH_OVERFLOWS.saturating_add(1);
+}
+
+/// Resolve any still-live module at an exact virtual EIP/state pair. The packed
+/// return is (actual wasm table slot << 16) | unit_state, or -1 on miss.
+#[no_mangle]
+pub unsafe fn jit_find_cache_entry_exact_chain(virt_address: u32, raw_state_flags: u32) -> i32 {
+    let key = (raw_state_flags as u64) << 32 | virt_address as u64;
+    let start = exact_dispatch_hash(key);
+
+    for probe in 0..EXACT_DISPATCH_MAX_PROBES {
+        let slot = (start + probe) & EXACT_DISPATCH_MASK;
+        let value = EXACT_DISPATCH_VALUES[slot];
+        if value == 0 {
+            EXACT_DISPATCH_MISSES = EXACT_DISPATCH_MISSES.saturating_add(1);
+            return -1;
+        }
+        if EXACT_DISPATCH_KEYS[slot] == key && exact_dispatch_value_is_live(value) {
+            EXACT_DISPATCH_HITS = EXACT_DISPATCH_HITS.saturating_add(1);
+            let table = ((value >> 16) & 0xFFFF) as i32 + cpu::WASM_TABLE_OFFSET as i32;
+            let unit_state = (value & 0xFFFF) as i32;
+            return table << 16 | unit_state;
+        }
+    }
+
+    EXACT_DISPATCH_MISSES = EXACT_DISPATCH_MISSES.saturating_add(1);
+    -1
+}
+
+/// Cold path for one generated direct-exit site: resolve the exact target and
+/// memoize its current table generation. The hot generated path validates that
+/// generation before using the packed target, so table-slot recycling is safe.
+#[no_mangle]
+pub unsafe fn jit_find_cache_entry_exact_chain_memo(
+    virt_address: u32,
+    raw_state_flags: u32,
+    memo_slot: u32,
+) -> i32 {
+    let packed = jit_find_cache_entry_exact_chain(virt_address, raw_state_flags);
+    if (memo_slot as usize) < CHAIN_SITE_MEMO_COUNT {
+        if packed >= 0 {
+            CHAIN_SITE_MEMOS[memo_slot as usize] =
+                (CHAIN_TARGET_EPOCH as u64) << 32 | packed as u32 as u64;
+        }
+        else {
+            // Negative memo. Any later exact-target publication bumps the epoch,
+            // making generated code retry this site automatically.
+            CHAIN_SITE_MEMOS[memo_slot as usize] =
+                (EXACT_DISPATCH_PUBLISH_EPOCH as u64) << 32 | u32::MAX as u64;
+        }
+    }
+    packed
+}
+
+fn allocate_chain_site_memo() -> Option<(u32, u32)> {
+    unsafe {
+        if CHAIN_SITE_MEMO_NEXT >= CHAIN_SITE_MEMO_COUNT {
+            CHAIN_SITE_MEMO_OVERFLOWS = CHAIN_SITE_MEMO_OVERFLOWS.saturating_add(1);
+            return None;
+        }
+        let slot = CHAIN_SITE_MEMO_NEXT;
+        CHAIN_SITE_MEMO_NEXT += 1;
+        CHAIN_SITE_MEMOS[slot] = 0;
+        CHAIN_SITE_MEMO_HIGH_WATER =
+            CHAIN_SITE_MEMO_HIGH_WATER.max(CHAIN_SITE_MEMO_NEXT as u32);
+        let address = std::ptr::addr_of!(CHAIN_SITE_MEMOS) as u32 + (slot as u32 * 8);
+        Some((slot as u32, address))
+    }
+}
+
 pub fn dispatch_meta_init() {
     unsafe {
         // Stack of free slabs, slab 0 excluded (reserved sentinel).
@@ -417,6 +593,9 @@ pub fn dispatch_meta_init() {
             DISPATCH_SLAB_FREE[i - 1] = i as u16;
         }
         DISPATCH_SLAB_FREE_TOP = DISPATCH_SLAB_COUNT - 1;
+        for i in 0..(1 << 16) {
+            EXACT_DISPATCH_GENERATIONS[i] = 1;
+        }
     }
 }
 
@@ -510,9 +689,25 @@ pub fn dispatch_slab_high_water() -> u32 { unsafe { DISPATCH_SLAB_HIGH_WATER } }
 pub fn dispatch_slab_overflows() -> u32 { unsafe { DISPATCH_SLAB_OVERFLOWS } }
 
 #[no_mangle]
+pub fn jit_exact_dispatch_inserts() -> u32 { unsafe { EXACT_DISPATCH_INSERTS } }
+#[no_mangle]
+pub fn jit_exact_dispatch_hits() -> u32 { unsafe { EXACT_DISPATCH_HITS } }
+#[no_mangle]
+pub fn jit_exact_dispatch_misses() -> u32 { unsafe { EXACT_DISPATCH_MISSES } }
+#[no_mangle]
+pub fn jit_exact_dispatch_overflows() -> u32 { unsafe { EXACT_DISPATCH_OVERFLOWS } }
+#[no_mangle]
+pub fn jit_chain_memo_high_water() -> u32 { unsafe { CHAIN_SITE_MEMO_HIGH_WATER } }
+#[no_mangle]
+pub fn jit_chain_memo_overflows() -> u32 { unsafe { CHAIN_SITE_MEMO_OVERFLOWS } }
+
+#[no_mangle]
 pub fn jit_inline_dispatch_sites_compiled() -> u32 {
     unsafe { INLINE_INTRA_MODULE_DISPATCH_SITES_COMPILED }
 }
+
+#[no_mangle]
+pub fn jit_block_chain_sites_compiled() -> u32 { unsafe { BLOCK_CHAIN_SITES_COMPILED } }
 
 // Coarse remap-thrash latch, using guest icount as the clock.
 static mut FASTMEM_THRASH_WINDOW_START: u32 = 0;
@@ -2526,18 +2721,166 @@ pub fn set_tlb_code(
     state_flags: CachedStateFlags,
 ) {
     dispatch_meta_set(virt_page, wasm_table_index, entries, state_flags);
+    if !block_chaining_enabled() {
+        return;
+    }
+    let base = virt_page.to_address();
+    for &(offset, unit_state) in entries {
+        unsafe {
+            exact_dispatch_insert(
+                base | offset as u32,
+                state_flags,
+                wasm_table_index,
+                unit_state,
+            );
+        }
+    }
 }
 
-// Statically-chainable direct-jump exit: record the exit as chainable and branch to the
-// module exit label (main_loop re-dispatch). (Static block-chaining was removed; the live
-// cross-module chaining mechanism is the dynamic RET path, set_jit_config idx 12.)
+// Statically-chainable direct-jump exit. When enabled, resolve the already-written
+// runtime EIP through the exact cross-module index, verify the scheduler budget in
+// generated wasm, and tail-call the target module. The lookup deliberately happens
+// before spilling guest registers: an unpublished target or exhausted budget pays
+// no more writeback than the ordinary module exit.
 fn gen_chain_or_exit_to_known_successor(
     ctx: &mut JitContext,
-    _state_flags: CachedStateFlags,
-    _last_instruction_addr: u32,
+    state_flags: CachedStateFlags,
+    last_instruction_addr: u32,
 ) {
+    if !block_chaining_enabled() {
+        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+        ctx.builder.br(ctx.exit_label);
+        return;
+    }
+
+    if let Some((memo_slot, memo_address)) = allocate_chain_site_memo() {
+        ctx.builder.load_fixed_i64(memo_address);
+        let memo = ctx.builder.set_new_local_i64();
+        ctx.builder.get_local_i64(&memo);
+        ctx.builder.wrap_i64_to_i32();
+        let memo_packed = ctx.builder.set_new_local();
+
+        // A negative memo is valid until any exact target is newly published.
+        ctx.builder.get_local(&memo_packed);
+        ctx.builder.const_i32(-1);
+        ctx.builder.eq_i32();
+        ctx.builder.if_i32();
+        ctx.builder.load_fixed_i32(std::ptr::addr_of!(EXACT_DISPATCH_PUBLISH_EPOCH) as u32);
+        ctx.builder.get_local_i64(&memo);
+        ctx.builder.const_i64(32);
+        ctx.builder.shr_u_i64();
+        ctx.builder.wrap_i64_to_i32();
+        ctx.builder.eq_i32();
+        ctx.builder.if_i32();
+        ctx.builder.const_i32(-1);
+        ctx.builder.else_();
+        codegen::gen_get_eip(ctx.builder);
+        ctx.builder.const_i32(state_flags.to_u32() as i32);
+        ctx.builder.const_i32(memo_slot as i32);
+        ctx.builder
+            .call_fn3_ret("jit_find_cache_entry_exact_chain_memo");
+        ctx.builder.block_end();
+        ctx.builder.else_();
+
+        // Positive memo: a single global target epoch is sufficient because the
+        // table-slot free/dispatch-eviction funnel invalidates every chain memo.
+        ctx.builder.get_local_i64(&memo);
+        ctx.builder.const_i64(0);
+        ctx.builder.ne_i64();
+        ctx.builder.load_fixed_i32(std::ptr::addr_of!(CHAIN_TARGET_EPOCH) as u32);
+        ctx.builder.get_local_i64(&memo);
+        ctx.builder.const_i64(32);
+        ctx.builder.shr_u_i64();
+        ctx.builder.wrap_i64_to_i32();
+        ctx.builder.eq_i32();
+        ctx.builder.and_i32();
+        ctx.builder.if_i32();
+        ctx.builder.get_local(&memo_packed);
+        ctx.builder.else_();
+        codegen::gen_get_eip(ctx.builder);
+        ctx.builder.const_i32(state_flags.to_u32() as i32);
+        ctx.builder.const_i32(memo_slot as i32);
+        ctx.builder
+            .call_fn3_ret("jit_find_cache_entry_exact_chain_memo");
+        ctx.builder.block_end();
+        ctx.builder.block_end();
+
+        ctx.builder.free_local(memo_packed);
+        ctx.builder.free_local_i64(memo);
+    }
+    else {
+        codegen::gen_get_eip(ctx.builder);
+        ctx.builder.const_i32(state_flags.to_u32() as i32);
+        ctx.builder.call_fn2_ret("jit_find_cache_entry_exact_chain");
+    }
+    let packed_target = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&packed_target);
+    ctx.builder.const_i32(0);
+    ctx.builder.ge_i32();
+    ctx.builder.if_void();
+
+    // do_many_cycles_native already decoded the writable hypercall budget for
+    // this slice. A direct JIT edge cannot cross the thunk/module exit that may
+    // change it, so use the cached value instead of re-reading and branching on
+    // the hypercall page at every tiny-block edge.
+    ctx.builder.load_fixed_i32(
+        std::ptr::addr_of!(cpu::jit_cycle_limit_cached) as u32,
+    );
+    let cycle_limit = ctx.builder.set_new_local();
+
+    // limit != 0 && (global + pending - slice_start) < limit && !in_hlt
+    ctx.builder.get_local(&cycle_limit);
+    ctx.builder.const_i32(0);
+    ctx.builder.ne_i32();
+    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.add_i32();
+    ctx.builder.load_fixed_i32(
+        std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32,
+    );
+    ctx.builder.sub_i32();
+    ctx.builder.get_local(&cycle_limit);
+    ctx.builder.ltu_i32();
+    ctx.builder.and_i32();
+    ctx.builder.load_fixed_u8(global_pointers::in_hlt as u32);
+    ctx.builder.eqz_i32();
+    ctx.builder.and_i32();
+    ctx.builder.if_void();
+
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_CHAINED_EDGE);
+    codegen::gen_move_registers_from_locals_to_memory(ctx);
+    codegen::gen_update_instruction_counter(ctx);
+    ctx.builder.const_i32(0);
+    ctx.builder.set_local(&ctx.instruction_counter);
+
+    ctx.builder.get_local(&packed_target);
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&packed_target);
+    ctx.builder.const_i32(16);
+    ctx.builder.shr_u_i32();
+    ctx.builder.return_call_indirect_fn1();
+    ctx.builder.block_end();
+
+    // A published target existed, but yielding now is architecturally required.
     codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_CHAIN_BUDGET_EXIT);
+    codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+    ctx.builder.free_local(cycle_limit);
     ctx.builder.br(ctx.exit_label);
+    ctx.builder.block_end();
+
+    // No live target was published for this exact EIP/state pair.
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_CHAIN_MISS);
+    ctx.builder.free_local(packed_target);
+    codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+    ctx.builder.br(ctx.exit_label);
+
+    unsafe {
+        BLOCK_CHAIN_SITES_COMPILED = BLOCK_CHAIN_SITES_COMPILED.saturating_add(1);
+    }
 }
 
 /// Emit the same lookup as `jit_find_cache_entry_in_page`, but directly into
@@ -3900,6 +4243,14 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
         return;
     }
 
+    // Invalidate every exact-dispatch entry owned by this table slot before the
+    // slot can be handed to another module. No hash-table scan is required.
+    unsafe {
+        let slot = wasm_table_index.to_u16() as usize;
+        let next = EXACT_DISPATCH_GENERATIONS[slot].wrapping_add(1);
+        EXACT_DISPATCH_GENERATIONS[slot] = if next == 0 { 1 } else { next };
+    }
+
     ctx.wasm_table_index_free_list.push(wasm_table_index);
 
     // This is the ONLY place a table slot is nulled — invalidate the B1b ret-target
@@ -4115,6 +4466,10 @@ fn jit_clear_cache(ctx: &mut JitState) {
     for page in pages_with_code {
         jit_dirty_page_ctx(ctx, page);
     }
+
+    // Every generated module has now been freed, so site-memo addresses may be
+    // reused. Allocation zeroes each reused slot before publishing new code.
+    unsafe { CHAIN_SITE_MEMO_NEXT = 0 };
 }
 
 pub fn jit_page_has_code(page: Page) -> bool { jit_page_has_code_ctx(&mut get_jit_state(), page) }
@@ -4254,7 +4609,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         1 => MAX_PAGES = value,
         2 => JIT_USE_LOOP_SAFETY = value != 0,
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
-        // idx 4 retired (static block-chaining removed; use idx 12 dynamic RET chaining)
+        4 => JIT_BLOCK_CHAINING = value != 0,
         5 => JIT_DEAD_FLAG_ELISION = value != 0,
         6 => JIT_INDIRECT_REGIONS = value != 0,
         7 => JIT_INDIRECT_REGION_MIN_SHARE = value,
@@ -4284,6 +4639,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         1 => MAX_PAGES as u32,
         2 => JIT_USE_LOOP_SAFETY as u32,
         3 => MAX_EXTRA_BASIC_BLOCKS as u32,
+        4 => JIT_BLOCK_CHAINING as u32,
         5 => JIT_DEAD_FLAG_ELISION as u32,
         6 => JIT_INDIRECT_REGIONS as u32,
         7 => JIT_INDIRECT_REGION_MIN_SHARE,

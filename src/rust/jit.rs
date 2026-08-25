@@ -258,6 +258,18 @@ static mut JIT_FASTMEM_WRITES: bool = false;
 // module epilogues spill at every exit.
 static mut JIT_FLAG_LOCALS: bool = false;
 
+// Inline the current-module AbsoluteEip resolver in generated wasm (idx 22).
+// Every RET / indirect jump first asks whether its runtime target is another
+// dispatcher entry in the same compiled module. DISPATCH_META / DISPATCH_SLABS
+// already live in the shared linear memory, so calling back into the base Rust
+// module just to perform two loads and comparisons adds an avoidable wasm-module
+// boundary on one of the hottest x86 control-flow paths. The generated lookup is
+// deliberately a byte-for-byte semantic mirror of jit_find_cache_entry_in_page:
+// state flags and table slot must both match, and a u16::MAX state still means
+// miss. Compile-time gated so a live workload can A/B it after a JIT-cache clear.
+static mut JIT_INLINE_INTRA_MODULE_DISPATCH: bool = false;
+static mut INLINE_INTRA_MODULE_DISPATCH_SITES_COMPILED: u32 = 0;
+
 // Tier-2R region recompiler: grow page groups across
 // indirect edges using trace_profiler target histograms, and make hot indirect
 // targets dispatcher entries so AbsoluteEip re-dispatches stay intra-module.
@@ -496,6 +508,11 @@ pub fn dispatch_meta_clear(page: u32) -> bool {
 pub fn dispatch_slab_high_water() -> u32 { unsafe { DISPATCH_SLAB_HIGH_WATER } }
 #[no_mangle]
 pub fn dispatch_slab_overflows() -> u32 { unsafe { DISPATCH_SLAB_OVERFLOWS } }
+
+#[no_mangle]
+pub fn jit_inline_dispatch_sites_compiled() -> u32 {
+    unsafe { INLINE_INTRA_MODULE_DISPATCH_SITES_COMPILED }
+}
 
 // Coarse remap-thrash latch, using guest icount as the clock.
 static mut FASTMEM_THRASH_WINDOW_START: u32 = 0;
@@ -2523,6 +2540,93 @@ fn gen_chain_or_exit_to_known_successor(
     ctx.builder.br(ctx.exit_label);
 }
 
+/// Emit the same lookup as `jit_find_cache_entry_in_page`, but directly into
+/// the generated module. Leaves the dispatcher state (or -1) on the wasm stack.
+///
+/// Layout recap:
+///   meta[virt >> 12] = state_flags:u32 | table_index:u16 | slab:u16
+///   slabs[(slab << 12) | (virt & 0xfff)] = dispatcher_state:u16
+///
+/// `virt >> 9` is `(virt >> 12) * sizeof(u64)`, and every slab entry is u16.
+/// Both derived addresses are naturally aligned. The arrays share the imported
+/// linear memory with every generated JIT module, so no helper or JS transition
+/// is required.
+fn gen_find_cache_entry_in_page_inline(
+    ctx: &mut JitContext,
+    wasm_table_index: WasmTableIndex,
+    state_flags: CachedStateFlags,
+) {
+    codegen::gen_profiler_stat_increment(ctx.builder, stat::INDIRECT_JUMP);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::ABSEIP_DISPATCH);
+
+    codegen::gen_get_eip(ctx.builder);
+    let virt_address = ctx.builder.set_new_local();
+
+    let meta_base = std::ptr::addr_of!(DISPATCH_META) as u32;
+    ctx.builder.const_i32(meta_base as i32);
+    ctx.builder.get_local(&virt_address);
+    ctx.builder.const_i32(9);
+    ctx.builder.shr_u_i32();
+    ctx.builder.add_i32();
+    ctx.builder.load_aligned_i64(0);
+    let meta = ctx.builder.set_new_local_i64();
+
+    // Comparing meta>>16 checks state_flags and table_index together while
+    // intentionally ignoring the low slab index. A zero/unpublished meta cannot
+    // match because wasm table slot zero is never assigned to generated code.
+    let expected = ((state_flags.to_u32() as u64) << 16)
+        | wasm_table_index.to_u16() as u64;
+    ctx.builder.get_local_i64(&meta);
+    ctx.builder.const_i64(16);
+    ctx.builder.shr_u_i64();
+    ctx.builder.const_i64(expected as i64);
+    ctx.builder.eq_i64();
+    ctx.builder.if_i32();
+
+    let slabs_base = std::ptr::addr_of!(DISPATCH_SLABS) as u32;
+    ctx.builder.const_i32(slabs_base as i32);
+    ctx.builder.get_local_i64(&meta);
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(13); // slab * 0x1000 entries * sizeof(u16)
+    ctx.builder.shl_i32();
+    ctx.builder.add_i32();
+    ctx.builder.get_local(&virt_address);
+    ctx.builder.const_i32(0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(1);
+    ctx.builder.shl_i32();
+    ctx.builder.add_i32();
+    ctx.builder.load_aligned_u16(0);
+    let unit_state = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&unit_state);
+    ctx.builder.const_i32(u16::MAX as i32);
+    ctx.builder.ne_i32();
+    ctx.builder.if_i32();
+    ctx.builder.get_local(&unit_state);
+    ctx.builder.else_();
+    codegen::gen_profiler_stat_increment(ctx.builder, stat::INDIRECT_JUMP_NO_ENTRY);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_INDIRECT);
+    ctx.builder.const_i32(-1);
+    ctx.builder.block_end();
+
+    ctx.builder.else_();
+    codegen::gen_profiler_stat_increment(ctx.builder, stat::INDIRECT_JUMP_NO_ENTRY);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_INDIRECT);
+    ctx.builder.const_i32(-1);
+    ctx.builder.block_end();
+
+    ctx.builder.free_local(unit_state);
+    ctx.builder.free_local_i64(meta);
+    ctx.builder.free_local(virt_address);
+    unsafe {
+        INLINE_INTRA_MODULE_DISPATCH_SITES_COMPILED =
+            INLINE_INTRA_MODULE_DISPATCH_SITES_COMPILED.saturating_add(1);
+    }
+}
+
 fn jit_generate_module(
     structure: Vec<WasmStructure>,
     basic_blocks: &HashMap<u32, BasicBlock>,
@@ -2783,10 +2887,19 @@ fn jit_generate_module(
                         }
 
                         // Check if we can stay in this module, if not exit
-                        codegen::gen_get_eip(ctx.builder);
-                        ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
-                        ctx.builder.const_i32(state_flags.to_u32() as i32);
-                        ctx.builder.call_fn3_ret("jit_find_cache_entry_in_page");
+                        if unsafe { JIT_INLINE_INTRA_MODULE_DISPATCH } {
+                            gen_find_cache_entry_in_page_inline(
+                                ctx,
+                                wasm_table_index,
+                                state_flags,
+                            );
+                        }
+                        else {
+                            codegen::gen_get_eip(ctx.builder);
+                            ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
+                            ctx.builder.const_i32(state_flags.to_u32() as i32);
+                            ctx.builder.call_fn3_ret("jit_find_cache_entry_in_page");
+                        }
                         ctx.builder.tee_local(target_block);
                         ctx.builder.const_i32(0);
                         ctx.builder.ge_i32();
@@ -4159,6 +4272,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         19 => JIT_FASTMEM_WRITES = value != 0,
         20 => TIER2_PAGE_SET_CAP = value.clamp(1, 4096),
         21 => JIT_FLAG_LOCALS = value != 0,
+        22 => JIT_INLINE_INTRA_MODULE_DISPATCH = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -4187,6 +4301,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         19 => JIT_FASTMEM_WRITES as u32,
         20 => TIER2_PAGE_SET_CAP,
         21 => JIT_FLAG_LOCALS as u32,
+        22 => JIT_INLINE_INTRA_MODULE_DISPATCH as u32,
         _ => 0,
     }
 }

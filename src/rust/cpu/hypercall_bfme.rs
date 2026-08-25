@@ -18,8 +18,63 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         144 => handle_transform_push(),
         145 => handle_transform_pop(),
         146 => handle_matrix_adjust(),
+        147 => handle_tree_successor(),
         _ => false,
     }
+}
+
+/// lotrbfme.exe 1.03 FR @ 0x00c2b870: in-order successor for the
+/// parent/left/right tree-node layout used by BFME's STL containers.
+unsafe fn handle_tree_successor() -> bool {
+    let esp = read_reg32(ESP);
+    let mut node = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let right = match safe_read32s(node.wrapping_add(0x0c)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if right != 0 {
+        node = right;
+        for _ in 0..65536u32 {
+            let left = match safe_read32s(node.wrapping_add(0x08)) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if left == 0 {
+                write_reg32(EAX, node);
+                return true;
+            }
+            node = left;
+        }
+        return false;
+    }
+
+    let mut parent = match safe_read32s(node.wrapping_add(0x04)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    for _ in 0..65536u32 {
+        let parent_right = match safe_read32s(parent.wrapping_add(0x0c)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if node != parent_right {
+            let node_right = match safe_read32s(node.wrapping_add(0x0c)) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            write_reg32(EAX, if node_right == parent { node } else { parent });
+            return true;
+        }
+        node = parent;
+        parent = match safe_read32s(parent.wrapping_add(0x04)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+    }
+    false
 }
 
 #[inline(always)]

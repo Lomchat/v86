@@ -267,7 +267,7 @@ static mut JIT_FLAG_LOCALS: bool = false;
 // deliberately a byte-for-byte semantic mirror of jit_find_cache_entry_in_page:
 // state flags and table slot must both match, and a u16::MAX state still means
 // miss. Compile-time gated so a live workload can A/B it after a JIT-cache clear.
-static mut JIT_INLINE_INTRA_MODULE_DISPATCH: bool = false;
+static mut JIT_INLINE_INTRA_MODULE_DISPATCH: bool = true;
 static mut INLINE_INTRA_MODULE_DISPATCH_SITES_COMPILED: u32 = 0;
 
 // Tier-2R region recompiler: grow page groups across

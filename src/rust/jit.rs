@@ -217,6 +217,9 @@ static mut TIER2_PROFILE_SAMPLES: [u32; WASM_TABLE_SIZE as usize] =
 static mut TIER2_PROFILED_EXITS: u32 = 0;
 static mut TIER2_REGION_PROMOTIONS: u32 = 0;
 static mut TIER2_REGION_SEEDS: u32 = 0;
+static mut TIER2_REGION_CANDIDATES: u32 = 0;
+static mut TIER2_REGION_REJECTED_TARGET: u32 = 0;
+static mut TIER2_REGION_REJECTED_BUDGET: u32 = 0;
 
 #[inline(always)]
 pub fn jit_tier2_note_sampled_exit(wasm_table_index: u16, target_eip: u32) {
@@ -254,6 +257,16 @@ pub fn jit_get_tier2_profiled_exits() -> u32 { unsafe { TIER2_PROFILED_EXITS } }
 pub fn jit_get_tier2_region_promotions() -> u32 { unsafe { TIER2_REGION_PROMOTIONS } }
 #[no_mangle]
 pub fn jit_get_tier2_region_seeds() -> u32 { unsafe { TIER2_REGION_SEEDS } }
+#[no_mangle]
+pub fn jit_get_tier2_region_candidates() -> u32 { unsafe { TIER2_REGION_CANDIDATES } }
+#[no_mangle]
+pub fn jit_get_tier2_region_rejected_target() -> u32 {
+    unsafe { TIER2_REGION_REJECTED_TARGET }
+}
+#[no_mangle]
+pub fn jit_get_tier2_region_rejected_budget() -> u32 {
+    unsafe { TIER2_REGION_REJECTED_BUDGET }
+}
 
 #[no_mangle]
 pub fn jit_reset_tier2_state() {
@@ -268,6 +281,9 @@ pub fn jit_reset_tier2_state() {
         TIER2_PROFILED_EXITS = 0;
         TIER2_REGION_PROMOTIONS = 0;
         TIER2_REGION_SEEDS = 0;
+        TIER2_REGION_CANDIDATES = 0;
+        TIER2_REGION_REJECTED_TARGET = 0;
+        TIER2_REGION_REJECTED_BUDGET = 0;
         TIER2_MAINTENANCE_NEXT =
             (*global_pointers::instruction_counter).wrapping_add(TIER2_MAINTENANCE_INTERVAL);
         TIER2_MAINTENANCE_DUE = false;
@@ -411,9 +427,18 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
     };
     let sample_exit = unsafe {
         JIT_TIER2_REGIONS
-            && TIER2_PAGE_COUNT < TIER2_PAGE_SET_CAP
-            && count >= threshold / 4 * 3
             && TIER2_PROFILE_SAMPLES[wasm_table_index as usize] < TIER2_PROFILE_SAMPLE_CAP
+            && if TIER2_PAGE_COUNT < TIER2_PAGE_SET_CAP {
+                count >= threshold / 4 * 3
+            }
+            else {
+                // Once the bounded set is full, ordinary entries still pay
+                // nothing. The already-sparse adaptive maintenance admission
+                // must nevertheless retain its successor EIP: otherwise a
+                // later gameplay phase can replace startup pages but can never
+                // form a fused region for its newly-hot cross-module path.
+                adaptive_sample
+            }
     };
     if count < threshold {
         return if sample_exit { 2 } else { 0 };
@@ -462,9 +487,16 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
             {
                 continue;
             }
+            unsafe { TIER2_REGION_CANDIDATES = TIER2_REGION_CANDIDATES.wrapping_add(1) };
             let phys = match cpu::translate_address_read_no_side_effects(target as i32) {
                 Ok(phys) => phys,
-                Err(()) => continue,
+                Err(()) => {
+                    unsafe {
+                        TIER2_REGION_REJECTED_TARGET =
+                            TIER2_REGION_REJECTED_TARGET.wrapping_add(1)
+                    };
+                    continue;
+                },
             };
             let target_page = Page::page_of(phys);
             let target_info = match ctx.pages.get(&target_page) {
@@ -475,7 +507,13 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
                             .entry_points
                             .iter()
                             .any(|&(offset, _)| offset == phys as u16 & 0xFFF) => info,
-                _ => continue,
+                _ => {
+                    unsafe {
+                        TIER2_REGION_REJECTED_TARGET =
+                            TIER2_REGION_REJECTED_TARGET.wrapping_add(1)
+                    };
+                    continue;
+                },
             };
             let target_index = target_info.wasm_table_index;
             let target_pages: Vec<Page> = ctx
@@ -489,6 +527,9 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
                 .filter(|page| !promoted_pages.contains(page))
                 .count();
             if promoted_pages.len() + added > unsafe { TIER2_MAX_PAGES as usize } {
+                unsafe {
+                    TIER2_REGION_REJECTED_BUDGET = TIER2_REGION_REJECTED_BUDGET.wrapping_add(1)
+                };
                 continue;
             }
             promoted_pages.extend(target_pages);
@@ -1421,6 +1462,9 @@ pub fn rust_init() {
         TIER2_PROFILED_EXITS = 0;
         TIER2_REGION_PROMOTIONS = 0;
         TIER2_REGION_SEEDS = 0;
+        TIER2_REGION_CANDIDATES = 0;
+        TIER2_REGION_REJECTED_TARGET = 0;
+        TIER2_REGION_REJECTED_BUDGET = 0;
         TIER2_EXIT_TARGETS = [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
         TIER2_EXIT_COUNTS = [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
         TIER2_PROFILE_SAMPLES = [0; WASM_TABLE_SIZE as usize];
@@ -1430,6 +1474,12 @@ pub fn rust_init() {
         TIER2_MAINTENANCE_TICK = 1;
         TIER2_MAINTENANCE_SAMPLES = 0;
         TIER2_PAGE_EVICTIONS = 0;
+        JIT_COMPILE_STARTED = 0;
+        JIT_COMPILE_COMPLETED = 0;
+        JIT_COMPILE_CAP_SKIPS = 0;
+        JIT_COMPILE_PENDING_HIGH_WATER = 0;
+        JIT_COMPILE_TOTAL_US = 0;
+        JIT_COMPILE_MAX_US = 0;
     }
 
     let _ = JIT_STATE
@@ -1464,6 +1514,14 @@ enum CompilingPageState {
     CompilingWritten,
 }
 
+static mut JIT_MAX_PENDING_COMPILES: u32 = 1;
+static mut JIT_COMPILE_STARTED: u32 = 0;
+static mut JIT_COMPILE_COMPLETED: u32 = 0;
+static mut JIT_COMPILE_CAP_SKIPS: u32 = 0;
+static mut JIT_COMPILE_PENDING_HIGH_WATER: u32 = 0;
+static mut JIT_COMPILE_TOTAL_US: u64 = 0;
+static mut JIT_COMPILE_MAX_US: u32 = 0;
+
 struct JitState {
     wasm_builder: WasmBuilder,
 
@@ -1474,7 +1532,10 @@ struct JitState {
     entry_points: HashMap<Page, (u32, HashSet<u16>)>,
     pages: HashMap<Page, PageInfo>,
     wasm_table_index_free_list: Vec<WasmTableIndex>,
-    compiling: Option<(WasmTableIndex, CompilingPageState)>,
+    // WebAssembly compilation is asynchronous. Keep a small bounded set in
+    // flight so one cold module does not force every other hot page to remain
+    // interpreted until its Promise settles.
+    compiling: HashMap<WasmTableIndex, CompilingPageState>,
     // B3 hotness tiering: pages promoted to tier-2 (jit_tier2_note_execution) — modules
     // whose entries land on these pages compile with the expanded tier-2 budgets.
     // Survives jit_clear_cache (the pages are still the hot ones); dies with the wasm
@@ -1494,26 +1555,24 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
         return;
     }
 
-    match &ctx.compiling {
-        Some((_, CompilingPageState::Compiling { pages })) => {
+    for state in ctx.compiling.values() {
+        if let CompilingPageState::Compiling { pages } = state {
             dbg_assert!(pages.keys().all(|page| ctx.entry_points.contains_key(page)));
-        },
-        _ => {},
+        }
     }
 
     let free: HashSet<WasmTableIndex> =
         HashSet::from_iter(ctx.wasm_table_index_free_list.iter().cloned());
     let used = HashSet::from_iter(ctx.pages.values().map(|info| info.wasm_table_index));
-    let compiling = HashSet::from_iter(ctx.compiling.as_ref().map(|&(index, _)| index));
+    let compiling = HashSet::from_iter(ctx.compiling.keys().copied());
     dbg_assert!(free.intersection(&used).next().is_none());
     dbg_assert!(used.intersection(&compiling).next().is_none());
     dbg_assert!(free.len() + used.len() + compiling.len() == (WASM_TABLE_SIZE - 1) as usize);
 
-    match &ctx.compiling {
-        Some((_, CompilingPageState::Compiling { pages })) => {
+    for state in ctx.compiling.values() {
+        if let CompilingPageState::Compiling { pages } = state {
             dbg_assert!(pages.keys().all(|page| ctx.entry_points.contains_key(page)));
-        },
-        _ => {},
+        }
     }
 
     for i in 0..unsafe { cpu::valid_tlb_entries_count } {
@@ -1553,7 +1612,7 @@ impl JitState {
             pages: HashMap::new(),
 
             wasm_table_index_free_list: Vec::from_iter(wasm_table_indices),
-            compiling: None,
+            compiling: HashMap::new(),
             tier2_pages: HashSet::new(),
             tier2_page_last_seen: HashMap::new(),
             tier2_regions: HashMap::new(),
@@ -2700,7 +2759,7 @@ pub fn jit_force_generate_unsafe(virt_addr: i32) {
         cpu::get_state_flags(),
         JIT_THRESHOLD,
     );
-    dbg_assert!(get_jit_state().compiling.is_some());
+    dbg_assert!(!get_jit_state().compiling.is_empty());
 }
 
 #[inline(never)]
@@ -2713,7 +2772,7 @@ fn jit_analyze_and_generate(
 ) {
     let page = Page::page_of(phys_entry_point);
 
-    dbg_assert!(ctx.compiling.is_none());
+    dbg_assert!(ctx.compiling.len() < unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize });
 
     let (_, entry_points) = match ctx.entry_points.get(&page) {
         None => return,
@@ -2952,11 +3011,16 @@ fn jit_analyze_and_generate(
 
     cpu::tlb_set_has_code_multiple(&pages, true);
 
-    dbg_assert!(ctx.compiling.is_none());
-    ctx.compiling = Some((
+    dbg_assert!(!ctx.compiling.contains_key(&wasm_table_index));
+    ctx.compiling.insert(
         wasm_table_index,
         CompilingPageState::Compiling { pages: page_info },
-    ));
+    );
+    unsafe {
+        JIT_COMPILE_STARTED = JIT_COMPILE_STARTED.wrapping_add(1);
+        JIT_COMPILE_PENDING_HIGH_WATER =
+            JIT_COMPILE_PENDING_HIGH_WATER.max(ctx.compiling.len() as u32);
+    }
 
     let phys_addr = page.to_address();
 
@@ -2977,6 +3041,7 @@ pub fn codegen_finalize_finished(
     wasm_table_index: WasmTableIndex,
     phys_addr: u32,
     state_flags: CachedStateFlags,
+    compile_us: u32,
 ) {
     let mut ctx = get_jit_state();
 
@@ -2987,21 +3052,23 @@ pub fn codegen_finalize_finished(
         Page::page_of(phys_addr).to_address()
     );
 
-    let pages = match mem::replace(&mut ctx.compiling, None) {
+    unsafe {
+        JIT_COMPILE_COMPLETED = JIT_COMPILE_COMPLETED.wrapping_add(1);
+        JIT_COMPILE_TOTAL_US = JIT_COMPILE_TOTAL_US.wrapping_add(compile_us as u64);
+        JIT_COMPILE_MAX_US = JIT_COMPILE_MAX_US.max(compile_us);
+    }
+    let pages = match ctx.compiling.remove(&wasm_table_index) {
         None => {
             dbg_assert!(false);
             return;
         },
-        Some((in_progress_wasm_table_index, CompilingPageState::CompilingWritten)) => {
-            dbg_assert!(wasm_table_index == in_progress_wasm_table_index);
-
+        Some(CompilingPageState::CompilingWritten) => {
             profiler::stat_increment(stat::INVALIDATE_MODULE_WRITTEN_WHILE_COMPILED);
             free_wasm_table_index(&mut ctx, wasm_table_index);
             check_jit_state_invariants(&mut ctx);
             return;
         },
-        Some((in_progress_wasm_table_index, CompilingPageState::Compiling { pages })) => {
-            dbg_assert!(wasm_table_index == in_progress_wasm_table_index);
+        Some(CompilingPageState::Compiling { pages }) => {
             dbg_assert!(!pages.is_empty());
             pages
         },
@@ -4528,8 +4595,13 @@ pub fn jit_increase_hotness_and_maybe_compile(
     }
 
     let mut ctx = get_jit_state();
-    let is_compiling = ctx.compiling.is_some();
     let page = Page::page_of(phys_address);
+    let page_is_compiling = ctx.compiling.values().any(|state| match state {
+        CompilingPageState::Compiling { pages } => pages.contains_key(&page),
+        CompilingPageState::CompilingWritten => false,
+    });
+    let compile_cap_reached =
+        ctx.compiling.len() >= unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize };
     let (hotness, entry_points) = ctx.entry_points.entry(page).or_insert_with(|| {
         cpu::tlb_set_has_code(page, true);
         profiler::stat_increment(stat::RUN_INTERPRETED_NEW_PAGE);
@@ -4542,7 +4614,12 @@ pub fn jit_increase_hotness_and_maybe_compile(
 
     *hotness += heat;
     if *hotness >= JIT_THRESHOLD {
-        if is_compiling {
+        if page_is_compiling || compile_cap_reached {
+            if compile_cap_reached {
+                unsafe {
+                    JIT_COMPILE_CAP_SKIPS = JIT_COMPILE_CAP_SKIPS.wrapping_add(1);
+                }
+            }
             return;
         }
         // only try generating if we're in the correct address space
@@ -4560,15 +4637,10 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
     if CHECK_JIT_STATE_INVARIANTS {
         dbg_assert!(!ctx.wasm_table_index_free_list.contains(&wasm_table_index));
 
-        match &ctx.compiling {
-            Some((wasm_table_index_compiling, _)) => {
-                dbg_assert!(
-                    *wasm_table_index_compiling != wasm_table_index,
-                    "Attempt to free wasm table index that is currently being compiled"
-                );
-            },
-            _ => {},
-        }
+        dbg_assert!(
+            !ctx.compiling.contains_key(&wasm_table_index),
+            "Attempt to free wasm table index that is currently being compiled"
+        );
 
         dbg_assert!(!ctx
             .pages
@@ -4740,22 +4812,22 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
             profiler::stat_increment(stat::INVALIDATE_PAGE_HAD_ENTRY_POINTS);
             did_have_code = true;
 
-            match &ctx.compiling {
-                Some((index, CompilingPageState::Compiling { pages })) => {
-                    if pages.contains_key(&page) {
-                        ctx.compiling = Some((*index, CompilingPageState::CompilingWritten));
-                    }
-                },
-                _ => {},
+            for state in ctx.compiling.values_mut() {
+                let touches_page = match state {
+                    CompilingPageState::Compiling { pages } => pages.contains_key(&page),
+                    CompilingPageState::CompilingWritten => false,
+                };
+                if touches_page {
+                    *state = CompilingPageState::CompilingWritten;
+                }
             }
         },
     }
 
-    match &ctx.compiling {
-        Some((_, CompilingPageState::Compiling { pages })) => {
+    for state in ctx.compiling.values() {
+        if let CompilingPageState::Compiling { pages } = state {
             dbg_assert!(!pages.contains_key(&page));
-        },
-        _ => {},
+        }
     }
 
     check_jit_state_invariants(ctx);
@@ -5002,6 +5074,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         22 => JIT_INLINE_INTRA_MODULE_DISPATCH = value != 0,
         23 => JIT_TIER2_REGIONS = value != 0,
         24 => JIT_TIER2_ADAPTIVE = value != 0,
+        25 => JIT_MAX_PENDING_COMPILES = value.clamp(1, 8),
         _ => dbg_assert!(false),
     }
 }
@@ -5034,7 +5107,43 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         22 => JIT_INLINE_INTRA_MODULE_DISPATCH as u32,
         23 => JIT_TIER2_REGIONS as u32,
         24 => JIT_TIER2_ADAPTIVE as u32,
+        25 => JIT_MAX_PENDING_COMPILES,
         _ => 0,
+    }
+}
+
+#[no_mangle]
+pub fn jit_get_compile_started() -> u32 { unsafe { JIT_COMPILE_STARTED } }
+
+#[no_mangle]
+pub fn jit_get_compile_completed() -> u32 { unsafe { JIT_COMPILE_COMPLETED } }
+
+#[no_mangle]
+pub fn jit_get_compile_cap_skips() -> u32 { unsafe { JIT_COMPILE_CAP_SKIPS } }
+
+#[no_mangle]
+pub fn jit_get_compile_pending() -> u32 { get_jit_state().compiling.len() as u32 }
+
+#[no_mangle]
+pub fn jit_get_compile_pending_high_water() -> u32 {
+    unsafe { JIT_COMPILE_PENDING_HIGH_WATER }
+}
+
+#[no_mangle]
+pub fn jit_get_compile_total_us() -> f64 { unsafe { JIT_COMPILE_TOTAL_US as f64 } }
+
+#[no_mangle]
+pub fn jit_get_compile_max_us() -> u32 { unsafe { JIT_COMPILE_MAX_US } }
+
+#[no_mangle]
+pub fn jit_reset_compile_stats() {
+    unsafe {
+        JIT_COMPILE_STARTED = 0;
+        JIT_COMPILE_COMPLETED = 0;
+        JIT_COMPILE_CAP_SKIPS = 0;
+        JIT_COMPILE_PENDING_HIGH_WATER = get_jit_state().compiling.len() as u32;
+        JIT_COMPILE_TOTAL_US = 0;
+        JIT_COMPILE_MAX_US = 0;
     }
 }
 

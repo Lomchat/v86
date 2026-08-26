@@ -1868,15 +1868,25 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
     }
 
     const SYNC_COMPILATION = false;
+    const compile_started = performance.now();
+    // The Rust WasmBuilder owns one reusable output buffer. WebAssembly.compile
+    // snapshots BufferSource bytes during the call, but keep an explicit copy
+    // whenever more than one compile may be pending so that this guarantee is
+    // local and testable rather than browser-engine dependent.
+    const compile_code = this.get_jit_config(25) > 1 ? code.slice() : code;
+    const compile_elapsed_us = () => Math.min(
+        0xFFFFFFFF,
+        Math.max(0, Math.round((performance.now() - compile_started) * 1000))
+    );
 
     if(SYNC_COMPILATION)
     {
-        const module = new WebAssembly.Module(code);
+        const module = new WebAssembly.Module(compile_code);
         const result = new WebAssembly.Instance(module, { "e": this.jit_imports });
         const f = result.exports["f"];
 
         this.wm.wasm_table.set(wasm_table_index + WASM_TABLE_OFFSET, f);
-        this.codegen_finalize_finished(wasm_table_index, start, state_flags);
+        this.codegen_finalize_finished(wasm_table_index, start, state_flags, compile_elapsed_us());
 
         if(this.test_hook_did_finalize_wasm)
         {
@@ -1886,11 +1896,11 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         return;
     }
 
-    const result = WebAssembly.instantiate(code, { "e": this.jit_imports }).then(result => {
+    const result = WebAssembly.instantiate(compile_code, { "e": this.jit_imports }).then(result => {
         const f = result.instance.exports["f"];
 
         this.wm.wasm_table.set(wasm_table_index + WASM_TABLE_OFFSET, f);
-        this.codegen_finalize_finished(wasm_table_index, start, state_flags);
+        this.codegen_finalize_finished(wasm_table_index, start, state_flags, compile_elapsed_us());
 
         if(this.test_hook_did_finalize_wasm)
         {

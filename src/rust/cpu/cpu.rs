@@ -3500,6 +3500,7 @@ unsafe fn run_guest_until_inner(
 pub unsafe fn do_many_cycles_native() {
     profiler::stat_increment(stat::DO_MANY_CYCLES);
     let initial_instruction_counter = *instruction_counter;
+    jit::jit_tier2_maintenance_poll();
     jit_cycle_start_instruction_counter = initial_instruction_counter;
     let limit = hypercall::read_cycle_limit();
     jit_cycle_limit_cached = limit;

@@ -175,6 +175,21 @@ const TIER2_SAMPLE_WEIGHT: u32 = 1 << TIER2_SAMPLE_SHIFT;
 // diagnostics raise TIER2_PAGE_SET_CAP later, tracking resumes automatically.
 static mut TIER2_PAGE_COUNT: u32 = 0;
 
+// Once the retained-page set is full, do not freeze it forever. Startup and
+// loading code can otherwise occupy every slot before a game's steady-state
+// simulation begins. The normal per-entry gate stays closed, but every roughly
+// four million guest instructions it admits one module as a sparse maintenance
+// sample. That is enough to discover a phase change without restoring the
+// measurable always-on note_execution cost of the old saturated path.
+static mut JIT_TIER2_ADAPTIVE: bool = true;
+const TIER2_MAINTENANCE_INTERVAL: u32 = 4_000_003;
+const TIER2_MAINTENANCE_WEIGHT: u32 = 16384;
+static mut TIER2_MAINTENANCE_NEXT: u32 = TIER2_MAINTENANCE_INTERVAL;
+static mut TIER2_MAINTENANCE_DUE: bool = false;
+static mut TIER2_MAINTENANCE_TICK: u32 = 1;
+static mut TIER2_MAINTENANCE_SAMPLES: u32 = 0;
+static mut TIER2_PAGE_EVICTIONS: u32 = 0;
+
 // Tier-2 observability (read via dbg.tier2Stats()): without these there is no way to
 // tell "promotions landed" apart from "promotions starved by the page-set cap" — the
 // exact ambiguity that made the in-race B3 A/B unreadable (threshold changes showed
@@ -244,6 +259,7 @@ pub fn jit_get_tier2_region_seeds() -> u32 { unsafe { TIER2_REGION_SEEDS } }
 pub fn jit_reset_tier2_state() {
     let mut ctx = get_jit_state();
     ctx.tier2_pages.clear();
+    ctx.tier2_page_last_seen.clear();
     ctx.tier2_regions.clear();
     unsafe {
         TIER2_PAGE_COUNT = 0;
@@ -252,6 +268,12 @@ pub fn jit_reset_tier2_state() {
         TIER2_PROFILED_EXITS = 0;
         TIER2_REGION_PROMOTIONS = 0;
         TIER2_REGION_SEEDS = 0;
+        TIER2_MAINTENANCE_NEXT =
+            (*global_pointers::instruction_counter).wrapping_add(TIER2_MAINTENANCE_INTERVAL);
+        TIER2_MAINTENANCE_DUE = false;
+        TIER2_MAINTENANCE_TICK = 1;
+        TIER2_MAINTENANCE_SAMPLES = 0;
+        TIER2_PAGE_EVICTIONS = 0;
         MODULE_EXEC_COUNTS = [0; 0x10000];
         TIER2_EXIT_TARGETS = [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
         TIER2_EXIT_COUNTS = [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
@@ -271,10 +293,46 @@ pub fn jit_get_tier2_promotions() -> u32 {
 pub fn jit_get_tier2_blocked_by_cap() -> u32 {
     unsafe { TIER2_BLOCKED_BY_CAP }
 }
+#[no_mangle]
+pub fn jit_get_tier2_maintenance_samples() -> u32 {
+    unsafe { TIER2_MAINTENANCE_SAMPLES }
+}
+#[no_mangle]
+pub fn jit_get_tier2_page_evictions() -> u32 {
+    unsafe { TIER2_PAGE_EVICTIONS }
+}
 
 #[inline(always)]
 pub fn jit_tier2_tracking_active() -> bool {
-    unsafe { JIT_TIER2_THRESHOLD != 0 && TIER2_PAGE_COUNT < TIER2_PAGE_SET_CAP }
+    unsafe {
+        if JIT_TIER2_THRESHOLD == 0 {
+            return false;
+        }
+        if TIER2_PAGE_COUNT < TIER2_PAGE_SET_CAP {
+            return true;
+        }
+        JIT_TIER2_ADAPTIVE && TIER2_MAINTENANCE_DUE
+    }
+}
+
+/// Called once per outer execution slice, not once per JIT module entry. This
+/// keeps the saturated steady-state gate as cheap as the historical boolean
+/// check while still arming sparse hot-set maintenance after a phase change.
+#[inline(always)]
+pub fn jit_tier2_maintenance_poll() {
+    unsafe {
+        if JIT_TIER2_THRESHOLD == 0
+            || !JIT_TIER2_ADAPTIVE
+            || TIER2_PAGE_COUNT < TIER2_PAGE_SET_CAP
+            || TIER2_MAINTENANCE_DUE
+        {
+            return;
+        }
+        let now = *global_pointers::instruction_counter;
+        if now.wrapping_sub(TIER2_MAINTENANCE_NEXT) < 0x8000_0000 {
+            TIER2_MAINTENANCE_DUE = true;
+        }
+    }
 }
 /// i-th tier-2 page address (page<<12), 0 when i >= count. Iteration order is the
 /// HashSet's (arbitrary but stable between mutations) — callers use this to feed
@@ -300,7 +358,22 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
     if threshold == 0 {
         return 0;
     }
-    let weight = if threshold >= TIER2_SAMPLE_WEIGHT {
+    let adaptive_sample = unsafe {
+        JIT_TIER2_ADAPTIVE
+            && TIER2_PAGE_COUNT >= TIER2_PAGE_SET_CAP
+            && TIER2_MAINTENANCE_DUE
+    };
+    let weight = if adaptive_sample {
+        unsafe {
+            let now = *global_pointers::instruction_counter;
+            TIER2_MAINTENANCE_NEXT = now.wrapping_add(TIER2_MAINTENANCE_INTERVAL);
+            TIER2_MAINTENANCE_DUE = false;
+            TIER2_MAINTENANCE_TICK = TIER2_MAINTENANCE_TICK.wrapping_add(1).max(1);
+            TIER2_MAINTENANCE_SAMPLES = TIER2_MAINTENANCE_SAMPLES.wrapping_add(1);
+        }
+        TIER2_MAINTENANCE_WEIGHT
+    }
+    else if threshold >= TIER2_SAMPLE_WEIGHT {
         let sample = unsafe {
             (*global_pointers::instruction_counter as u32)
                 .wrapping_mul(0x9E37_79B9)
@@ -314,6 +387,23 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
     else {
         1
     };
+    if adaptive_sample {
+        let tick = unsafe { TIER2_MAINTENANCE_TICK };
+        let mut ctx = get_jit_state();
+        let index = WasmTableIndex(wasm_table_index);
+        let live_pages: Vec<Page> = ctx
+            .pages
+            .iter()
+            .filter(|(_, info)| info.wasm_table_index == index)
+            .map(|(page, _)| *page)
+            .collect();
+        for page in live_pages {
+            if ctx.tier2_pages.contains(&page) {
+                ctx.tier2_page_last_seen.insert(page, tick);
+            }
+        }
+    }
+
     let count = unsafe {
         let c = &mut (*std::ptr::addr_of_mut!(MODULE_EXEC_COUNTS))[wasm_table_index as usize];
         *c = c.saturating_add(weight);
@@ -410,12 +500,50 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
         .iter()
         .filter(|page| !ctx.tier2_pages.contains(page))
         .count();
-    if ctx.tier2_pages.len() + newly_promoted > unsafe { TIER2_PAGE_SET_CAP as usize } {
+    let cap = unsafe { TIER2_PAGE_SET_CAP as usize };
+    if promoted_pages.len() > cap {
         unsafe { TIER2_BLOCKED_BY_CAP += 1 };
         return 0;
     }
+    let required = ctx.tier2_pages.len() + newly_promoted;
+    if required > cap {
+        if !unsafe { JIT_TIER2_ADAPTIVE } {
+            unsafe { TIER2_BLOCKED_BY_CAP += 1 };
+            return 0;
+        }
+        let need = required - cap;
+        let now = unsafe { TIER2_MAINTENANCE_TICK };
+        let mut candidates: Vec<(Page, u32)> = ctx
+            .tier2_pages
+            .iter()
+            .filter(|page| !promoted_pages.contains(page))
+            .map(|page| {
+                let seen = ctx.tier2_page_last_seen.get(page).copied().unwrap_or(0);
+                (*page, now.wrapping_sub(seen))
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        let evicted: HashSet<Page> = candidates
+            .into_iter()
+            .take(need)
+            .map(|(page, _)| page)
+            .collect();
+        if evicted.len() != need {
+            unsafe { TIER2_BLOCKED_BY_CAP += 1 };
+            return 0;
+        }
+        for page in &evicted {
+            ctx.tier2_pages.remove(page);
+            ctx.tier2_page_last_seen.remove(page);
+        }
+        ctx.tier2_regions
+            .retain(|_, region| region.pages.is_disjoint(&evicted));
+        unsafe { TIER2_PAGE_EVICTIONS = TIER2_PAGE_EVICTIONS.wrapping_add(need as u32) };
+    }
+    let tick = unsafe { TIER2_MAINTENANCE_TICK };
     for p in &promoted_pages {
         ctx.tier2_pages.insert(*p);
+        ctx.tier2_page_last_seen.insert(*p, tick);
     }
     if unsafe { JIT_TIER2_REGIONS } && !region_seeds.is_empty() {
         let region = Tier2Region {
@@ -1297,6 +1425,11 @@ pub fn rust_init() {
         TIER2_EXIT_COUNTS = [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
         TIER2_PROFILE_SAMPLES = [0; WASM_TABLE_SIZE as usize];
         MODULE_EXEC_COUNTS = [0; 0x10000];
+        TIER2_MAINTENANCE_NEXT = TIER2_MAINTENANCE_INTERVAL;
+        TIER2_MAINTENANCE_DUE = false;
+        TIER2_MAINTENANCE_TICK = 1;
+        TIER2_MAINTENANCE_SAMPLES = 0;
+        TIER2_PAGE_EVICTIONS = 0;
     }
 
     let _ = JIT_STATE
@@ -1347,6 +1480,10 @@ struct JitState {
     // Survives jit_clear_cache (the pages are still the hot ones); dies with the wasm
     // instance (per game load).
     tier2_pages: HashSet<Page>,
+    // Sparse recency metadata used only after the bounded Tier-2 set fills.
+    // Existing compiled modules remain valid when a page loses its marking;
+    // the mark controls the budget of its next compilation, not code lifetime.
+    tier2_page_last_seen: HashMap<Page, u32>,
     // Profile-selected unions of already-hot Tier-1 modules. Keyed by every
     // source page so whichever source entry triggers recompilation sees the plan.
     tier2_regions: HashMap<Page, Tier2Region>,
@@ -1418,6 +1555,7 @@ impl JitState {
             wasm_table_index_free_list: Vec::from_iter(wasm_table_indices),
             compiling: None,
             tier2_pages: HashSet::new(),
+            tier2_page_last_seen: HashMap::new(),
             tier2_regions: HashMap::new(),
         }
     }
@@ -4863,6 +5001,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         21 => JIT_FLAG_LOCALS = value != 0,
         22 => JIT_INLINE_INTRA_MODULE_DISPATCH = value != 0,
         23 => JIT_TIER2_REGIONS = value != 0,
+        24 => JIT_TIER2_ADAPTIVE = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -4894,6 +5033,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         21 => JIT_FLAG_LOCALS as u32,
         22 => JIT_INLINE_INTRA_MODULE_DISPATCH as u32,
         23 => JIT_TIER2_REGIONS as u32,
+        24 => JIT_TIER2_ADAPTIVE as u32,
         _ => 0,
     }
 }

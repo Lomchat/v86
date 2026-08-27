@@ -84,6 +84,14 @@ static mut BLOCK_CHAIN_SITES_COMPILED: u32 = 0;
 // exiting to main_loop. Gated at COMPILE time — toggle via
 // set_jit_config(12) and clear the JIT cache.
 static mut JIT_RET_CHAINING: bool = false;
+// Per-AbsoluteEip monomorphic cache in front of the dynamic RET chaining helper
+// (idx 30). Unlike RET_CACHE, which is keyed only by runtime EIP and can collide
+// across thousands of call sites, this remembers the last successful target of
+// each generated site. A hit stays entirely in the generated module; misses use
+// the exact historical helper and refresh the site. Epoch and scheduler-budget
+// guards preserve invalidation/preemption semantics.
+static mut JIT_DYNAMIC_CHAIN_SITE_PIC: bool = true;
+static mut DYNAMIC_CHAIN_SITE_PIC_COMPILED: u32 = 0;
 // RET-target speculation (superblock lite): annotate the RET of a
 // small module-local leaf with its call sites' return addresses and emit inline
 // eip-compare + direct dispatcher re-entry, skipping the jit_find_cache_entry_in_page
@@ -137,6 +145,24 @@ static mut RET_CACHE: [(u32, u32, i32, u64); RET_CACHE_SIZE] = [(0, 0, -1, 0); R
 // Starts at 1 so zero-initialized entries can never match before their first fill.
 static mut RET_CACHE_EPOCH: u64 = 1;
 static mut CHAIN_TARGET_EPOCH: u32 = 1;
+
+// One compact monomorphic inline-cache entry per generated AbsoluteEip site.
+// Slots are monotonic for the complete wasm lifetime. In particular, do not
+// reuse them after jit_clear_cache: a parallel compilation invalidated by that
+// clear may still finish asynchronously, and reusing its slot would let two
+// generated modules alias one memo. Exhaustion is safe and simply falls back to
+// the historical resolver. Three SoA arrays keep generated loads at fixed,
+// naturally aligned addresses and avoid relying on Rust tuple layout in codegen.
+const DYNAMIC_CHAIN_SITE_PIC_COUNT: usize = 1 << 18;
+static mut DYNAMIC_CHAIN_SITE_TARGETS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_PACKED: [i32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_EPOCHS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_PIC_NEXT: usize = 0;
+static mut DYNAMIC_CHAIN_SITE_PIC_HIGH_WATER: u32 = 0;
+static mut DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS: u32 = 0;
 
 pub fn ret_cache_invalidate_all() {
     unsafe {
@@ -2167,6 +2193,62 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     -1
 }
 
+/// Cold/miss path for one generated dynamic-chain site. The normal resolver is
+/// still the sole authority; a successful result is merely copied into the
+/// site's generated-code cache with the current invalidation epoch.
+#[no_mangle]
+pub unsafe fn jit_find_cache_entry_for_dynamic_chaining_site(
+    state_flags: u32,
+    memo_slot: u32,
+) -> i32 {
+    let packed = jit_find_cache_entry_for_dynamic_chaining(state_flags);
+    let slot = memo_slot as usize;
+    if packed >= 0 && slot < DYNAMIC_CHAIN_SITE_PIC_COUNT {
+        DYNAMIC_CHAIN_SITE_TARGETS[slot] = *global_pointers::instruction_pointer as u32;
+        DYNAMIC_CHAIN_SITE_PACKED[slot] = packed;
+        DYNAMIC_CHAIN_SITE_EPOCHS[slot] = RET_CACHE_EPOCH as u32;
+    }
+    packed
+}
+
+fn allocate_dynamic_chain_site_pic() -> Option<(u32, u32, u32, u32)> {
+    unsafe {
+        if DYNAMIC_CHAIN_SITE_PIC_NEXT >= DYNAMIC_CHAIN_SITE_PIC_COUNT {
+            DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS =
+                DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS.saturating_add(1);
+            return None;
+        }
+        let slot = DYNAMIC_CHAIN_SITE_PIC_NEXT;
+        DYNAMIC_CHAIN_SITE_PIC_NEXT += 1;
+        DYNAMIC_CHAIN_SITE_TARGETS[slot] = 0;
+        DYNAMIC_CHAIN_SITE_PACKED[slot] = 0;
+        DYNAMIC_CHAIN_SITE_EPOCHS[slot] = 0;
+        DYNAMIC_CHAIN_SITE_PIC_HIGH_WATER =
+            DYNAMIC_CHAIN_SITE_PIC_HIGH_WATER.max(DYNAMIC_CHAIN_SITE_PIC_NEXT as u32);
+        Some((
+            slot as u32,
+            std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_TARGETS) as u32 + slot as u32 * 4,
+            std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_PACKED) as u32 + slot as u32 * 4,
+            std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_EPOCHS) as u32 + slot as u32 * 4,
+        ))
+    }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_compiled() -> u32 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_COMPILED }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_high_water() -> u32 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_HIGH_WATER }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_overflows() -> u32 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS }
+}
+
 fn jit_find_basic_blocks(
     ctx: &mut JitState,
     entry_points: HashSet<i32>,
@@ -3473,6 +3555,73 @@ fn gen_find_cache_entry_in_page_inline(
     }
 }
 
+/// Return a packed cross-module target for the current AbsoluteEip. A stable
+/// per-site target avoids the generated-module -> base-wasm resolver call while
+/// a miss retains the complete legacy lookup and refreshes the cache. This runs
+/// after guest registers/instruction count have already been flushed.
+fn gen_dynamic_chain_site_pic_lookup(
+    ctx: &mut JitContext,
+    state_flags: CachedStateFlags,
+) {
+    let Some((slot, target_address, packed_address, epoch_address)) =
+        allocate_dynamic_chain_site_pic()
+    else {
+        ctx.builder.const_i32(state_flags.to_u32() as i32);
+        ctx.builder.call_fn1_ret("jit_find_cache_entry_for_dynamic_chaining");
+        return;
+    };
+
+    codegen::gen_get_eip(ctx.builder);
+    let virt_address = ctx.builder.set_new_local();
+
+    // A memo is usable only while its dispatch epoch is current and its last
+    // target equals this site's runtime target.
+    ctx.builder.load_fixed_i32(epoch_address);
+    ctx.builder.load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.eq_i32();
+    ctx.builder.load_fixed_i32(target_address);
+    ctx.builder.get_local(&virt_address);
+    ctx.builder.eq_i32();
+    ctx.builder.and_i32();
+
+    // The historical helper checks this before every chain. Keep the same
+    // scheduler boundary on the generated hit path; a failed guard enters the
+    // helper, which returns -1 without refreshing the memo.
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_limit_cached) as u32);
+    let cycle_limit = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(0);
+    ctx.builder.ne_i32();
+    ctx.builder.and_i32();
+    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder.load_fixed_i32(
+        std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32,
+    );
+    ctx.builder.sub_i32();
+    ctx.builder.get_local(&cycle_limit);
+    ctx.builder.ltu_i32();
+    ctx.builder.and_i32();
+    ctx.builder.load_fixed_u8(global_pointers::in_hlt as u32);
+    ctx.builder.eqz_i32();
+    ctx.builder.and_i32();
+
+    ctx.builder.if_i32();
+    ctx.builder.load_fixed_i32(packed_address);
+    ctx.builder.else_();
+    ctx.builder.const_i32(state_flags.to_u32() as i32);
+    ctx.builder.const_i32(slot as i32);
+    ctx.builder
+        .call_fn2_ret("jit_find_cache_entry_for_dynamic_chaining_site");
+    ctx.builder.block_end();
+
+    ctx.builder.free_local(cycle_limit);
+    ctx.builder.free_local(virt_address);
+    unsafe {
+        DYNAMIC_CHAIN_SITE_PIC_COMPILED =
+            DYNAMIC_CHAIN_SITE_PIC_COMPILED.saturating_add(1);
+    }
+}
+
 fn jit_generate_module(
     structure: Vec<WasmStructure>,
     basic_blocks: &HashMap<u32, BasicBlock>,
@@ -3846,10 +3995,15 @@ fn jit_generate_module(
                             ctx.builder.const_i32(0);
                             ctx.builder.set_local(&ctx.instruction_counter);
 
-                            ctx.builder.const_i32(state_flags.to_u32() as i32);
-                            ctx.builder.call_fn1_ret(
-                                "jit_find_cache_entry_for_dynamic_chaining",
-                            );
+                            if unsafe { JIT_DYNAMIC_CHAIN_SITE_PIC } {
+                                gen_dynamic_chain_site_pic_lookup(ctx, state_flags);
+                            }
+                            else {
+                                ctx.builder.const_i32(state_flags.to_u32() as i32);
+                                ctx.builder.call_fn1_ret(
+                                    "jit_find_cache_entry_for_dynamic_chaining",
+                                );
+                            }
                             let packed_target = ctx.builder.tee_new_local();
 
                             ctx.builder.get_local(&packed_target);
@@ -5064,8 +5218,9 @@ fn jit_clear_cache(ctx: &mut JitState) {
         jit_dirty_page_ctx(ctx, page);
     }
 
-    // Every generated module has now been freed, so site-memo addresses may be
-    // reused. Allocation zeroes each reused slot before publishing new code.
+    // Existing exact-chain memos retain their historical clear-time reuse.
+    // Dynamic site-PIC slots deliberately remain monotonic: async compilation
+    // can still finish after this clear (see its declaration above).
     unsafe { CHAIN_SITE_MEMO_NEXT = 0 };
 }
 
@@ -5232,6 +5387,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         27 => JIT_TIER2_LEAF_CALL_FUSION = value != 0,
         28 => JIT_TIER2_LEAF_RETURN_LOCAL = value != 0,
         29 => LEAF_CALL_FUSION_MAX_INSTR = value.clamp(1, 64),
+        30 => JIT_DYNAMIC_CHAIN_SITE_PIC = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -5269,6 +5425,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         27 => JIT_TIER2_LEAF_CALL_FUSION as u32,
         28 => JIT_TIER2_LEAF_RETURN_LOCAL as u32,
         29 => LEAF_CALL_FUSION_MAX_INSTR,
+        30 => JIT_DYNAMIC_CHAIN_SITE_PIC as u32,
         _ => 0,
     }
 }

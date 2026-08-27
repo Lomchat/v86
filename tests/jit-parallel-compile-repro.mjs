@@ -59,18 +59,21 @@ function buildImage()
     return buf;
 }
 
-function run(maxPending)
+function run(maxPending, clearDuringRun = false)
 {
     return new Promise(resolve => {
         const emulator = new V86({ autostart: false, memory_size: MEM_SIZE, disable_jit: 0, log_level: 0 });
-        let timer, done = false, startedAt = 0, haltedAt = 0;
+        let timer, clearTimer, clearCount = 0, done = false, startedAt = 0, haltedAt = 0;
         const finish = status => {
             if(done) return;
             done = true;
             clearTimeout(timer);
+            clearInterval(clearTimer);
             const cpu = emulator.v86.cpu, w = cpu.wm.exports;
             const result = {
                 maxPending,
+                clearDuringRun,
+                clearCount,
                 status,
                 elapsedMs: +((haltedAt || performance.now()) - startedAt).toFixed(2),
                 eax: cpu.reg32[0] >>> 0,
@@ -103,12 +106,23 @@ function run(maxPending)
             timer = setTimeout(() => finish("HANG"), TIMEOUT_MS);
             startedAt = performance.now();
             emulator.run();
+            if(clearDuringRun)
+            {
+                clearTimer = setInterval(() => {
+                    cpu.jit_clear_cache?.();
+                    clearCount++;
+                    if(clearCount >= 50) clearInterval(clearTimer);
+                }, 1);
+            }
         });
     });
 }
 
 const results = [];
 for(const maxPending of [1, 2, 4, 1, 2, 4, 1, 2, 4]) results.push(await run(maxPending));
+// Regression guard for per-generated-site memo ownership: clearing while async
+// compiles are completing must never let a new module reuse an old memo slot.
+results.push(await run(4, true));
 console.log("jit-parallel-compile " + JSON.stringify(results));
 
 const expectedEax = (ITERATIONS - 1) * PAGE_COUNT;
@@ -128,5 +142,11 @@ for(const result of results)
 if(!results.filter(x => x.maxPending === 4).some(x => x.highWater > 1))
 {
     console.error("FAIL: parallel mode never had more than one compilation in flight");
+    process.exit(1);
+}
+const clearRun = results.find(x => x.clearDuringRun);
+if(!clearRun || clearRun.clearCount === 0)
+{
+    console.error("FAIL: cache-clear race scenario did not execute", clearRun);
     process.exit(1);
 }

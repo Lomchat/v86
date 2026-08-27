@@ -48,7 +48,7 @@ function image()
     return bytes;
 }
 
-function run(pic)
+function run(pic, secondWay = false)
 {
     return new Promise(resolve => {
         const emulator = new V86({
@@ -67,6 +67,7 @@ function run(pic)
             resolve({
                 status,
                 pic: cpu.get_jit_config?.(30) >>> 0,
+                secondWay: cpu.get_jit_config?.(32) >>> 0,
                 elapsedMs: Math.round(elapsedMs * 100) / 100,
                 eax: cpu.reg32[0] >>> 0,
                 ecx: cpu.reg32[1] >>> 0,
@@ -84,6 +85,7 @@ function run(pic)
             cpu.set_jit_config(1, 1);   // one page/module
             cpu.set_jit_config(12, 1);  // dynamic RET chaining
             cpu.set_jit_config(30, pic ? 1 : 0);
+            cpu.set_jit_config(32, secondWay ? 1 : 0);
             cpu.jit_clear_cache?.();
             cpu.load_multiboot(image().buffer);
             started = performance.now();
@@ -121,3 +123,21 @@ console.log("jit-dynamic-site-pic-summary " + JSON.stringify({
 
 if(!samples.some(x => x.pic && x.compiledSites > 0 && x.highWater > 0 && x.overflows === 0))
     throw new Error("site PIC enabled but no memoized site was generated");
+
+// A second way must not significantly penalize a genuinely monomorphic site.
+const wayOrder = [false, true, true, false, false, true];
+const waySamples = [];
+for(const secondWay of wayOrder)
+{
+    const result = await run(true, secondWay);
+    check(result);
+    waySamples.push(result);
+}
+const oneWayMs = median(waySamples.filter(x => !x.secondWay).map(x => x.elapsedMs));
+const twoWayMs = median(waySamples.filter(x => x.secondWay).map(x => x.elapsedMs));
+console.log("jit-dynamic-site-pic-monomorphic-way-samples " + JSON.stringify(waySamples));
+console.log("jit-dynamic-site-pic-monomorphic-way-summary " + JSON.stringify({
+    oneWayMs,
+    twoWayMs,
+    overheadPercent: Math.round((twoWayMs / oneWayMs - 1) * 10000) / 100,
+}));

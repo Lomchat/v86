@@ -84,14 +84,34 @@ static mut BLOCK_CHAIN_SITES_COMPILED: u32 = 0;
 // exiting to main_loop. Gated at COMPILE time — toggle via
 // set_jit_config(12) and clear the JIT cache.
 static mut JIT_RET_CHAINING: bool = false;
-// Per-AbsoluteEip monomorphic cache in front of the dynamic RET chaining helper
+// Per-AbsoluteEip primary cache in front of the dynamic RET chaining helper
 // (idx 30). Unlike RET_CACHE, which is keyed only by runtime EIP and can collide
-// across thousands of call sites, this remembers the last successful target of
-// each generated site. A hit stays entirely in the generated module; misses use
-// the exact historical helper and refresh the site. Epoch and scheduler-budget
-// guards preserve invalidation/preemption semantics.
+// across thousands of call sites, this remembers successful targets per
+// generated site. A primary hit stays entirely in the generated module; misses
+// may probe three bounded positive alternatives before using the exact
+// historical helper. Epoch and scheduler-budget guards preserve
+// invalidation/preemption semantics.
 static mut JIT_DYNAMIC_CHAIN_SITE_PIC: bool = true;
 static mut DYNAMIC_CHAIN_SITE_PIC_COMPILED: u32 = 0;
+// Diagnostic-only miss classifier for the per-site PIC (idx 31). All work is
+// confined to the existing cold helper: generated-cache hits remain completely
+// untouched. The shadow second way predicts how many target misses a two-way
+// cache would have absorbed without changing dispatch behaviour.
+static mut JIT_DYNAMIC_CHAIN_SITE_PIC_DIAG: bool = false;
+// Optional second target per site (idx 32). It is consulted only after the
+// generated primary path misses, so stable sites retain identical code.
+static mut JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY: bool = true;
+// Third and fourth targets are nested behind misses of the first two ways
+// (idx 33). Like way two, they never add work to a primary generated hit.
+static mut JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY: bool = true;
+static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS: u64 = 0;
+static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES: u64 = 0;
+static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS: u64 = 0;
+static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_THIRD_WAY_HITS: u64 = 0;
+static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_FOURTH_WAY_HITS: u64 = 0;
+static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_EPOCH_MISSES: u64 = 0;
+static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_GUARD_MISSES: u64 = 0;
+static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_RESOLVER_HITS: u64 = 0;
 // RET-target speculation (superblock lite): annotate the RET of a
 // small module-local leaf with its call sites' return addresses and emit inline
 // eip-compare + direct dispatcher re-entry, skipping the jit_find_cache_entry_in_page
@@ -146,7 +166,8 @@ static mut RET_CACHE: [(u32, u32, i32, u64); RET_CACHE_SIZE] = [(0, 0, -1, 0); R
 static mut RET_CACHE_EPOCH: u64 = 1;
 static mut CHAIN_TARGET_EPOCH: u32 = 1;
 
-// One compact monomorphic inline-cache entry per generated AbsoluteEip site.
+// One compact primary inline-cache entry per generated AbsoluteEip site, plus
+// three bounded positive alternatives consulted only from nested miss arms.
 // Slots are monotonic for the complete wasm lifetime. In particular, do not
 // reuse them after jit_clear_cache: a parallel compilation invalidated by that
 // clear may still finish asynchronously, and reusing its slot would let two
@@ -159,6 +180,24 @@ static mut DYNAMIC_CHAIN_SITE_TARGETS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
 static mut DYNAMIC_CHAIN_SITE_PACKED: [i32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
     [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
 static mut DYNAMIC_CHAIN_SITE_EPOCHS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_DIAG_SECOND_TARGETS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_DIAG_SECOND_PACKED: [i32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_DIAG_SECOND_EPOCHS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_DIAG_THIRD_TARGETS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_DIAG_THIRD_PACKED: [i32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_DIAG_THIRD_EPOCHS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_DIAG_FOURTH_TARGETS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_DIAG_FOURTH_PACKED: [i32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
+    [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
+static mut DYNAMIC_CHAIN_SITE_DIAG_FOURTH_EPOCHS: [u32; DYNAMIC_CHAIN_SITE_PIC_COUNT] =
     [0; DYNAMIC_CHAIN_SITE_PIC_COUNT];
 static mut DYNAMIC_CHAIN_SITE_PIC_NEXT: usize = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_HIGH_WATER: u32 = 0;
@@ -2201,17 +2240,206 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining_site(
     state_flags: u32,
     memo_slot: u32,
 ) -> i32 {
-    let packed = jit_find_cache_entry_for_dynamic_chaining(state_flags);
     let slot = memo_slot as usize;
+    let diag = JIT_DYNAMIC_CHAIN_SITE_PIC_DIAG && slot < DYNAMIC_CHAIN_SITE_PIC_COUNT;
+    let track_second = (diag
+        || JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY
+        || JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY)
+        && slot < DYNAMIC_CHAIN_SITE_PIC_COUNT;
+    let virt_address = *global_pointers::instruction_pointer as u32;
+    let epoch = RET_CACHE_EPOCH as u32;
+    let mut previous_target = 0;
+    let mut previous_epoch = 0;
+    if track_second {
+        previous_target = DYNAMIC_CHAIN_SITE_TARGETS[slot];
+        previous_epoch = DYNAMIC_CHAIN_SITE_EPOCHS[slot];
+    }
+    if diag {
+        DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS = DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS.saturating_add(1);
+        if previous_epoch != epoch {
+            DYNAMIC_CHAIN_SITE_PIC_DIAG_EPOCH_MISSES =
+                DYNAMIC_CHAIN_SITE_PIC_DIAG_EPOCH_MISSES.saturating_add(1);
+        }
+        else if previous_target != virt_address {
+            DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES =
+                DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES.saturating_add(1);
+            if DYNAMIC_CHAIN_SITE_DIAG_SECOND_EPOCHS[slot] == epoch
+                && DYNAMIC_CHAIN_SITE_DIAG_SECOND_TARGETS[slot] == virt_address
+            {
+                DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS =
+                    DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS.saturating_add(1);
+            }
+            else if DYNAMIC_CHAIN_SITE_DIAG_THIRD_EPOCHS[slot] == epoch
+                && DYNAMIC_CHAIN_SITE_DIAG_THIRD_TARGETS[slot] == virt_address
+            {
+                DYNAMIC_CHAIN_SITE_PIC_DIAG_THIRD_WAY_HITS =
+                    DYNAMIC_CHAIN_SITE_PIC_DIAG_THIRD_WAY_HITS.saturating_add(1);
+            }
+            else if DYNAMIC_CHAIN_SITE_DIAG_FOURTH_EPOCHS[slot] == epoch
+                && DYNAMIC_CHAIN_SITE_DIAG_FOURTH_TARGETS[slot] == virt_address
+            {
+                DYNAMIC_CHAIN_SITE_PIC_DIAG_FOURTH_WAY_HITS =
+                    DYNAMIC_CHAIN_SITE_PIC_DIAG_FOURTH_WAY_HITS.saturating_add(1);
+            }
+        }
+        else {
+            // The target and epoch matched, so generated code reached the helper
+            // only because the scheduler budget or HLT guard rejected chaining.
+            DYNAMIC_CHAIN_SITE_PIC_DIAG_GUARD_MISSES =
+                DYNAMIC_CHAIN_SITE_PIC_DIAG_GUARD_MISSES.saturating_add(1);
+        }
+    }
+
+    // Keep the generated primary hit path byte-for-byte unchanged. Only
+    // after that path has already missed do we consult the optional second
+    // target here. Recheck the scheduler boundary because a matching primary
+    // can also enter this helper when its budget guard rejects chaining.
+    if JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY
+        && slot < DYNAMIC_CHAIN_SITE_PIC_COUNT
+        && previous_epoch == epoch
+        && previous_target != virt_address
+        && DYNAMIC_CHAIN_SITE_DIAG_SECOND_EPOCHS[slot] == epoch
+        && DYNAMIC_CHAIN_SITE_DIAG_SECOND_TARGETS[slot] == virt_address
+    {
+        let limit = hypercall::read_cycle_limit();
+        let elapsed = (*global_pointers::instruction_counter)
+            .wrapping_sub(cpu::jit_cycle_start_instruction_counter);
+        if limit != 0 && elapsed < limit && !*global_pointers::in_hlt {
+            if dispatch_stats_enabled() {
+                profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+            }
+            return DYNAMIC_CHAIN_SITE_DIAG_SECOND_PACKED[slot];
+        }
+    }
+    if JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY
+        && slot < DYNAMIC_CHAIN_SITE_PIC_COUNT
+        && previous_epoch == epoch
+        && previous_target != virt_address
+    {
+        let packed = if DYNAMIC_CHAIN_SITE_DIAG_THIRD_EPOCHS[slot] == epoch
+            && DYNAMIC_CHAIN_SITE_DIAG_THIRD_TARGETS[slot] == virt_address
+        {
+            DYNAMIC_CHAIN_SITE_DIAG_THIRD_PACKED[slot]
+        }
+        else if DYNAMIC_CHAIN_SITE_DIAG_FOURTH_EPOCHS[slot] == epoch
+            && DYNAMIC_CHAIN_SITE_DIAG_FOURTH_TARGETS[slot] == virt_address
+        {
+            DYNAMIC_CHAIN_SITE_DIAG_FOURTH_PACKED[slot]
+        }
+        else {
+            -1
+        };
+        if packed >= 0 {
+            let limit = hypercall::read_cycle_limit();
+            let elapsed = (*global_pointers::instruction_counter)
+                .wrapping_sub(cpu::jit_cycle_start_instruction_counter);
+            if limit != 0 && elapsed < limit && !*global_pointers::in_hlt {
+                if dispatch_stats_enabled() {
+                    profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+                }
+                return packed;
+            }
+        }
+    }
+
+    let packed = jit_find_cache_entry_for_dynamic_chaining(state_flags);
     if packed >= 0 && slot < DYNAMIC_CHAIN_SITE_PIC_COUNT {
-        DYNAMIC_CHAIN_SITE_TARGETS[slot] = *global_pointers::instruction_pointer as u32;
+        if diag {
+            DYNAMIC_CHAIN_SITE_PIC_DIAG_RESOLVER_HITS =
+                DYNAMIC_CHAIN_SITE_PIC_DIAG_RESOLVER_HITS.saturating_add(1);
+        }
+        if track_second && previous_epoch == epoch && previous_target != virt_address {
+            DYNAMIC_CHAIN_SITE_DIAG_FOURTH_TARGETS[slot] =
+                DYNAMIC_CHAIN_SITE_DIAG_THIRD_TARGETS[slot];
+            DYNAMIC_CHAIN_SITE_DIAG_FOURTH_PACKED[slot] =
+                DYNAMIC_CHAIN_SITE_DIAG_THIRD_PACKED[slot];
+            DYNAMIC_CHAIN_SITE_DIAG_FOURTH_EPOCHS[slot] =
+                DYNAMIC_CHAIN_SITE_DIAG_THIRD_EPOCHS[slot];
+            DYNAMIC_CHAIN_SITE_DIAG_THIRD_TARGETS[slot] =
+                DYNAMIC_CHAIN_SITE_DIAG_SECOND_TARGETS[slot];
+            DYNAMIC_CHAIN_SITE_DIAG_THIRD_PACKED[slot] =
+                DYNAMIC_CHAIN_SITE_DIAG_SECOND_PACKED[slot];
+            DYNAMIC_CHAIN_SITE_DIAG_THIRD_EPOCHS[slot] =
+                DYNAMIC_CHAIN_SITE_DIAG_SECOND_EPOCHS[slot];
+            DYNAMIC_CHAIN_SITE_DIAG_SECOND_TARGETS[slot] = previous_target;
+            DYNAMIC_CHAIN_SITE_DIAG_SECOND_PACKED[slot] = DYNAMIC_CHAIN_SITE_PACKED[slot];
+            DYNAMIC_CHAIN_SITE_DIAG_SECOND_EPOCHS[slot] = epoch;
+        }
+        DYNAMIC_CHAIN_SITE_TARGETS[slot] = virt_address;
         DYNAMIC_CHAIN_SITE_PACKED[slot] = packed;
-        DYNAMIC_CHAIN_SITE_EPOCHS[slot] = RET_CACHE_EPOCH as u32;
+        DYNAMIC_CHAIN_SITE_EPOCHS[slot] = epoch;
     }
     packed
 }
 
-fn allocate_dynamic_chain_site_pic() -> Option<(u32, u32, u32, u32)> {
+#[no_mangle]
+pub unsafe fn jit_dynamic_chain_site_pic_diag_reset() {
+    DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS = 0;
+    DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES = 0;
+    DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS = 0;
+    DYNAMIC_CHAIN_SITE_PIC_DIAG_THIRD_WAY_HITS = 0;
+    DYNAMIC_CHAIN_SITE_PIC_DIAG_FOURTH_WAY_HITS = 0;
+    DYNAMIC_CHAIN_SITE_PIC_DIAG_EPOCH_MISSES = 0;
+    DYNAMIC_CHAIN_SITE_PIC_DIAG_GUARD_MISSES = 0;
+    DYNAMIC_CHAIN_SITE_PIC_DIAG_RESOLVER_HITS = 0;
+    std::ptr::write_bytes(
+        std::ptr::addr_of_mut!(DYNAMIC_CHAIN_SITE_DIAG_SECOND_EPOCHS) as *mut u32,
+        0,
+        DYNAMIC_CHAIN_SITE_PIC_COUNT,
+    );
+    std::ptr::write_bytes(
+        std::ptr::addr_of_mut!(DYNAMIC_CHAIN_SITE_DIAG_THIRD_EPOCHS) as *mut u32,
+        0,
+        DYNAMIC_CHAIN_SITE_PIC_COUNT,
+    );
+    std::ptr::write_bytes(
+        std::ptr::addr_of_mut!(DYNAMIC_CHAIN_SITE_DIAG_FOURTH_EPOCHS) as *mut u32,
+        0,
+        DYNAMIC_CHAIN_SITE_PIC_COUNT,
+    );
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_diag_calls() -> u64 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_diag_target_misses() -> u64 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_diag_second_way_hits() -> u64 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_diag_third_way_hits() -> u64 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_DIAG_THIRD_WAY_HITS }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_diag_fourth_way_hits() -> u64 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_DIAG_FOURTH_WAY_HITS }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_diag_epoch_misses() -> u64 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_DIAG_EPOCH_MISSES }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_diag_guard_misses() -> u64 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_DIAG_GUARD_MISSES }
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_site_pic_diag_resolver_hits() -> u64 {
+    unsafe { DYNAMIC_CHAIN_SITE_PIC_DIAG_RESOLVER_HITS }
+}
+
+fn allocate_dynamic_chain_site_pic() -> Option<u32> {
     unsafe {
         if DYNAMIC_CHAIN_SITE_PIC_NEXT >= DYNAMIC_CHAIN_SITE_PIC_COUNT {
             DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS =
@@ -2223,14 +2451,18 @@ fn allocate_dynamic_chain_site_pic() -> Option<(u32, u32, u32, u32)> {
         DYNAMIC_CHAIN_SITE_TARGETS[slot] = 0;
         DYNAMIC_CHAIN_SITE_PACKED[slot] = 0;
         DYNAMIC_CHAIN_SITE_EPOCHS[slot] = 0;
+        DYNAMIC_CHAIN_SITE_DIAG_SECOND_TARGETS[slot] = 0;
+        DYNAMIC_CHAIN_SITE_DIAG_SECOND_PACKED[slot] = 0;
+        DYNAMIC_CHAIN_SITE_DIAG_SECOND_EPOCHS[slot] = 0;
+        DYNAMIC_CHAIN_SITE_DIAG_THIRD_TARGETS[slot] = 0;
+        DYNAMIC_CHAIN_SITE_DIAG_THIRD_PACKED[slot] = 0;
+        DYNAMIC_CHAIN_SITE_DIAG_THIRD_EPOCHS[slot] = 0;
+        DYNAMIC_CHAIN_SITE_DIAG_FOURTH_TARGETS[slot] = 0;
+        DYNAMIC_CHAIN_SITE_DIAG_FOURTH_PACKED[slot] = 0;
+        DYNAMIC_CHAIN_SITE_DIAG_FOURTH_EPOCHS[slot] = 0;
         DYNAMIC_CHAIN_SITE_PIC_HIGH_WATER =
             DYNAMIC_CHAIN_SITE_PIC_HIGH_WATER.max(DYNAMIC_CHAIN_SITE_PIC_NEXT as u32);
-        Some((
-            slot as u32,
-            std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_TARGETS) as u32 + slot as u32 * 4,
-            std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_PACKED) as u32 + slot as u32 * 4,
-            std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_EPOCHS) as u32 + slot as u32 * 4,
-        ))
+        Some(slot as u32)
     }
 }
 
@@ -3563,13 +3795,34 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx: &mut JitContext,
     state_flags: CachedStateFlags,
 ) {
-    let Some((slot, target_address, packed_address, epoch_address)) =
-        allocate_dynamic_chain_site_pic()
+    let Some(slot) = allocate_dynamic_chain_site_pic()
     else {
         ctx.builder.const_i32(state_flags.to_u32() as i32);
         ctx.builder.call_fn1_ret("jit_find_cache_entry_for_dynamic_chaining");
         return;
     };
+    let slot_offset = slot * 4;
+    let target_address = std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_TARGETS) as u32 + slot_offset;
+    let packed_address = std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_PACKED) as u32 + slot_offset;
+    let epoch_address = std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_EPOCHS) as u32 + slot_offset;
+    let second_target_address =
+        std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_DIAG_SECOND_TARGETS) as u32 + slot_offset;
+    let second_packed_address =
+        std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_DIAG_SECOND_PACKED) as u32 + slot_offset;
+    let second_epoch_address =
+        std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_DIAG_SECOND_EPOCHS) as u32 + slot_offset;
+    let third_target_address =
+        std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_DIAG_THIRD_TARGETS) as u32 + slot_offset;
+    let third_packed_address =
+        std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_DIAG_THIRD_PACKED) as u32 + slot_offset;
+    let third_epoch_address =
+        std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_DIAG_THIRD_EPOCHS) as u32 + slot_offset;
+    let fourth_target_address =
+        std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_DIAG_FOURTH_TARGETS) as u32 + slot_offset;
+    let fourth_packed_address =
+        std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_DIAG_FOURTH_PACKED) as u32 + slot_offset;
+    let fourth_epoch_address =
+        std::ptr::addr_of!(DYNAMIC_CHAIN_SITE_DIAG_FOURTH_EPOCHS) as u32 + slot_offset;
 
     codegen::gen_get_eip(ctx.builder);
     let virt_address = ctx.builder.set_new_local();
@@ -3608,12 +3861,93 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx.builder.if_i32();
     ctx.builder.load_fixed_i32(packed_address);
     ctx.builder.else_();
+
+    // Compute the scheduler guard once for every polymorphic way. This whole
+    // arm is skipped by the unchanged primary hit path above.
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_limit_cached) as u32);
+    let miss_cycle_limit = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(0);
+    ctx.builder.ne_i32();
+    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder.load_fixed_i32(
+        std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32,
+    );
+    ctx.builder.sub_i32();
+    ctx.builder.get_local(&miss_cycle_limit);
+    ctx.builder.ltu_i32();
+    ctx.builder.and_i32();
+    ctx.builder.load_fixed_u8(global_pointers::in_hlt as u32);
+    ctx.builder.eqz_i32();
+    ctx.builder.and_i32();
+    let miss_scheduler_ok = ctx.builder.set_new_local();
+
+    // The primary-hit instruction stream above is identical whether this
+    // option is enabled or not. Only its already-cold miss arm consults the
+    // second target, so monomorphic sites pay no extra branch or memory load.
+    ctx.builder.load_fixed_u8(
+        std::ptr::addr_of!(JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY) as u32,
+    );
+    ctx.builder.load_fixed_i32(second_epoch_address);
+    ctx.builder.load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.eq_i32();
+    ctx.builder.and_i32();
+    ctx.builder.load_fixed_i32(second_target_address);
+    ctx.builder.get_local(&virt_address);
+    ctx.builder.eq_i32();
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&miss_scheduler_ok);
+    ctx.builder.and_i32();
+    ctx.builder.if_i32();
+    ctx.builder.load_fixed_i32(second_packed_address);
+    ctx.builder.else_();
+
+    ctx.builder.load_fixed_u8(
+        std::ptr::addr_of!(JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY) as u32,
+    );
+    ctx.builder.load_fixed_i32(third_epoch_address);
+    ctx.builder.load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.eq_i32();
+    ctx.builder.and_i32();
+    ctx.builder.load_fixed_i32(third_target_address);
+    ctx.builder.get_local(&virt_address);
+    ctx.builder.eq_i32();
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&miss_scheduler_ok);
+    ctx.builder.and_i32();
+    ctx.builder.if_i32();
+    ctx.builder.load_fixed_i32(third_packed_address);
+    ctx.builder.else_();
+
+    ctx.builder.load_fixed_u8(
+        std::ptr::addr_of!(JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY) as u32,
+    );
+    ctx.builder.load_fixed_i32(fourth_epoch_address);
+    ctx.builder.load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.eq_i32();
+    ctx.builder.and_i32();
+    ctx.builder.load_fixed_i32(fourth_target_address);
+    ctx.builder.get_local(&virt_address);
+    ctx.builder.eq_i32();
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&miss_scheduler_ok);
+    ctx.builder.and_i32();
+    ctx.builder.if_i32();
+    ctx.builder.load_fixed_i32(fourth_packed_address);
+    ctx.builder.else_();
     ctx.builder.const_i32(state_flags.to_u32() as i32);
     ctx.builder.const_i32(slot as i32);
     ctx.builder
         .call_fn2_ret("jit_find_cache_entry_for_dynamic_chaining_site");
     ctx.builder.block_end();
+    ctx.builder.block_end();
+    ctx.builder.block_end();
+    ctx.builder.block_end();
 
+    ctx.builder.free_local(miss_scheduler_ok);
+    ctx.builder.free_local(miss_cycle_limit);
     ctx.builder.free_local(cycle_limit);
     ctx.builder.free_local(virt_address);
     unsafe {
@@ -5388,6 +5722,9 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         28 => JIT_TIER2_LEAF_RETURN_LOCAL = value != 0,
         29 => LEAF_CALL_FUSION_MAX_INSTR = value.clamp(1, 64),
         30 => JIT_DYNAMIC_CHAIN_SITE_PIC = value != 0,
+        31 => JIT_DYNAMIC_CHAIN_SITE_PIC_DIAG = value != 0,
+        32 => JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY = value != 0,
+        33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -5426,6 +5763,9 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         28 => JIT_TIER2_LEAF_RETURN_LOCAL as u32,
         29 => LEAF_CALL_FUSION_MAX_INSTR,
         30 => JIT_DYNAMIC_CHAIN_SITE_PIC as u32,
+        31 => JIT_DYNAMIC_CHAIN_SITE_PIC_DIAG as u32,
+        32 => JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY as u32,
+        33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY as u32,
         _ => 0,
     }
 }

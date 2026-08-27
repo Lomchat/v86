@@ -24,8 +24,120 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         150 => handle_pixel_alpha_blend(),
         151 => handle_msvcr71_sscanf_scalar(),
         152 => handle_msvcr71_stricmp(),
+        153 => handle_memory_stream_read1(),
+        154 => handle_bc1_color_block(),
         _ => false,
     }
+}
+
+
+#[inline(always)]
+fn bc1_interpolate(left: f32, right: f32, scale: f32) -> f32 {
+    (((right as f64 - left as f64) * scale as f64) + left as f64) as f32
+}
+
+#[inline(always)]
+fn bc1_endpoint(value: u32) -> [f32; 4] {
+    let scale5 = f32::from_bits(0x3d04_2108); // lotrbfme.exe 0x01149e2c
+    let scale6 = f32::from_bits(0x3c82_0821); // lotrbfme.exe 0x01149e24
+    [
+        (((value >> 11) & 0x1f) as f64 * scale5 as f64) as f32,
+        (((value >> 5) & 0x3f) as f64 * scale6 as f64) as f32,
+        ((value & 0x1f) as f64 * scale5 as f64) as f32,
+        1.0,
+    ]
+}
+
+/// lotrbfme.exe 1.03 FR @ 0x00e679a5. Inputs are captured before the first
+/// output write, preserving the original's alias behaviour and fault surface.
+unsafe fn handle_bc1_color_block() -> bool {
+    let esp = read_reg32(ESP);
+    let output = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let input = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    if !decode_bc1_color_block(output, input) { return false; }
+    write_reg32(EAX, 0);
+    true
+}
+
+unsafe fn decode_bc1_color_block(output: i32, input: i32) -> bool {
+    let color0 = match read_u16(input) { Some(v) => v, None => return false };
+    let color1 = match read_u16(input.wrapping_add(2)) { Some(v) => v, None => return false };
+    let selectors = match safe_read32s(input.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return false };
+    if safe_read32s(output).is_err() || safe_read32s(output.wrapping_add(252)).is_err() { return false; }
+
+    let mut palette = [[0.0f32; 4]; 4];
+    palette[0] = bc1_endpoint(color0);
+    palette[1] = bc1_endpoint(color1);
+    if color0 <= color1 {
+        let scale = f32::from_bits(0x3f00_0000);
+        for lane in 0..4 { palette[2][lane] = bc1_interpolate(palette[0][lane], palette[1][lane], scale); }
+    } else {
+        let third = f32::from_bits(0x3eaa_aaab);
+        let two_thirds = f32::from_bits(0x3f2a_aaab);
+        for lane in 0..4 {
+            palette[2][lane] = bc1_interpolate(palette[0][lane], palette[1][lane], third);
+            palette[3][lane] = bc1_interpolate(palette[0][lane], palette[1][lane], two_thirds);
+        }
+    }
+    for pixel in 0..16i32 {
+        let color = palette[((selectors >> (pixel * 2)) & 3) as usize];
+        let destination = output.wrapping_add(pixel * 16);
+        for lane in 0..4i32 {
+            if safe_write32(destination.wrapping_add(lane * 4), color[lane as usize].to_bits() as i32).is_err() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// lotrbfme.exe 1.03 FR @ 0x00dd1a70. The byte-exact entry filter admits
+/// only the parser's overwhelmingly common one-byte request. Invalid state
+/// declines to the relocated original before any guest mutation.
+unsafe fn handle_memory_stream_read1() -> bool {
+    let esp = read_reg32(ESP);
+    let object = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let destination = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let requested = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(1) => 1,
+        _ => return false,
+    };
+    let base = match safe_read32s(object.wrapping_add(0x14)) {
+        Ok(0) => {
+            write_reg32(EAX, -1);
+            return true;
+        }
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let position = match safe_read32s(object.wrapping_add(0x18)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let end = match safe_read32s(object.wrapping_add(0x1c)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let available = end.wrapping_sub(position);
+    let count = if requested <= available { requested } else { available };
+    if count > 0 && destination != 0 {
+        let byte = match hc_safe_read8(base.wrapping_add(position)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if safe_write8(destination, byte).is_err() { return false; }
+    }
+    if safe_write32(object.wrapping_add(0x18), position.wrapping_add(count)).is_err() {
+        return false;
+    }
+    write_reg32(EAX, count);
+    true
 }
 
 

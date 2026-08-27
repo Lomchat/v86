@@ -1,7 +1,7 @@
 //! BFME-specific inner-loop HLE handlers. These live in the engine-handler
 //! band (128..=255) and are armed only by byte-exact, title-specific hooks.
 
-use crate::cpu::cpu::{read_reg32, safe_read32s, safe_write32, safe_write8, write_reg32, EAX, ECX, ESP};
+use crate::cpu::cpu::{read_reg32, safe_read32s, safe_write32, safe_write8, write_reg32, EAX, EBP, EBX, ECX, EDX, ESI, ESP};
 use crate::cpu::hypercall::hc_safe_read8;
 
 pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
@@ -19,8 +19,371 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         145 => handle_transform_pop(),
         146 => handle_matrix_adjust(),
         147 => handle_tree_successor(),
+        148 => handle_vertex_blend(),
+        149 => handle_jpeg_idct_islow(),
+        150 => handle_pixel_alpha_blend(),
+        151 => handle_msvcr71_sscanf_scalar(),
+        152 => handle_msvcr71_stricmp(),
         _ => false,
     }
+}
+
+
+
+#[inline(always)]
+fn scanf_space(byte: i32) -> bool {
+    byte == 0x20 || (byte >= 0x09 && byte <= 0x0d)
+}
+
+/// MSVCR71.dll 7.10.3052.4 `sscanf`: the entry filter admits only the exact
+/// one-output formats `%d`, `%u` and `%f`. Complex/variadic formats never enter
+/// this handler and remain authoritative in the original CRT.
+unsafe fn handle_msvcr71_sscanf_scalar() -> bool {
+    let esp = read_reg32(ESP);
+    let mut at = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let fmt = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    let output = match safe_read32s(esp.wrapping_add(12)) { Ok(v) if v != 0 => v, _ => return false };
+    if hc_safe_read8(fmt).ok() != Some(b'%' as i32) || hc_safe_read8(fmt.wrapping_add(2)).ok() != Some(0) {
+        return false;
+    }
+    let kind = match hc_safe_read8(fmt.wrapping_add(1)) { Ok(v) => v, Err(_) => return false };
+    if kind != b'd' as i32 && kind != b'u' as i32 && kind != b'f' as i32 { return false; }
+    if hc_safe_read8(output).is_err() { return false; }
+
+    while scanf_space(match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false }) {
+        at = at.wrapping_add(1);
+    }
+    let first = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
+    if first == 0 { write_reg32(EAX, -1); return true; }
+    let mut negative = false;
+    if first == b'+' as i32 || first == b'-' as i32 {
+        negative = first == b'-' as i32;
+        at = at.wrapping_add(1);
+    }
+
+    let parsed_bits = if kind == b'd' as i32 || kind == b'u' as i32 {
+            let mut value: u64 = 0;
+            let mut digits = 0u32;
+            loop {
+                let byte = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
+                if byte < b'0' as i32 || byte > b'9' as i32 { break; }
+                value = value * 10 + (byte - b'0' as i32) as u64;
+                digits += 1;
+                at = at.wrapping_add(1);
+                if value > 0xffff_ffff { return false; }
+            }
+            if digits == 0 {
+                write_reg32(EAX, 0);
+                return true;
+            }
+            if kind == b'd' as i32 {
+                let limit = if negative { 0x8000_0000u64 } else { 0x7fff_ffffu64 };
+                if value > limit { return false; }
+            }
+            let mut bits = value as u32;
+            if negative { bits = bits.wrapping_neg(); }
+            bits
+    } else {
+            // Let the original CRT decide legacy spellings such as 1.#INF/NAN.
+            let lead = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
+            if lead == b'i' as i32 || lead == b'I' as i32 || lead == b'n' as i32 || lead == b'N' as i32 {
+                return false;
+            }
+            let mut value = 0.0f64;
+            let mut digits = 0u32;
+            loop {
+                let byte = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
+                if byte < b'0' as i32 || byte > b'9' as i32 { break; }
+                value = value * 10.0 + (byte - b'0' as i32) as f64;
+                digits += 1;
+                at = at.wrapping_add(1);
+                if digits > 128 { return false; }
+            }
+            if hc_safe_read8(at).ok() == Some(b'.' as i32) {
+                at = at.wrapping_add(1);
+                let mut scale = 0.1f64;
+                loop {
+                    let byte = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
+                    if byte < b'0' as i32 || byte > b'9' as i32 { break; }
+                    value += (byte - b'0' as i32) as f64 * scale;
+                    scale *= 0.1;
+                    digits += 1;
+                    at = at.wrapping_add(1);
+                    if digits > 128 { return false; }
+                }
+            }
+            if digits == 0 {
+                write_reg32(EAX, 0);
+                return true;
+            }
+            let marker = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
+            if marker == b'e' as i32 || marker == b'E' as i32 {
+                at = at.wrapping_add(1);
+                let mut exp_negative = false;
+                let exp_sign = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
+                if exp_sign == b'+' as i32 || exp_sign == b'-' as i32 {
+                    exp_negative = exp_sign == b'-' as i32;
+                    at = at.wrapping_add(1);
+                }
+                let mut exponent = 0u32;
+                let mut exp_digits = 0u32;
+                loop {
+                    let byte = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
+                    if byte < b'0' as i32 || byte > b'9' as i32 { break; }
+                    exponent = exponent.saturating_mul(10).saturating_add((byte - b'0' as i32) as u32);
+                    exp_digits += 1;
+                    at = at.wrapping_add(1);
+                    if exponent > 64 { return false; }
+                }
+                if exp_digits == 0 { return false; }
+                for _ in 0..exponent {
+                    value = if exp_negative { value * 0.1 } else { value * 10.0 };
+                }
+            }
+            if negative { value = -value; }
+            (value as f32).to_bits()
+    };
+
+    if safe_write32(output, parsed_bits as i32).is_err() { return false; }
+    write_reg32(EAX, 1);
+    true
+}
+
+/// MSVCR71.dll 7.10.3052.4 @ RVA 0x32ec: ASCII-only `_stricmp`.
+unsafe fn handle_msvcr71_stricmp() -> bool {
+    let esp = read_reg32(ESP);
+    let mut left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let mut right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    for _ in 0..16_384 {
+        let a = match hc_safe_read8(left) { Ok(v) => v, Err(_) => return false };
+        let b = match hc_safe_read8(right) { Ok(v) => v, Err(_) => return false };
+        if a == b {
+            if a == 0 { write_reg32(EAX, 0); return true; }
+        }
+        else {
+            let folded_a = if a >= 0x41 && a <= 0x5a { a + 0x20 } else { a };
+            let folded_b = if b >= 0x41 && b <= 0x5a { b + 0x20 } else { b };
+            if folded_a != folded_b {
+                write_reg32(EAX, if folded_a < folded_b { -1 } else { 1 });
+                return true;
+            }
+        }
+        left = left.wrapping_add(1);
+        right = right.wrapping_add(1);
+    }
+    false
+}
+
+/// lotrbfme.exe 1.03 FR @ 0x00b47940: blend three color bytes per BGRA pixel
+/// using an 8-bit opacity stream while preserving destination alpha.
+unsafe fn handle_pixel_alpha_blend() -> bool {
+    let esp = read_reg32(ESP);
+    let source = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let destination = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    let alpha = match safe_read32s(esp.wrapping_add(12)) { Ok(v) if v != 0 => v, _ => return false };
+    let count = match safe_read32s(esp.wrapping_add(16)) {
+        Ok(v) if v > 0 && v <= 0x0010_0000 => v,
+        _ => return false,
+    };
+
+    // Validate the complete input/output spans before the first mutation. A
+    // fault must fall back to the original with destination still untouched.
+    for i in 0..count {
+        let offset = i.wrapping_mul(4);
+        if safe_read32s(source.wrapping_add(offset)).is_err()
+            || safe_read32s(destination.wrapping_add(offset)).is_err()
+            || safe_read32s(alpha.wrapping_add(offset)).is_err() {
+            return false;
+        }
+    }
+
+    for i in 0..count {
+        let offset = i.wrapping_mul(4);
+        let src = safe_read32s(source.wrapping_add(offset)).unwrap() as u32;
+        let old = safe_read32s(destination.wrapping_add(offset)).unwrap() as u32;
+        let opacity = (safe_read32s(alpha.wrapping_add(offset)).unwrap() as u32) & 0xff;
+        let inverse = 255u32 - opacity;
+        let mut result = old & 0xff00_0000;
+        for shift in [0u32, 8, 16] {
+            let src_byte = (src >> shift) & 0xff;
+            let dst_byte = (old >> shift) & 0xff;
+            let blended = ((src_byte * opacity) >> 8) + ((dst_byte * inverse) >> 8);
+            result |= (blended & 0xff) << shift;
+        }
+        if safe_write32(destination.wrapping_add(offset), result as i32).is_err() { return false; }
+    }
+    write_reg32(EAX, 0);
+    true
+}
+
+const IDCT_FIX_0_298631336: i32 = 2446;
+const IDCT_FIX_0_390180644: i32 = 3196;
+const IDCT_FIX_0_541196100: i32 = 4433;
+const IDCT_FIX_0_765366865: i32 = 6270;
+const IDCT_FIX_0_899976223: i32 = 7373;
+const IDCT_FIX_1_175875602: i32 = 9633;
+const IDCT_FIX_1_501321110: i32 = 12299;
+const IDCT_FIX_1_847759065: i32 = 15137;
+const IDCT_FIX_1_961570560: i32 = 16069;
+const IDCT_FIX_2_053119869: i32 = 16819;
+const IDCT_FIX_2_562915447: i32 = 20995;
+const IDCT_FIX_3_072711026: i32 = 25172;
+
+#[inline(always)]
+fn idct_descale(value: i32, bits: u32) -> i32 {
+    value.wrapping_add(1i32 << (bits - 1)) >> bits
+}
+
+#[inline(always)]
+fn idct_1d(v: [i32; 8], shift: u32) -> [i32; 8] {
+    let mut z2 = v[2];
+    let mut z3 = v[6];
+    let mut z1 = z2.wrapping_add(z3).wrapping_mul(IDCT_FIX_0_541196100);
+    let mut tmp2 = z1.wrapping_sub(z3.wrapping_mul(IDCT_FIX_1_847759065));
+    let mut tmp3 = z1.wrapping_add(z2.wrapping_mul(IDCT_FIX_0_765366865));
+    let mut tmp0 = v[0].wrapping_add(v[4]).wrapping_shl(13);
+    let mut tmp1 = v[0].wrapping_sub(v[4]).wrapping_shl(13);
+    let tmp10 = tmp0.wrapping_add(tmp3);
+    let tmp13 = tmp0.wrapping_sub(tmp3);
+    let tmp11 = tmp1.wrapping_add(tmp2);
+    let tmp12 = tmp1.wrapping_sub(tmp2);
+
+    tmp0 = v[7];
+    tmp1 = v[5];
+    tmp2 = v[3];
+    tmp3 = v[1];
+    z1 = tmp0.wrapping_add(tmp3);
+    z2 = tmp1.wrapping_add(tmp2);
+    z3 = tmp0.wrapping_add(tmp2);
+    let mut z4 = tmp1.wrapping_add(tmp3);
+    let z5 = z3.wrapping_add(z4).wrapping_mul(IDCT_FIX_1_175875602);
+    tmp0 = tmp0.wrapping_mul(IDCT_FIX_0_298631336);
+    tmp1 = tmp1.wrapping_mul(IDCT_FIX_2_053119869);
+    tmp2 = tmp2.wrapping_mul(IDCT_FIX_3_072711026);
+    tmp3 = tmp3.wrapping_mul(IDCT_FIX_1_501321110);
+    z1 = z1.wrapping_mul(-IDCT_FIX_0_899976223);
+    z2 = z2.wrapping_mul(-IDCT_FIX_2_562915447);
+    z3 = z3.wrapping_mul(-IDCT_FIX_1_961570560).wrapping_add(z5);
+    z4 = z4.wrapping_mul(-IDCT_FIX_0_390180644).wrapping_add(z5);
+    tmp0 = tmp0.wrapping_add(z1.wrapping_add(z3));
+    tmp1 = tmp1.wrapping_add(z2.wrapping_add(z4));
+    tmp2 = tmp2.wrapping_add(z2.wrapping_add(z3));
+    tmp3 = tmp3.wrapping_add(z1.wrapping_add(z4));
+    [
+        idct_descale(tmp10.wrapping_add(tmp3), shift),
+        idct_descale(tmp11.wrapping_add(tmp2), shift),
+        idct_descale(tmp12.wrapping_add(tmp1), shift),
+        idct_descale(tmp13.wrapping_add(tmp0), shift),
+        idct_descale(tmp13.wrapping_sub(tmp0), shift),
+        idct_descale(tmp12.wrapping_sub(tmp1), shift),
+        idct_descale(tmp11.wrapping_sub(tmp2), shift),
+        idct_descale(tmp10.wrapping_sub(tmp3), shift),
+    ]
+}
+
+#[inline(always)]
+unsafe fn bfme_read_i16(address: i32) -> Option<i32> {
+    let lo = hc_safe_read8(address).ok()? as u16;
+    let hi = hc_safe_read8(address.wrapping_add(1)).ok()? as u16;
+    Some(((lo | hi << 8) as i16) as i32)
+}
+
+/// lotrbfme.exe 1.03 FR @ 0x00ed1aa0: statically linked IJG
+/// jpeg_idct_islow. It dequantizes one 8x8 block, applies the two integer IDCT
+/// passes and writes eight bytes to each supplied output row.
+unsafe fn handle_jpeg_idct_islow() -> bool {
+    let esp = read_reg32(ESP);
+    let cinfo = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let component = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    let coefficients = match safe_read32s(esp.wrapping_add(12)) { Ok(v) if v != 0 => v, _ => return false };
+    let output_rows = match safe_read32s(esp.wrapping_add(16)) { Ok(v) if v != 0 => v, _ => return false };
+    let output_column = match safe_read32s(esp.wrapping_add(20)) { Ok(v) if v >= 0 && v <= 0x0010_0000 => v, _ => return false };
+    let range_limit = match safe_read32s(cinfo.wrapping_add(0x148)) { Ok(v) if v != 0 => v.wrapping_add(0x80), _ => return false };
+    let quantization = match safe_read32s(component.wrapping_add(0x50)) { Ok(v) if v != 0 => v, _ => return false };
+
+    let mut coef = [0i32; 64];
+    let mut quant = [0i32; 64];
+    let mut rows = [0i32; 8];
+    for i in 0..64i32 {
+        coef[i as usize] = match bfme_read_i16(coefficients.wrapping_add(i * 2)) { Some(v) => v, None => return false };
+        quant[i as usize] = match bfme_read_i16(quantization.wrapping_add(i * 2)) { Some(v) => v, None => return false };
+    }
+    for row in 0..8i32 {
+        rows[row as usize] = match safe_read32s(output_rows.wrapping_add(row * 4)) {
+            Ok(v) if v != 0 => v.wrapping_add(output_column),
+            _ => return false,
+        };
+    }
+
+    let mut workspace = [0i32; 64];
+    for column in 0..8usize {
+        if (1..8usize).all(|row| coef[row * 8 + column] == 0) {
+            let dc = coef[column].wrapping_mul(quant[column]).wrapping_shl(2);
+            for row in 0..8usize { workspace[row * 8 + column] = dc; }
+            continue;
+        }
+        let mut input = [0i32; 8];
+        for row in 0..8usize {
+            let index = row * 8 + column;
+            input[row] = coef[index].wrapping_mul(quant[index]);
+        }
+        let output = idct_1d(input, 11);
+        for row in 0..8usize { workspace[row * 8 + column] = output[row]; }
+    }
+
+    for row in 0..8usize {
+        let base = row * 8;
+        let mut output = [0i32; 8];
+        if (1..8usize).all(|x| workspace[base + x] == 0) {
+            let value = idct_descale(workspace[base], 5);
+            output.fill(value);
+        } else {
+            let mut input = [0i32; 8];
+            input.copy_from_slice(&workspace[base..base + 8]);
+            output = idct_1d(input, 18);
+        }
+        for x in 0..8usize {
+            let sample = match hc_safe_read8(range_limit.wrapping_add(output[x] & 1023)) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if safe_write8(rows[row].wrapping_add(x as i32), sample).is_err() { return false; }
+        }
+    }
+    write_reg32(EAX, 0);
+    true
+}
+
+/// lotrbfme.exe 1.03 FR @ 0x00e2dc30: consume the complete inner loop which
+/// blends four float4 streams and applies a scalar. The exact byte-signature
+/// hook enters after the surrounding function has acquired all buffers.
+unsafe fn handle_vertex_blend() -> bool {
+    let frame = read_reg32(EBP);
+    let owner = read_reg32(EBX);
+    if frame == 0 || owner == 0 { return false; }
+    let stream = match safe_read32s(owner.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let count = match safe_read32s(stream.wrapping_add(0x68)) { Ok(v) if v > 0 && v <= 0x0100_0000 => v, _ => return false };
+    let output = match safe_read32s(frame.wrapping_sub(0x10)) { Ok(v) if v != 0 => v, _ => return false };
+    let source_a = match safe_read32s(frame.wrapping_sub(0x18)) { Ok(v) if v != 0 => v, _ => return false };
+    let source_b = match safe_read32s(frame.wrapping_sub(0x04)) { Ok(v) if v != 0 => v, _ => return false };
+    let source_c = match safe_read32s(frame.wrapping_sub(0x08)) { Ok(v) if v != 0 => v, _ => return false };
+    let source_d = match safe_read32s(frame.wrapping_sub(0x1c)) { Ok(v) if v != 0 => v, _ => return false };
+    let scale = match read_f32(0x0108_3b6c) { Some(v) => v as f64, None => return false };
+
+    for i in 0..count {
+        let offset = i.wrapping_mul(16);
+        for lane in 0..4i32 {
+            let lane_offset = offset.wrapping_add(lane * 4);
+            let a = match read_f32(source_a.wrapping_add(lane_offset)) { Some(v) => v as f64, None => return false };
+            let b = match read_f32(source_b.wrapping_add(lane_offset)) { Some(v) => v as f64, None => return false };
+            let c = match read_f32(source_c.wrapping_add(lane_offset)) { Some(v) => v as f64, None => return false };
+            let d = match read_f32(source_d.wrapping_add(lane_offset)) { Some(v) => v as f64, None => return false };
+            if !write_f32(output.wrapping_add(lane_offset), (((a + b) + c) + d) * scale) { return false; }
+        }
+    }
+    write_reg32(EDX, count);
+    write_reg32(ESI, source_b);
+    true
 }
 
 /// lotrbfme.exe 1.03 FR @ 0x00c2b870: in-order successor for the

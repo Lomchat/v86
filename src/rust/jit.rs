@@ -1423,7 +1423,10 @@ pub fn set_dispatch_stats(enabled: u32) { unsafe { DISPATCH_STATS = enabled != 0
 #[no_mangle]
 pub fn get_dispatch_stats() -> u32 { unsafe { DISPATCH_STATS as u32 } }
 
-pub const JIT_THRESHOLD: u32 = 200 * 1000;
+// Tier-1 hotness threshold. Runtime-tunable for cold-start A/Bs: a lower value
+// trades more WebAssembly compilation/code memory for less interpreter time.
+// Keep the stock 200k default until a multi-workload benchmark justifies moving it.
+static mut JIT_THRESHOLD: u32 = 200 * 1000;
 
 // less branches will generate if-else, more will generate brtable
 pub const BRTABLE_CUTOFF: usize = 10;
@@ -2757,7 +2760,7 @@ pub fn jit_force_generate_unsafe(virt_addr: i32) {
         cpu::translate_address_read(virt_addr).unwrap(),
         cpu::get_seg_cs() as u32,
         cpu::get_state_flags(),
-        JIT_THRESHOLD,
+        unsafe { JIT_THRESHOLD },
     );
     dbg_assert!(!get_jit_state().compiling.is_empty());
 }
@@ -4613,7 +4616,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
     }
 
     *hotness += heat;
-    if *hotness >= JIT_THRESHOLD {
+    if *hotness >= unsafe { JIT_THRESHOLD } {
         if page_is_compiling || compile_cap_reached {
             if compile_cap_reached {
                 unsafe {
@@ -5075,6 +5078,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         23 => JIT_TIER2_REGIONS = value != 0,
         24 => JIT_TIER2_ADAPTIVE = value != 0,
         25 => JIT_MAX_PENDING_COMPILES = value.clamp(1, 8),
+        26 => JIT_THRESHOLD = value.clamp(10_000, 2_000_000),
         _ => dbg_assert!(false),
     }
 }
@@ -5108,6 +5112,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         23 => JIT_TIER2_REGIONS as u32,
         24 => JIT_TIER2_ADAPTIVE as u32,
         25 => JIT_MAX_PENDING_COMPILES,
+        26 => JIT_THRESHOLD,
         _ => 0,
     }
 }

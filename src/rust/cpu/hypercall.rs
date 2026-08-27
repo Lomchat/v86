@@ -84,6 +84,7 @@ const OFF_HC_TEB_BASE: usize = 0x028;
 const OFF_HC_INSN_AT_TIME_UPDATE: usize = 0x02C;
 const OFF_HC_MIPS_ESTIMATE: usize = 0x030;
 const OFF_HC_CURRENT_THREAD_ID: usize = 0x034;
+
 // (pending wake buffer removed — CS wake now uses LockSemaphore events)
 const OFF_HC_CURSOR_X: usize = 0x080;
 const OFF_HC_CURSOR_Y: usize = 0x084;
@@ -353,8 +354,8 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         //    file — the whole band delegates to the engine module(s); a second
         //    engine graduates this into a dedicated band router. ──
         128..=134 => super::hypercall_eagl::dispatch_inner_loop(handler_id),
-        135..=147 => super::hypercall_bfme::dispatch_inner_loop(handler_id),
-        148..=255 => false,
+        135..=152 => super::hypercall_bfme::dispatch_inner_loop(handler_id),
+        153..=255 => false,
         _ => false,
     };
 

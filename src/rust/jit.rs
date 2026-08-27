@@ -103,7 +103,14 @@ const RET_SPEC_MAX_CANDIDATES: usize = 4;
 // Restricting this to promoted modules and a tiny instruction budget bounds wasm
 // growth while making the optimization workload-agnostic.
 static mut JIT_TIER2_LEAF_CALL_FUSION: bool = true;
-const LEAF_CALL_FUSION_MAX_INSTR: u32 = 4;
+// Keep the architectural return EIP in a wasm local while emitting a fused
+// leaf. The guarded mismatch path materializes it in instruction_pointer before
+// entering the legacy resolver, so this only removes the hot store/load pair.
+// Kept behind a separate compile-time switch (idx 28) for controlled A/B.
+static mut JIT_TIER2_LEAF_RETURN_LOCAL: bool = true;
+// Runtime-tunable only for controlled cross-workload A/B (idx 29). Production
+// starts at the validated four-instruction bound.
+static mut LEAF_CALL_FUSION_MAX_INSTR: u32 = 4;
 static mut LEAF_CALL_FUSION_SITES_COMPILED: u32 = 0;
 
 // B1b: direct-mapped memo in front of the dynamic-chaining tlb_code walk
@@ -1770,6 +1777,11 @@ pub struct JitContext<'a> {
     pub fastmem_writes: bool,
     pub x87_local_cache: [Option<X87LocalCacheSlot>; 8],
     pub push32_write_cache: Option<Push32WriteCache>,
+    /// Compile-time handshake used only while duplicating a fused C3 leaf. The
+    /// RET emitter records the popped architectural EIP here instead of storing
+    /// it globally; the caller then guards it and restores the global on miss.
+    pub capture_inline_leaf_return_eip: bool,
+    pub inline_leaf_return_eip: Option<WasmLocal>,
     /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
     /// cache coherent (it either updated the touched slot or invalidated all
     /// slots). Reset to false before each instruction; if an x87 opcode
@@ -2647,7 +2659,7 @@ fn jit_find_basic_blocks(
                 continue;
             }
             let Some(callee) = basic_blocks.get(&target) else { continue };
-            if callee.number_of_instructions > LEAF_CALL_FUSION_MAX_INSTR
+            if callee.number_of_instructions > unsafe { LEAF_CALL_FUSION_MAX_INSTR }
                 || callee.has_sti
                 || callee.ty != BasicBlockType::AbsoluteEip
                 || memory::read8(callee.last_instruction_addr) as u8 != 0xC3
@@ -3548,6 +3560,8 @@ fn jit_generate_module(
         fastmem_writes: fastmem_writes_compile_enabled(state_flags),
         x87_local_cache: std::array::from_fn(|_| None),
         push32_write_cache: None,
+        capture_inline_leaf_return_eip: false,
+        inline_leaf_return_eip: None,
         x87_cache_kept: false,
     };
 
@@ -3626,14 +3640,35 @@ fn jit_generate_module(
 
                 if let Some(leaf_addr) = block.inline_leaf {
                     let leaf = basic_blocks.get(&leaf_addr).unwrap();
+                    let use_return_local = unsafe { JIT_TIER2_LEAF_RETURN_LOCAL };
+                    if use_return_local {
+                        ctx.capture_inline_leaf_return_eip = true;
+                        ctx.inline_leaf_return_eip = None;
+                    }
                     jit_generate_basic_block(ctx, leaf, basic_blocks);
+                    let return_eip_local = if use_return_local {
+                        ctx.capture_inline_leaf_return_eip = false;
+                        Some(
+                            ctx.inline_leaf_return_eip
+                                .take()
+                                .expect("fused C3 leaf must capture its return EIP"),
+                        )
+                    }
+                    else {
+                        None
+                    };
 
                     // Normal returns take the zero-dispatch direct continuation.
                     // A callee that deliberately changed [esp] still gets the
                     // ordinary AbsoluteEip lookup and module-exit semantics.
                     let return_virt = block.virt_addr & !0xFFF
                         | block.end_addr as i32 & 0xFFF;
-                    codegen::gen_get_eip(ctx.builder);
+                    if let Some(local) = return_eip_local.as_ref() {
+                        ctx.builder.get_local(local);
+                    }
+                    else {
+                        codegen::gen_get_eip(ctx.builder);
+                    }
                     ctx.builder.const_i32(return_virt);
                     ctx.builder.eq_i32();
                     ctx.builder.if_void();
@@ -3642,6 +3677,15 @@ fn jit_generate_module(
                     ctx.builder.set_local(target_block);
                     ctx.builder.br(main_loop_label);
                     ctx.builder.block_end();
+
+                    // The legacy resolver reads instruction_pointer. Only the
+                    // unusual mismatching return reaches this store.
+                    if let Some(local) = return_eip_local.as_ref() {
+                        ctx.builder.get_local(local);
+                        ctx.builder.store_aligned_i32(
+                            global_pointers::instruction_pointer as u32,
+                        );
+                    }
 
                     if unsafe { JIT_INLINE_INTRA_MODULE_DISPATCH } {
                         gen_find_cache_entry_in_page_inline(
@@ -3661,6 +3705,9 @@ fn jit_generate_module(
                     ctx.builder.ge_i32();
                     ctx.builder.br_if(main_loop_label);
                     ctx.builder.br(ctx.exit_label);
+                    if let Some(local) = return_eip_local {
+                        ctx.builder.free_local(local);
+                    }
                     continue;
                 }
 
@@ -3800,8 +3847,9 @@ fn jit_generate_module(
                             ctx.builder.set_local(&ctx.instruction_counter);
 
                             ctx.builder.const_i32(state_flags.to_u32() as i32);
-                            ctx.builder
-                                .call_fn1_ret("jit_find_cache_entry_for_dynamic_chaining");
+                            ctx.builder.call_fn1_ret(
+                                "jit_find_cache_entry_for_dynamic_chaining",
+                            );
                             let packed_target = ctx.builder.tee_new_local();
 
                             ctx.builder.get_local(&packed_target);
@@ -5182,6 +5230,8 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         25 => JIT_MAX_PENDING_COMPILES = value.clamp(1, 8),
         26 => JIT_THRESHOLD = value.clamp(10_000, 2_000_000),
         27 => JIT_TIER2_LEAF_CALL_FUSION = value != 0,
+        28 => JIT_TIER2_LEAF_RETURN_LOCAL = value != 0,
+        29 => LEAF_CALL_FUSION_MAX_INSTR = value.clamp(1, 64),
         _ => dbg_assert!(false),
     }
 }
@@ -5217,6 +5267,8 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         25 => JIT_MAX_PENDING_COMPILES,
         26 => JIT_THRESHOLD,
         27 => JIT_TIER2_LEAF_CALL_FUSION as u32,
+        28 => JIT_TIER2_LEAF_RETURN_LOCAL as u32,
+        29 => LEAF_CALL_FUSION_MAX_INSTR,
         _ => 0,
     }
 }

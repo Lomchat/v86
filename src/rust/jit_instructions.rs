@@ -3369,8 +3369,14 @@ pub fn instr32_C3_jit(ctx: &mut JitContext) {
     ctx.builder.const_i32(0);
     codegen::gen_pop32s(ctx);
     codegen::gen_add_cs_offset(ctx);
-    ctx.builder
-        .store_aligned_i32(global_pointers::instruction_pointer as u32);
+    if ctx.capture_inline_leaf_return_eip {
+        dbg_assert!(ctx.inline_leaf_return_eip.is_none());
+        ctx.inline_leaf_return_eip = Some(ctx.builder.set_new_local());
+    }
+    else {
+        ctx.builder
+            .store_aligned_i32(global_pointers::instruction_pointer as u32);
+    }
 }
 
 pub fn instr16_C9_jit(ctx: &mut JitContext) { codegen::gen_leave(ctx, false); }

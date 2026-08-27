@@ -94,6 +94,17 @@ static mut JIT_RET_CHAINING: bool = false;
 static mut JIT_RET_SPECULATION: bool = false;
 static mut JIT_RET_SPEC_MAX_INSTR: u32 = 24;
 const RET_SPEC_MAX_CANDIDATES: usize = 4;
+// Tier-2 direct leaf-call fusion (idx 27): duplicate a tiny, single-basic-block
+// direct-call callee at its call site. The architectural CALL and RET still run
+// unchanged (including their stack accesses); only the otherwise dynamic RET
+// dispatch is replaced by a guarded direct re-entry at the known continuation.
+// The runtime EIP guard preserves unusual callees that rewrite their return
+// address: a mismatch falls through to the ordinary in-page resolver/exit path.
+// Restricting this to promoted modules and a tiny instruction budget bounds wasm
+// growth while making the optimization workload-agnostic.
+static mut JIT_TIER2_LEAF_CALL_FUSION: bool = true;
+const LEAF_CALL_FUSION_MAX_INSTR: u32 = 4;
+static mut LEAF_CALL_FUSION_SITES_COMPILED: u32 = 0;
 
 // B1b: direct-mapped memo in front of the dynamic-chaining tlb_code walk
 // (measured 1.5% self + part of the 7% indirect-jump bucket, NFSU in-race).
@@ -1661,6 +1672,10 @@ pub struct BasicBlock {
     /// otherwise. The compare guards correctness — a stale/wrong candidate simply
     /// falls through to the existing dispatch.
     pub ret_speculation: Vec<(i32, u32)>,
+    /// Tiny direct-call callee duplicated after this CALL in Tier-2. The caller's
+    /// CFG remains unchanged; emission intercepts its terminal edge, runs this
+    /// leaf, then guards the popped EIP before re-entering at the continuation.
+    pub inline_leaf: Option<u32>,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -2329,6 +2344,7 @@ fn jit_find_basic_blocks(
             has_sti: false,
             number_of_instructions: 0,
             ret_speculation: Vec::new(),
+            inline_leaf: None,
         };
         loop {
             let addr_before_instruction = current_address;
@@ -2602,6 +2618,52 @@ fn jit_find_basic_blocks(
     for block in basic_blocks.values_mut() {
         if marked_as_entry.contains(&block.virt_addr) {
             block.is_entry_block = true;
+        }
+    }
+
+    // Tier-2 tiny-leaf call fusion. CALL discovery represents a direct call as a
+    // Normal edge whose target differs from end_addr and marks the fall-through
+    // continuation as an entry. A single-block C3 leaf cannot contain another
+    // control transfer; duplicating it therefore removes one AbsoluteEip dispatch
+    // without changing CALL/RET stack semantics. Emission still checks the popped
+    // runtime EIP, so self-modifying/hand-written code that changes the return
+    // address takes the exact legacy resolver path.
+    if tier2 && unsafe { JIT_TIER2_LEAF_CALL_FUSION } {
+        let mut sites = Vec::new();
+        for block in basic_blocks.values() {
+            // The CFG shape below is shared by CALL and JMP. RET speculation can
+            // tolerate a false candidate because it guards runtime EIP, but fusion
+            // would actually execute the target and therefore requires a proven
+            // near direct CALL instruction.
+            if memory::read8(block.last_instruction_addr) as u8 != 0xE8 {
+                continue;
+            }
+            let target = match block.ty {
+                BasicBlockType::Normal { next_block_addr: Some(target), .. }
+                    if target != block.end_addr => target,
+                _ => continue,
+            };
+            if !basic_blocks.contains_key(&block.end_addr) {
+                continue;
+            }
+            let Some(callee) = basic_blocks.get(&target) else { continue };
+            if callee.number_of_instructions > LEAF_CALL_FUSION_MAX_INSTR
+                || callee.has_sti
+                || callee.ty != BasicBlockType::AbsoluteEip
+                || memory::read8(callee.last_instruction_addr) as u8 != 0xC3
+            {
+                continue;
+            }
+            sites.push((block.addr, target));
+        }
+        for (call_addr, target) in sites {
+            if let Some(block) = basic_blocks.get_mut(&call_addr) {
+                block.inline_leaf = Some(target);
+                unsafe {
+                    LEAF_CALL_FUSION_SITES_COMPILED =
+                        LEAF_CALL_FUSION_SITES_COMPILED.wrapping_add(1);
+                }
+            }
         }
     }
 
@@ -3561,6 +3623,46 @@ fn jit_generate_module(
             Work::WasmStructure(WasmStructure::BasicBlock(addr)) => {
                 let block = basic_blocks.get(&addr).unwrap();
                 jit_generate_basic_block(ctx, block, basic_blocks);
+
+                if let Some(leaf_addr) = block.inline_leaf {
+                    let leaf = basic_blocks.get(&leaf_addr).unwrap();
+                    jit_generate_basic_block(ctx, leaf, basic_blocks);
+
+                    // Normal returns take the zero-dispatch direct continuation.
+                    // A callee that deliberately changed [esp] still gets the
+                    // ordinary AbsoluteEip lookup and module-exit semantics.
+                    let return_virt = block.virt_addr & !0xFFF
+                        | block.end_addr as i32 & 0xFFF;
+                    codegen::gen_get_eip(ctx.builder);
+                    ctx.builder.const_i32(return_virt);
+                    ctx.builder.eq_i32();
+                    ctx.builder.if_void();
+                    let return_index = *index_for_addr.get(&block.end_addr).unwrap();
+                    ctx.builder.const_i32(return_index.into());
+                    ctx.builder.set_local(target_block);
+                    ctx.builder.br(main_loop_label);
+                    ctx.builder.block_end();
+
+                    if unsafe { JIT_INLINE_INTRA_MODULE_DISPATCH } {
+                        gen_find_cache_entry_in_page_inline(
+                            ctx,
+                            wasm_table_index,
+                            state_flags,
+                        );
+                    }
+                    else {
+                        codegen::gen_get_eip(ctx.builder);
+                        ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
+                        ctx.builder.const_i32(state_flags.to_u32() as i32);
+                        ctx.builder.call_fn3_ret("jit_find_cache_entry_in_page");
+                    }
+                    ctx.builder.tee_local(target_block);
+                    ctx.builder.const_i32(0);
+                    ctx.builder.ge_i32();
+                    ctx.builder.br_if(main_loop_label);
+                    ctx.builder.br(ctx.exit_label);
+                    continue;
+                }
 
                 if block.has_sti {
                     match block.ty {
@@ -5079,6 +5181,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         24 => JIT_TIER2_ADAPTIVE = value != 0,
         25 => JIT_MAX_PENDING_COMPILES = value.clamp(1, 8),
         26 => JIT_THRESHOLD = value.clamp(10_000, 2_000_000),
+        27 => JIT_TIER2_LEAF_CALL_FUSION = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -5113,8 +5216,14 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         24 => JIT_TIER2_ADAPTIVE as u32,
         25 => JIT_MAX_PENDING_COMPILES,
         26 => JIT_THRESHOLD,
+        27 => JIT_TIER2_LEAF_CALL_FUSION as u32,
         _ => 0,
     }
+}
+
+#[no_mangle]
+pub fn jit_leaf_call_fusion_sites_compiled() -> u32 {
+    unsafe { LEAF_CALL_FUSION_SITES_COMPILED }
 }
 
 #[no_mangle]

@@ -26,8 +26,185 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         152 => handle_msvcr71_stricmp(),
         153 => handle_memory_stream_read1(),
         154 => handle_bc1_color_block(),
+        155 => handle_dxt_encode_cache(),
         _ => false,
     }
+}
+
+// Keep the complete 256-byte keys compact enough for CPU cache locality.  The
+// cold high-quality pass is benchmarked at several capacities before retention.
+const DXT_CACHE_SLOTS: usize = 2048;
+const DXT_CACHE_WAYS: usize = 4;
+const DXT_CACHE_SETS: usize = DXT_CACHE_SLOTS / DXT_CACHE_WAYS;
+const DXT_SOURCE_WORDS: usize = 64;
+static mut DXT_CACHE_ENABLED: bool = true;
+static mut DXT_CACHE_VALID: [u8; DXT_CACHE_SLOTS] = [0; DXT_CACHE_SLOTS];
+static mut DXT_CACHE_HASH: [u32; DXT_CACHE_SLOTS] = [0; DXT_CACHE_SLOTS];
+static mut DXT_CACHE_MODE: [i32; DXT_CACHE_SLOTS] = [0; DXT_CACHE_SLOTS];
+static mut DXT_CACHE_OPTION: [i32; DXT_CACHE_SLOTS] = [0; DXT_CACHE_SLOTS];
+static mut DXT_CACHE_SOURCE: [[u32; DXT_SOURCE_WORDS]; DXT_CACHE_SLOTS] =
+    [[0; DXT_SOURCE_WORDS]; DXT_CACHE_SLOTS];
+static mut DXT_CACHE_OUTPUT: [[u32; 2]; DXT_CACHE_SLOTS] = [[0; 2]; DXT_CACHE_SLOTS];
+static mut DXT_CACHE_NEXT_WAY: [u8; DXT_CACHE_SETS] = [0; DXT_CACHE_SETS];
+static mut DXT_CACHE_LOOKUPS: u32 = 0;
+static mut DXT_CACHE_HITS: u32 = 0;
+static mut DXT_CACHE_INSERTS: u32 = 0;
+static mut DXT_CACHE_REPLACEMENTS: u32 = 0;
+static mut DXT_CACHE_BYPASSES: u32 = 0;
+
+#[inline(always)]
+fn dxt_hash_word(mut hash: u32, word: u32) -> u32 {
+    // Four-byte FNV-1a. The full 256-byte key is compared on a hit, so this
+    // hash selects a slot but can never make a colliding block authoritative.
+    hash ^= word & 0xff;
+    hash = hash.wrapping_mul(0x0100_0193);
+    hash ^= (word >> 8) & 0xff;
+    hash = hash.wrapping_mul(0x0100_0193);
+    hash ^= (word >> 16) & 0xff;
+    hash = hash.wrapping_mul(0x0100_0193);
+    hash ^= word >> 24;
+    hash.wrapping_mul(0x0100_0193)
+}
+
+#[inline(always)]
+fn dxt_finish_hash(mut hash: u32) -> u32 {
+    // FNV-1a's low bits retain visible regularity for arrays of IEEE-754
+    // floats.  Using them directly for a power-of-two table caused a few hot
+    // blocks to evict each other thousands of times even though the complete
+    // working set fit in the table.  Avalanche all bits before selecting the
+    // slot.  The complete key is still compared below, so this affects only
+    // cache placement and can never turn a collision into a false hit.
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x85eb_ca6b);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xc2b2_ae35);
+    hash ^ (hash >> 16)
+}
+
+#[inline]
+unsafe fn read_dxt_source(source: i32) -> Option<([u32; DXT_SOURCE_WORDS], u32)> {
+    let mut words = [0u32; DXT_SOURCE_WORDS];
+    let mut hash = 0x811c_9dc5u32;
+    for i in 0..DXT_SOURCE_WORDS {
+        let word = match safe_read32s(source.wrapping_add((i * 4) as i32)) {
+            Ok(v) => v as u32,
+            Err(_) => return None,
+        };
+        words[i] = word;
+        hash = dxt_hash_word(hash, word);
+    }
+    Some((words, hash))
+}
+
+/// Exact memoization wrapper for lotrbfme.exe 1.03 FR @ 0x00e67124.
+/// The generated x86 wrapper supplies [source, output, mode, option, phase].
+/// A lookup copies cached bytes only after comparing all 64 source words plus
+/// both scalar options. A miss runs the original encoder and calls phase 1 to
+/// record its authoritative eight-byte output.
+unsafe fn handle_dxt_encode_cache() -> bool {
+    let esp = read_reg32(ESP);
+    let source = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let output = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    let mode = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v, Err(_) => return false };
+    let option = match safe_read32s(esp.wrapping_add(16)) { Ok(v) => v, Err(_) => return false };
+    let phase = match safe_read32s(esp.wrapping_add(20)) { Ok(v) => v, Err(_) => return false };
+
+    if !DXT_CACHE_ENABLED {
+        if phase == 0 { DXT_CACHE_BYPASSES = DXT_CACHE_BYPASSES.wrapping_add(1); }
+        write_reg32(EAX, 0);
+        return true;
+    }
+    let (words, mut hash) = match read_dxt_source(source) {
+        Some(v) => v,
+        None => return false,
+    };
+    hash = dxt_finish_hash(dxt_hash_word(dxt_hash_word(hash, mode as u32), option as u32));
+    let set = (hash as usize) & (DXT_CACHE_SETS - 1);
+    let set_base = set * DXT_CACHE_WAYS;
+
+    if phase == 0 {
+        DXT_CACHE_LOOKUPS = DXT_CACHE_LOOKUPS.wrapping_add(1);
+        for way in 0..DXT_CACHE_WAYS {
+            let slot = set_base + way;
+            if DXT_CACHE_VALID[slot] != 0
+                && DXT_CACHE_HASH[slot] == hash
+                && DXT_CACHE_MODE[slot] == mode
+                && DXT_CACHE_OPTION[slot] == option
+                && DXT_CACHE_SOURCE[slot] == words
+            {
+                let encoded = DXT_CACHE_OUTPUT[slot];
+                if safe_write32(output, encoded[0] as i32).is_err()
+                    || safe_write32(output.wrapping_add(4), encoded[1] as i32).is_err()
+                {
+                    return false;
+                }
+                DXT_CACHE_HITS = DXT_CACHE_HITS.wrapping_add(1);
+                write_reg32(EAX, 1);
+                return true;
+            }
+        }
+        write_reg32(EAX, 0);
+        return true;
+    }
+
+    if phase == 1 {
+        let out0 = match safe_read32s(output) { Ok(v) => v as u32, Err(_) => return false };
+        let out1 = match safe_read32s(output.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return false };
+        let mut slot = set_base;
+        let mut found_empty = false;
+        for way in 0..DXT_CACHE_WAYS {
+            let candidate = set_base + way;
+            if DXT_CACHE_VALID[candidate] == 0 {
+                slot = candidate;
+                found_empty = true;
+                break;
+            }
+        }
+        if !found_empty {
+            slot = set_base + (DXT_CACHE_NEXT_WAY[set] as usize);
+            DXT_CACHE_NEXT_WAY[set] = ((DXT_CACHE_NEXT_WAY[set] as usize + 1) % DXT_CACHE_WAYS) as u8;
+            DXT_CACHE_REPLACEMENTS = DXT_CACHE_REPLACEMENTS.wrapping_add(1);
+        }
+        DXT_CACHE_HASH[slot] = hash;
+        DXT_CACHE_MODE[slot] = mode;
+        DXT_CACHE_OPTION[slot] = option;
+        DXT_CACHE_SOURCE[slot] = words;
+        DXT_CACHE_OUTPUT[slot] = [out0, out1];
+        DXT_CACHE_VALID[slot] = 1;
+        DXT_CACHE_INSERTS = DXT_CACHE_INSERTS.wrapping_add(1);
+        write_reg32(EAX, 0);
+        return true;
+    }
+    false
+}
+
+#[no_mangle]
+pub unsafe fn bfme_dxt_cache_set_enabled(enabled: u32) {
+    DXT_CACHE_ENABLED = enabled != 0;
+}
+
+#[no_mangle]
+pub unsafe fn bfme_dxt_cache_get_enabled() -> u32 { DXT_CACHE_ENABLED as u32 }
+
+#[no_mangle]
+pub unsafe fn bfme_dxt_cache_get_stat(index: u32) -> u32 {
+    match index {
+        0 => DXT_CACHE_LOOKUPS,
+        1 => DXT_CACHE_HITS,
+        2 => DXT_CACHE_INSERTS,
+        3 => DXT_CACHE_REPLACEMENTS,
+        4 => DXT_CACHE_BYPASSES,
+        _ => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe fn bfme_dxt_cache_reset_stats() {
+    DXT_CACHE_LOOKUPS = 0;
+    DXT_CACHE_HITS = 0;
+    DXT_CACHE_INSERTS = 0;
+    DXT_CACHE_REPLACEMENTS = 0;
+    DXT_CACHE_BYPASSES = 0;
 }
 
 

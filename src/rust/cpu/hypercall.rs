@@ -354,8 +354,8 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         //    file — the whole band delegates to the engine module(s); a second
         //    engine graduates this into a dedicated band router. ──
         128..=134 => super::hypercall_eagl::dispatch_inner_loop(handler_id),
-        135..=154 => super::hypercall_bfme::dispatch_inner_loop(handler_id),
-        155..=255 => false,
+        135..=155 => super::hypercall_bfme::dispatch_inner_loop(handler_id),
+        156..=255 => false,
         _ => false,
     };
 

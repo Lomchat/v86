@@ -33,6 +33,7 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         159 => handle_msvcr71_strlen(),
         160 => handle_msvcr71_strncpy(),
         161 => handle_msvcr71_strnicmp(),
+        162 => handle_msvcr71_strcmp(),
         _ => false,
     }
 }
@@ -961,6 +962,25 @@ unsafe fn handle_msvcr71_strnicmp() -> bool {
     }
     write_reg32(EAX, 0);
     true
+}
+
+/// MSVCR71.dll 7.10.3052.4 @ RVA 0x2cc0: `strcmp` returns normalized
+/// -1/0/+1 rather than the raw byte difference used by the generic handler.
+unsafe fn handle_msvcr71_strcmp() -> bool {
+    let esp = read_reg32(ESP);
+    let mut left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let mut right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    loop {
+        let a = match hc_safe_read8(left) { Ok(v) => v, Err(_) => return false };
+        let b = match hc_safe_read8(right) { Ok(v) => v, Err(_) => return false };
+        if a != b {
+            write_reg32(EAX, if a < b { -1 } else { 1 });
+            return true;
+        }
+        if a == 0 { write_reg32(EAX, 0); return true; }
+        left = left.wrapping_add(1);
+        right = right.wrapping_add(1);
+    }
 }
 
 /// lotrbfme.exe 1.03 FR @ 0x00b47940: blend three color bytes per BGRA pixel

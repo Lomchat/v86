@@ -1523,9 +1523,10 @@ unsafe fn handle_strlen() -> bool {
         write_reg32(EAX, 0);
         return true;
     }
+    let mut reader = HcReadCursor::new();
     let mut len: u32 = 0;
     loop {
-        let ch = match hc_safe_read8(str_ptr + len as i32) {
+        let ch = match reader.read8(str_ptr.wrapping_add(len as i32)) {
             Ok(v) => v,
             Err(_) => break,
         };
@@ -1548,13 +1549,15 @@ unsafe fn handle_strcmp() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
+    let mut r1 = HcReadCursor::new();
+    let mut r2 = HcReadCursor::new();
     let mut i: u32 = 0;
     let result = loop {
-        let c1 = match hc_safe_read8(s1 + i as i32) {
+        let c1 = match r1.read8(s1.wrapping_add(i as i32)) {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
-        let c2 = match hc_safe_read8(s2 + i as i32) {
+        let c2 = match r2.read8(s2.wrapping_add(i as i32)) {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
@@ -1582,9 +1585,10 @@ unsafe fn handle_strcpy() -> bool {
         write_reg32(EAX, dst);
         return true;
     }
+    let mut reader = HcReadCursor::new();
     let mut i: u32 = 0;
     loop {
-        let ch = match hc_safe_read8(src + i as i32) {
+        let ch = match reader.read8(src.wrapping_add(i as i32)) {
             Ok(v) => v,
             Err(_) => return false,
         };
@@ -1608,13 +1612,15 @@ unsafe fn handle_stricmp() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
+    let mut r1 = HcReadCursor::new();
+    let mut r2 = HcReadCursor::new();
     let mut i: u32 = 0;
     let result = loop {
-        let c1 = match hc_safe_read8(s1 + i as i32) {
+        let c1 = match r1.read8(s1.wrapping_add(i as i32)) {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
-        let c2 = match hc_safe_read8(s2 + i as i32) {
+        let c2 = match r2.read8(s2.wrapping_add(i as i32)) {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
@@ -1644,13 +1650,15 @@ unsafe fn handle_memcmp() -> bool {
         Ok(v) => v as u32,
         Err(_) => return false,
     };
+    let mut r1 = HcReadCursor::new();
+    let mut r2 = HcReadCursor::new();
     let mut i: u32 = 0;
     while i < len {
-        let c1 = match hc_safe_read8(s1 + i as i32) {
+        let c1 = match r1.read8(s1.wrapping_add(i as i32)) {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
-        let c2 = match hc_safe_read8(s2 + i as i32) {
+        let c2 = match r2.read8(s2.wrapping_add(i as i32)) {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
@@ -1687,14 +1695,16 @@ unsafe fn handle_strnicmp() -> bool {
         write_reg32(EAX, 0);
         return true;
     }
+    let mut r1 = HcReadCursor::new();
+    let mut r2 = HcReadCursor::new();
     let mut i: u32 = 0;
     let result = loop {
         if i >= count { break 0i32; }
-        let c1 = match hc_safe_read8(s1 + i as i32) {
+        let c1 = match r1.read8(s1.wrapping_add(i as i32)) {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
-        let c2 = match hc_safe_read8(s2 + i as i32) {
+        let c2 = match r2.read8(s2.wrapping_add(i as i32)) {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
@@ -1748,8 +1758,54 @@ unsafe fn handle_strstr() -> bool {
         return true;
     }
     let cached_needle = needle_len < NEEDLE_CACHE_CAP;
-    let first = needle_cache[0] as i32;
     let mut hay_reader = HcReadCursor::new();
+    if cached_needle {
+        // Knuth-Morris-Pratt keeps the guest access pattern strictly forward-only: every
+        // haystack byte is read once, no byte after the first complete match is touched, and
+        // an invalid page still takes the exact fallback path. This removes the old O(n*m)
+        // behaviour for repetitive parser input without speculative reads past the NUL.
+        let mut prefix = [0u16; NEEDLE_CACHE_CAP];
+        let mut matched = 0usize;
+        let mut k = 1usize;
+        while k < needle_len {
+            while matched > 0 && needle_cache[k] != needle_cache[matched] {
+                matched = prefix[matched - 1] as usize;
+            }
+            if needle_cache[k] == needle_cache[matched] {
+                matched += 1;
+            }
+            prefix[k] = matched as u16;
+            k += 1;
+        }
+
+        matched = 0;
+        let mut i = 0u32;
+        loop {
+            let hc = match hay_reader.read8(haystack.wrapping_add(i as i32)) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if hc == 0 { break; }
+            let byte = hc as u8;
+            while matched > 0 && byte != needle_cache[matched] {
+                matched = prefix[matched - 1] as usize;
+            }
+            if byte == needle_cache[matched] {
+                matched += 1;
+            }
+            if matched == needle_len {
+                let start = i + 1 - needle_len as u32;
+                write_reg32(EAX, haystack.wrapping_add(start as i32));
+                return true;
+            }
+            i += 1;
+            if i > 0x100000 { break; }
+        }
+        write_reg32(EAX, 0);
+        return true;
+    }
+
+    let first = needle_cache[0] as i32;
     let mut i: u32 = 0;
     loop {
         let hc = match hay_reader.read8(haystack.wrapping_add(i as i32)) {

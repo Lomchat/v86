@@ -24,7 +24,7 @@
 //!   0x094: hc_peek_starvation_counter u32 — consecutive WASM-handled PeekMessage calls
 //!   0x098: hc_peek_starvation_limit   u32 — max consecutive before JS fallthrough
 //!   0x09C: hc_has_runnable_peers      u32 — 1 if other threads are READY/RUNNING (written by JS)
-//!   0x0A0: hc_sleep_starvation_counter u32 — consecutive WASM-handled Sleep(0) calls with peers
+//!   0x0A0: hc_sleep_starvation_counter u32 — consecutive WASM-handled Sleep(0) calls
 //!   0x0A4: hc_sleep_starvation_limit   u32 — max consecutive before JS fallthrough
 //!   0x0B0: hc_rand_seed         u32 — RNG seed for handle_rand
 //!   0x100: hc_dispatch_table    [u8; 4096] — dispatch_table[functionId] = handler_id
@@ -2045,11 +2045,13 @@ unsafe fn handle_wait_for_single_object() -> bool {
 }
 
 /// Sleep(dwMilliseconds) — stdcall(1).
-/// Fast path: Sleep(0) with no other runnable threads is a pure no-op.
-/// When peers exist, uses a starvation counter: only every Nth call falls
-/// through to JS for actual context switch. This matches real Windows behavior
-/// where Sleep(0) yields the remainder of the time quantum — often a near no-op
-/// if the thread was just scheduled.
+/// Fast path for Sleep(0). With runnable guest peers, only every Nth call falls
+/// through to JS for an actual guest context switch. With no guest peer, a
+/// tight polling loop would otherwise stay wholly inside WASM and monopolize
+/// the browser worker (BFME II can execute millions of Sleep(0)+timeGetTime
+/// pairs per second while pacing at 30 FPS). Let one call through after a much
+/// larger burst so the scheduler can yield to the host without penalizing
+/// ordinary cooperative Sleep(0) use.
 unsafe fn handle_sleep() -> bool {
     let esp = read_reg32(ESP);
     let ms = match safe_read32s(esp + 4) {
@@ -2060,25 +2062,26 @@ unsafe fn handle_sleep() -> bool {
     if ms == 0 {
         let page = hp_ptr();
         let has_peers = *(page.add(OFF_HC_HAS_RUNNABLE_PEERS) as *const u32);
-        if has_peers == 0 {
-            // No-op: no peer thread to yield to. Return void (EAX=0 by convention).
-            write_reg32(EAX, 0);
-            return true;
-        }
-
-        // Peers exist — use starvation counter to avoid excessive JS transitions.
         let counter_ptr = hp_mut().add(OFF_HC_SLEEP_STARVATION_COUNTER) as *mut u32;
         let counter = *counter_ptr;
         let limit = *(page.add(OFF_HC_SLEEP_STARVATION_LIMIT) as *const u32);
+        // A sole runnable thread only needs a host yield for a proven storm.
+        // 64 * the guest-fairness limit = 4096 calls with today's limit of 64.
+        let effective_limit = if has_peers != 0 {
+            limit
+        } else {
+            limit.saturating_mul(64)
+        };
 
-        if limit > 0 && counter < limit {
-            // Not yet starved — no-op in WASM, peers can wait a few more µs
+        if effective_limit > 0 && counter < effective_limit {
+            // Not yet starved — remain entirely in WASM.
             *counter_ptr = counter + 1;
             write_reg32(EAX, 0);
             return true;
         }
 
-        // Starvation limit reached or unset → reset counter and fall through to JS
+        // Starvation limit reached or unset → reset and let the scheduler
+        // context-switch a guest peer or yield the sole runnable thread to host.
         *counter_ptr = 0;
     }
 

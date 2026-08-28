@@ -354,8 +354,11 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         //    file — the whole band delegates to the engine module(s); a second
         //    engine graduates this into a dedicated band router. ──
         128..=134 => super::hypercall_eagl::dispatch_inner_loop(handler_id),
-        135..=157 => super::hypercall_bfme::dispatch_inner_loop(handler_id),
-        158..=255 => false,
+        // The engine module also owns the guarded MSVCR71 leaves allocated
+        // after the original BFME range. Let its exhaustive dispatcher reject
+        // unknown ids instead of silently forcing every new CRT call through
+        // the JavaScript fallback.
+        135..=255 => super::hypercall_bfme::dispatch_inner_loop(handler_id),
         _ => false,
     };
 

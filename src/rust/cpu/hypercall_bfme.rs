@@ -1,7 +1,7 @@
 //! BFME-specific inner-loop HLE handlers. These live in the engine-handler
 //! band (128..=255) and are armed only by byte-exact, title-specific hooks.
 
-use crate::cpu::cpu::{read_reg32, safe_read32s, safe_write32, safe_write8, write_reg32, EAX, EBP, EBX, ECX, EDX, ESI, ESP};
+use crate::cpu::cpu::{readable_or_pagefault, read_reg32, safe_read32s, safe_write32, safe_write8, writable_or_pagefault, write_reg32, EAX, EBP, EBX, ECX, EDX, ESI, ESP};
 use crate::cpu::hypercall::hc_safe_read8;
 
 pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
@@ -27,8 +27,278 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         153 => handle_memory_stream_read1(),
         154 => handle_bc1_color_block(),
         155 => handle_dxt_encode_cache(),
+        156 => handle_rgb24_expand(),
+        157 => handle_sparse_float4(),
         _ => false,
     }
+}
+
+static mut RGB24_EXPAND_CALLS: u32 = 0;
+static mut RGB24_EXPAND_PIXELS: u32 = 0;
+static mut RGB24_EXPAND_ENABLED: bool = false;
+static mut RGB24_EXPAND_ATTEMPTS: u32 = 0;
+static mut RGB24_EXPAND_LAST_SOURCE: u32 = 0;
+static mut RGB24_EXPAND_LAST_DESTINATION: u32 = 0;
+static mut RGB24_EXPAND_LAST_END: u32 = 0;
+static mut RGB24_EXPAND_LAST_COUNT: u32 = 0;
+static mut RGB24_EXPAND_LAST_FAILURE: u32 = 0;
+
+#[inline(always)]
+unsafe fn rgb24_decline(code: u32) -> bool {
+    RGB24_EXPAND_LAST_FAILURE = code;
+    // The guest wrapper tests EBX and enters the relocated original loop when
+    // zero. Returning true keeps this byte-exact hook entirely in WASM; a Rust
+    // decline must never fall through to the JS stub and skip the loop.
+    write_reg32(EBX, 0);
+    true
+}
+
+#[inline(always)]
+fn ranges_overlap(left: u32, left_len: u32, right: u32, right_len: u32) -> bool {
+    let left_end = left as u64 + left_len as u64;
+    let right_end = right as u64 + right_len as u64;
+    (left as u64) < right_end && (right as u64) < left_end
+}
+
+/// Validate a complete non-wrapping guest range without touching its contents.
+/// The paging helper deliberately accepts less than one page at a time.
+#[inline]
+unsafe fn validate_guest_range(address: u32, length: u32, writable: bool) -> bool {
+    if length == 0 || (address as u64 + length as u64) > 0x1_0000_0000 { return false; }
+    let mut cursor = address;
+    let mut remaining = length;
+    while remaining != 0 {
+        let in_page = cursor & 0xfff;
+        let chunk = remaining.min(0xfff - in_page).max(1);
+        let valid = if writable {
+            writable_or_pagefault(cursor as i32, chunk as i32).is_ok()
+        }
+        else {
+            readable_or_pagefault(cursor as i32, chunk as i32).is_ok()
+        };
+        if !valid { return false; }
+        cursor = cursor.wrapping_add(chunk);
+        remaining -= chunk;
+    }
+    true
+}
+
+/// lotrbfme.exe 1.03 FR @ 0x00e29092. The byte-exact guest hook enters with
+/// EAX=packed RGB source, ESI=XRGB destination and ECX=destination end. Consume
+/// the complete loop in WASM and preserve every register live at 0x00e290ae.
+unsafe fn handle_rgb24_expand() -> bool {
+    let esp = read_reg32(ESP);
+    let source = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(9) };
+    let destination = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(9) };
+    let end = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(9) };
+    let destination_bytes = end.wrapping_sub(destination);
+    RGB24_EXPAND_ATTEMPTS = RGB24_EXPAND_ATTEMPTS.wrapping_add(1);
+    RGB24_EXPAND_LAST_SOURCE = source;
+    RGB24_EXPAND_LAST_DESTINATION = destination;
+    RGB24_EXPAND_LAST_END = end;
+    RGB24_EXPAND_LAST_COUNT = destination_bytes >> 2;
+    RGB24_EXPAND_LAST_FAILURE = 0;
+    if !RGB24_EXPAND_ENABLED { return rgb24_decline(8); }
+    if destination == 0 || source == 0 || end <= destination
+        || destination_bytes & 3 != 0 {
+        return rgb24_decline(1);
+    }
+    let count = destination_bytes >> 2;
+    if count == 0 || count > 0x0100_0000 { return rgb24_decline(2); }
+    let source_bytes = match count.checked_mul(3) { Some(v) => v, None => return rgb24_decline(2) };
+    if source.checked_add(source_bytes).is_none() || destination.checked_add(destination_bytes).is_none() {
+        return rgb24_decline(2);
+    }
+    // The original loop is streaming. Cached reads would change its semantics
+    // for overlapping input/output, so leave that rare case to the original.
+    if ranges_overlap(source, source_bytes, destination, destination_bytes) {
+        return rgb24_decline(6);
+    }
+    // Make the accelerated operation atomic with respect to fallback: once the
+    // first output word is written, no later paging failure may route through
+    // the original loop and apply a partially completed conversion twice.
+    if !validate_guest_range(source, source_bytes, false)
+        || !validate_guest_range(destination, destination_bytes, true) {
+        return rgb24_decline(7);
+    }
+
+    let mut last = 0u32;
+    for i in 0..count {
+        let src = source.wrapping_add(i.wrapping_mul(3)) as i32;
+        let value = if i + 1 < count {
+            match safe_read32s(src) {
+                Ok(v) => v as u32,
+                Err(_) => return rgb24_decline(3),
+            }
+        }
+        else {
+            // Do not read a fourth byte beyond the source span on the final
+            // pixel, even when it would usually remain inside a mapped page.
+            let r = match hc_safe_read8(src) { Ok(v) => v as u32, Err(_) => return rgb24_decline(4) };
+            let g = match hc_safe_read8(src.wrapping_add(1)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(4) };
+            let b = match hc_safe_read8(src.wrapping_add(2)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(4) };
+            r | g << 8 | b << 16
+        };
+        last = ((value & 0xff) << 16) | (value & 0xff00) | ((value >> 16) & 0xff);
+        let dst = destination.wrapping_add(i.wrapping_mul(4)) as i32;
+        if safe_write32(dst, last as i32).is_err() { return rgb24_decline(5); }
+    }
+
+    write_reg32(EAX, source.wrapping_add(count.wrapping_mul(3)) as i32);
+    write_reg32(ESI, end as i32);
+    write_reg32(EDX, last as i32);
+    write_reg32(EBX, 1);
+    RGB24_EXPAND_CALLS = RGB24_EXPAND_CALLS.wrapping_add(1);
+    RGB24_EXPAND_PIXELS = RGB24_EXPAND_PIXELS.wrapping_add(count);
+    true
+}
+
+#[no_mangle]
+pub unsafe fn bfme_rgb24_stat(index: u32) -> u32 {
+    match index {
+        0 => RGB24_EXPAND_CALLS,
+        1 => RGB24_EXPAND_PIXELS,
+        2 => RGB24_EXPAND_ATTEMPTS,
+        3 => RGB24_EXPAND_LAST_SOURCE,
+        4 => RGB24_EXPAND_LAST_DESTINATION,
+        5 => RGB24_EXPAND_LAST_END,
+        6 => RGB24_EXPAND_LAST_COUNT,
+        7 => RGB24_EXPAND_LAST_FAILURE,
+        _ => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe fn bfme_rgb24_stat_reset() {
+    RGB24_EXPAND_CALLS = 0;
+    RGB24_EXPAND_PIXELS = 0;
+    RGB24_EXPAND_ATTEMPTS = 0;
+    RGB24_EXPAND_LAST_SOURCE = 0;
+    RGB24_EXPAND_LAST_DESTINATION = 0;
+    RGB24_EXPAND_LAST_END = 0;
+    RGB24_EXPAND_LAST_COUNT = 0;
+    RGB24_EXPAND_LAST_FAILURE = 0;
+}
+
+#[no_mangle]
+pub unsafe fn bfme_rgb24_set_enabled(enabled: u32) {
+    RGB24_EXPAND_ENABLED = enabled != 0;
+}
+
+#[no_mangle]
+pub unsafe fn bfme_rgb24_get_enabled() -> u32 { RGB24_EXPAND_ENABLED as u32 }
+
+static mut SPARSE_FLOAT4_ENABLED: bool = false;
+static mut SPARSE_FLOAT4_ATTEMPTS: u32 = 0;
+static mut SPARSE_FLOAT4_CALLS: u32 = 0;
+static mut SPARSE_FLOAT4_ITEMS: u32 = 0;
+static mut SPARSE_FLOAT4_LAST_FAILURE: u32 = 0;
+
+#[inline(always)]
+unsafe fn sparse_float4_decline(code: u32) -> bool {
+    SPARSE_FLOAT4_LAST_FAILURE = code;
+    write_reg32(ESI, 0);
+    true
+}
+
+/// lotrbfme.exe 1.03 FR @ 0x00e2f4f0. Arguments materialized by the guest
+/// wrapper are [entries, entries_end, destination_base, source_float4, frame].
+/// Binary64 holds each exact f32 product plus f32 accumulator before the same
+/// final binary32 rounding performed by the original x87 FSTP.
+unsafe fn handle_sparse_float4() -> bool {
+    let esp = read_reg32(ESP);
+    let entries = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let entries_end = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let destination_base = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let source = match safe_read32s(esp.wrapping_add(16)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let frame = match safe_read32s(esp.wrapping_add(20)) { Ok(v) => v, Err(_) => return sparse_float4_decline(1) };
+    SPARSE_FLOAT4_ATTEMPTS = SPARSE_FLOAT4_ATTEMPTS.wrapping_add(1);
+    SPARSE_FLOAT4_LAST_FAILURE = 0;
+    if !SPARSE_FLOAT4_ENABLED { return sparse_float4_decline(8); }
+    let bytes = entries_end.wrapping_sub(entries);
+    if entries == 0 || entries_end <= entries || bytes & 7 != 0 { return sparse_float4_decline(2); }
+    let count = bytes >> 3;
+    if count == 0 || count > 0x0100_0000 { return sparse_float4_decline(3); }
+    let outer = match safe_read32s(frame.wrapping_sub(4)) { Ok(v) if v != 0 => v, _ => return sparse_float4_decline(4) };
+    let multiplier = match read_f32(outer.wrapping_add(4)) { Some(v) => v as f64, None => return sparse_float4_decline(4) };
+    let mut source_lanes = [0f64; 4];
+    for lane in 0..4i32 {
+        source_lanes[lane as usize] = match read_f32((source as i32).wrapping_sub(8).wrapping_add(lane * 4)) {
+            Some(v) => v as f64,
+            None => return sparse_float4_decline(5),
+        };
+    }
+
+
+    let source_start = match source.checked_sub(8) { Some(v) => v, None => return sparse_float4_decline(5) };
+    let multiplier_address = match (outer as u32).checked_add(4) { Some(v) => v, None => return sparse_float4_decline(4) };
+    if entries.checked_add(bytes).is_none() { return sparse_float4_decline(2); }
+
+    // Validate every scattered destination before mutating any of them. This
+    // preserves the relocated original as a genuine all-or-nothing fallback.
+    // Repeated destination indices remain valid and retain sequential sums.
+    for i in 0..count {
+        let entry = entries.wrapping_add(i.wrapping_mul(8)) as i32;
+        let index = match safe_read32s(entry) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(6) };
+        if read_f32(entry.wrapping_add(4)).is_none() { return sparse_float4_decline(6); }
+        let destination_offset = match index.checked_mul(16) { Some(v) => v, None => return sparse_float4_decline(7) };
+        let destination = match destination_base.checked_add(destination_offset) { Some(v) => v, None => return sparse_float4_decline(7) };
+        if destination.checked_add(16).is_none()
+            || ranges_overlap(destination, 16, entries, bytes)
+            || ranges_overlap(destination, 16, source_start, 16)
+            || ranges_overlap(destination, 16, multiplier_address, 4)
+            || !validate_guest_range(destination, 16, true) {
+            return sparse_float4_decline(7);
+        }
+        for lane in 0..4i32 {
+            if read_f32(destination.wrapping_add((lane * 4) as u32) as i32).is_none() {
+                return sparse_float4_decline(7);
+            }
+        }
+    }
+
+    let mut last_destination = 0u32;
+    for i in 0..count {
+        let entry = entries.wrapping_add(i.wrapping_mul(8)) as i32;
+        let index = match safe_read32s(entry) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(6) };
+        let weight = match read_f32(entry.wrapping_add(4)) { Some(v) => v as f64 * multiplier, None => return sparse_float4_decline(6) };
+        let destination = destination_base.wrapping_add(index.wrapping_mul(16));
+        for lane in 0..4i32 {
+            let address = destination.wrapping_add((lane * 4) as u32) as i32;
+            let current = match read_f32(address) { Some(v) => v as f64, None => return sparse_float4_decline(7) };
+            if !write_f32(address, current + weight * source_lanes[lane as usize]) {
+                return sparse_float4_decline(7);
+            }
+        }
+        last_destination = destination.wrapping_add(12);
+    }
+    write_reg32(EAX, entries_end as i32);
+    write_reg32(ESI, last_destination as i32);
+    SPARSE_FLOAT4_CALLS = SPARSE_FLOAT4_CALLS.wrapping_add(1);
+    SPARSE_FLOAT4_ITEMS = SPARSE_FLOAT4_ITEMS.wrapping_add(count);
+    true
+}
+
+#[no_mangle]
+pub unsafe fn bfme_sparse_float4_set_enabled(enabled: u32) { SPARSE_FLOAT4_ENABLED = enabled != 0; }
+#[no_mangle]
+pub unsafe fn bfme_sparse_float4_get_enabled() -> u32 { SPARSE_FLOAT4_ENABLED as u32 }
+#[no_mangle]
+pub unsafe fn bfme_sparse_float4_stat(index: u32) -> u32 {
+    match index {
+        0 => SPARSE_FLOAT4_ATTEMPTS,
+        1 => SPARSE_FLOAT4_CALLS,
+        2 => SPARSE_FLOAT4_ITEMS,
+        3 => SPARSE_FLOAT4_LAST_FAILURE,
+        _ => 0,
+    }
+}
+#[no_mangle]
+pub unsafe fn bfme_sparse_float4_stat_reset() {
+    SPARSE_FLOAT4_ATTEMPTS = 0;
+    SPARSE_FLOAT4_CALLS = 0;
+    SPARSE_FLOAT4_ITEMS = 0;
+    SPARSE_FLOAT4_LAST_FAILURE = 0;
 }
 
 // Keep the complete 256-byte keys compact enough for CPU cache locality.  The
@@ -51,6 +321,122 @@ static mut DXT_CACHE_HITS: u32 = 0;
 static mut DXT_CACHE_INSERTS: u32 = 0;
 static mut DXT_CACHE_REPLACEMENTS: u32 = 0;
 static mut DXT_CACHE_BYPASSES: u32 = 0;
+static mut DXT_FAST_ENABLED: bool = false;
+static mut DXT_FAST_ENCODES: u32 = 0;
+
+#[inline(always)]
+fn dxt_clamp01(value: f32) -> f32 {
+    if !value.is_finite() || value <= 0.0 { 0.0 }
+    else if value >= 1.0 { 1.0 }
+    else { value }
+}
+
+#[inline(always)]
+fn dxt_pack_565(rgb: [f32; 3]) -> u16 {
+    let r = (dxt_clamp01(rgb[0]) * 31.0 + 0.5) as u16;
+    let g = (dxt_clamp01(rgb[1]) * 63.0 + 0.5) as u16;
+    let b = (dxt_clamp01(rgb[2]) * 31.0 + 0.5) as u16;
+    (r << 11) | (g << 5) | b
+}
+
+#[inline(always)]
+fn dxt_unpack_565(value: u16) -> [f32; 3] {
+    [
+        ((value >> 11) & 31) as f32 * (1.0 / 31.0),
+        ((value >> 5) & 63) as f32 * (1.0 / 63.0),
+        (value & 31) as f32 * (1.0 / 31.0),
+    ]
+}
+
+#[inline(always)]
+fn dxt_palette(c0: u16, c1: u16, three_colour: bool) -> [[f32; 3]; 4] {
+    let a = dxt_unpack_565(c0);
+    let b = dxt_unpack_565(c1);
+    let mut result = [[0.0; 3]; 4];
+    result[0] = a;
+    result[1] = b;
+    for lane in 0..3 {
+        if three_colour {
+            result[2][lane] = (a[lane] + b[lane]) * 0.5;
+        } else {
+            result[2][lane] = (a[lane] * 2.0 + b[lane]) * (1.0 / 3.0);
+            result[3][lane] = (a[lane] + b[lane] * 2.0) * (1.0 / 3.0);
+        }
+    }
+    result
+}
+
+#[inline(always)]
+fn dxt_colour_error(pixel: [f32; 3], candidate: [f32; 3]) -> f32 {
+    // Match BFME's strongly perceptual fit closely enough for a fast loading
+    // path: green dominates, then red, then blue. Only relative weights matter.
+    let dr = pixel[0] - candidate[0];
+    let dg = pixel[1] - candidate[1];
+    let db = pixel[2] - candidate[2];
+    dr * dr * 0.29703665 + dg * dg + db * db * 0.10078278
+}
+
+/// Fast, deterministic BC1 range fit for BFME's cold texture load. The title's
+/// high-quality x87 cluster fit is disproportionately expensive under a JIT.
+/// Keep this path deliberately tiny: one min/max pass and one selector pass.
+/// It affects texture pixels only, never simulation state.
+fn dxt_fast_encode(words: &[u32; DXT_SOURCE_WORDS], mode: i32) -> [u32; 2] {
+    let mut opaque_count = 0usize;
+    let mut lo = [1.0f32; 3];
+    let mut hi = [0.0f32; 3];
+
+    for i in 0..16 {
+        let alpha = f32::from_bits(words[i * 4 + 3]);
+        let visible = mode == 0 || !alpha.is_finite() || alpha >= 0.5;
+        if visible {
+            for lane in 0..3 {
+                let value = dxt_clamp01(f32::from_bits(words[i * 4 + lane]));
+                if value < lo[lane] { lo[lane] = value; }
+                if value > hi[lane] { hi[lane] = value; }
+            }
+            opaque_count += 1;
+        }
+    }
+
+    if opaque_count == 0 {
+        return [0xffff_0000, 0xffff_ffff];
+    }
+
+    let three_colour = mode != 0 && opaque_count != 16;
+    let mut c0 = dxt_pack_565(hi);
+    let mut c1 = dxt_pack_565(lo);
+
+    if three_colour {
+        if c0 > c1 { core::mem::swap(&mut c0, &mut c1); }
+    } else if c0 < c1 {
+        core::mem::swap(&mut c0, &mut c1);
+    }
+    let palette = dxt_palette(c0, c1, three_colour);
+    let palette_len = if three_colour { 3 } else { 4 };
+    let mut selectors = 0u32;
+    for i in 0..16 {
+        let alpha = f32::from_bits(words[i * 4 + 3]);
+        let visible = mode == 0 || !alpha.is_finite() || alpha >= 0.5;
+        let best = if !visible {
+            3usize
+        } else {
+            let pixel = [
+                dxt_clamp01(f32::from_bits(words[i * 4])),
+                dxt_clamp01(f32::from_bits(words[i * 4 + 1])),
+                dxt_clamp01(f32::from_bits(words[i * 4 + 2])),
+            ];
+            let mut selected = 0usize;
+            let mut best_error = f32::INFINITY;
+            for selector in 0..palette_len {
+                let error = dxt_colour_error(pixel, palette[selector]);
+                if error < best_error { best_error = error; selected = selector; }
+            }
+            selected
+        };
+        selectors |= (best as u32) << (i * 2);
+    }
+    [c0 as u32 | ((c1 as u32) << 16), selectors]
+}
 
 #[inline(always)]
 fn dxt_hash_word(mut hash: u32, word: u32) -> u32 {
@@ -143,6 +529,17 @@ unsafe fn handle_dxt_encode_cache() -> bool {
                 return true;
             }
         }
+        if DXT_FAST_ENABLED {
+            let encoded = dxt_fast_encode(&words, mode);
+            if safe_write32(output, encoded[0] as i32).is_err()
+                || safe_write32(output.wrapping_add(4), encoded[1] as i32).is_err()
+            {
+                return false;
+            }
+            DXT_FAST_ENCODES = DXT_FAST_ENCODES.wrapping_add(1);
+            write_reg32(EAX, 1);
+            return true;
+        }
         write_reg32(EAX, 0);
         return true;
     }
@@ -187,6 +584,14 @@ pub unsafe fn bfme_dxt_cache_set_enabled(enabled: u32) {
 pub unsafe fn bfme_dxt_cache_get_enabled() -> u32 { DXT_CACHE_ENABLED as u32 }
 
 #[no_mangle]
+pub unsafe fn bfme_dxt_fast_set_enabled(enabled: u32) {
+    DXT_FAST_ENABLED = enabled != 0;
+}
+
+#[no_mangle]
+pub unsafe fn bfme_dxt_fast_get_enabled() -> u32 { DXT_FAST_ENABLED as u32 }
+
+#[no_mangle]
 pub unsafe fn bfme_dxt_cache_get_stat(index: u32) -> u32 {
     match index {
         0 => DXT_CACHE_LOOKUPS,
@@ -194,6 +599,7 @@ pub unsafe fn bfme_dxt_cache_get_stat(index: u32) -> u32 {
         2 => DXT_CACHE_INSERTS,
         3 => DXT_CACHE_REPLACEMENTS,
         4 => DXT_CACHE_BYPASSES,
+        5 => DXT_FAST_ENCODES,
         _ => 0,
     }
 }
@@ -205,6 +611,7 @@ pub unsafe fn bfme_dxt_cache_reset_stats() {
     DXT_CACHE_INSERTS = 0;
     DXT_CACHE_REPLACEMENTS = 0;
     DXT_CACHE_BYPASSES = 0;
+    DXT_FAST_ENCODES = 0;
 }
 
 

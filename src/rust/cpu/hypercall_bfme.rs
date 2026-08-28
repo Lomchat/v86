@@ -29,6 +29,10 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         155 => handle_dxt_encode_cache(),
         156 => handle_rgb24_expand(),
         157 => handle_sparse_float4(),
+        158 => handle_msvcr71_memcmp(),
+        159 => handle_msvcr71_strlen(),
+        160 => handle_msvcr71_strncpy(),
+        161 => handle_msvcr71_strnicmp(),
         _ => false,
     }
 }
@@ -868,6 +872,95 @@ unsafe fn handle_msvcr71_stricmp() -> bool {
         right = right.wrapping_add(1);
     }
     false
+}
+
+/// MSVCR71.dll 7.10.3052.4 @ RVA 0x3234: `memcmp` returns normalized
+/// -1/0/+1 rather than the raw difference used by our generic CRT handler.
+unsafe fn handle_msvcr71_memcmp() -> bool {
+    let esp = read_reg32(ESP);
+    let left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
+    let right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v, Err(_) => return false };
+    let length = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
+    for offset in 0..length {
+        let a = match hc_safe_read8(left.wrapping_add(offset as i32)) { Ok(v) => v, Err(_) => return false };
+        let b = match hc_safe_read8(right.wrapping_add(offset as i32)) { Ok(v) => v, Err(_) => return false };
+        if a != b {
+            write_reg32(EAX, if a < b { -1 } else { 1 });
+            return true;
+        }
+    }
+    write_reg32(EAX, 0);
+    true
+}
+
+/// MSVCR71.dll 7.10.3052.4 @ RVA 0x17d5: bounded only by mapped guest
+/// memory, matching the native function's fault behaviour on invalid input.
+unsafe fn handle_msvcr71_strlen() -> bool {
+    let esp = read_reg32(ESP);
+    let string = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let mut length = 0u32;
+    loop {
+        let byte = match hc_safe_read8(string.wrapping_add(length as i32)) { Ok(v) => v, Err(_) => return false };
+        if byte == 0 { break; }
+        length = match length.checked_add(1) { Some(v) => v, None => return false };
+    }
+    write_reg32(EAX, length as i32);
+    true
+}
+
+/// MSVCR71.dll 7.10.3052.4 @ RVA 0x26c3: `strncpy`, including zero padding.
+/// Validate every source byte and the complete destination before mutating so
+/// a declined HLE call can safely execute the relocated original.
+unsafe fn handle_msvcr71_strncpy() -> bool {
+    let esp = read_reg32(ESP);
+    let destination = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
+    let source = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v, Err(_) => return false };
+    let count = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
+    if count == 0 { write_reg32(EAX, destination); return true; }
+    if destination == 0 || source == 0 || !validate_guest_range(destination as u32, count, true) { return false; }
+
+    let mut copied = 0u32;
+    while copied < count {
+        let byte = match hc_safe_read8(source.wrapping_add(copied as i32)) { Ok(v) => v, Err(_) => return false };
+        copied += 1;
+        if byte == 0 { break; }
+    }
+    for offset in 0..count {
+        let byte = if offset < copied {
+            match hc_safe_read8(source.wrapping_add(offset as i32)) { Ok(v) => v, Err(_) => return false }
+        }
+        else { 0 };
+        if safe_write8(destination.wrapping_add(offset as i32), byte).is_err() { return false; }
+    }
+    write_reg32(EAX, destination);
+    true
+}
+
+/// MSVCR71.dll 7.10.3052.4 internal ASCII `_strnicmp` @ RVA 0x38d9.
+unsafe fn handle_msvcr71_strnicmp() -> bool {
+    let esp = read_reg32(ESP);
+    let mut left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let mut right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    let count = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
+    for _ in 0..count {
+        let a = match hc_safe_read8(left) { Ok(v) => v, Err(_) => return false };
+        let b = match hc_safe_read8(right) { Ok(v) => v, Err(_) => return false };
+        if a == b {
+            if a == 0 { write_reg32(EAX, 0); return true; }
+        }
+        else {
+            let folded_a = if a >= 0x41 && a <= 0x5a { a + 0x20 } else { a };
+            let folded_b = if b >= 0x41 && b <= 0x5a { b + 0x20 } else { b };
+            if folded_a != folded_b {
+                write_reg32(EAX, if folded_a < folded_b { -1 } else { 1 });
+                return true;
+            }
+        }
+        left = left.wrapping_add(1);
+        right = right.wrapping_add(1);
+    }
+    write_reg32(EAX, 0);
+    true
 }
 
 /// lotrbfme.exe 1.03 FR @ 0x00b47940: blend three color bytes per BGRA pixel

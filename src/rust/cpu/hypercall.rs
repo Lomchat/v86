@@ -1078,6 +1078,46 @@ pub(crate) unsafe fn hc_safe_read8(addr: i32) -> Result<i32, ()> {
     crate::cpu::cpu::safe_read8(addr).map_err(|_| ())
 }
 
+/// Sequential guest byte reader that translates a virtual address once per 4 KiB page.
+///
+/// CRT string primitives otherwise call `safe_read8` for every character, repeating the
+/// complete TLB/access check even while walking the same page. The guest cannot switch page
+/// tables while a synchronous hypercall is running, so retaining the translated physical page
+/// is equivalent to the fast path used by x86 REP string instructions. MMIO pages still go
+/// through `memory::read8` for every byte so device read side effects are preserved.
+struct HcReadCursor {
+    virt_page: u32,
+    phys_page: u32,
+    direct_ram: bool,
+    valid: bool,
+}
+
+impl HcReadCursor {
+    fn new() -> Self {
+        Self { virt_page: 0, phys_page: 0, direct_ram: false, valid: false }
+    }
+
+    unsafe fn read8(&mut self, addr: i32) -> Result<i32, ()> {
+        let virt = addr as u32;
+        let virt_page = virt & !0xFFF;
+        if !self.valid || self.virt_page != virt_page {
+            let phys = crate::cpu::cpu::translate_address_read(addr).map_err(|_| ())?;
+            self.virt_page = virt_page;
+            self.phys_page = phys & !0xFFF;
+            self.direct_ram = !memory::in_mapped_range(phys);
+            self.valid = true;
+        }
+
+        let phys = self.phys_page | (virt & 0xFFF);
+        Ok(if self.direct_ram {
+            memory::read8_no_mmap_check(phys)
+        }
+        else {
+            memory::read8(phys)
+        })
+    }
+}
+
 /// Helper: safe_write16 wrapper
 unsafe fn hc_safe_write16(addr: i32, value: i32) -> Result<(), ()> {
     crate::cpu::cpu::safe_write16(addr, value).map_err(|_| ())
@@ -1670,7 +1710,7 @@ unsafe fn handle_strnicmp() -> bool {
 
 /// strstr(char* haystack, char* needle): substring search, return ptr into haystack or NULL.
 /// Byte-wise analogue of handle_wcsstr; mirrors the JS strstr (crt-string.ts): null haystack
-/// OR null needle → 0, empty needle → haystack. Naive O(n*m), matching MSVCRT / the JS impl.
+/// OR null needle → 0, empty needle → haystack.
 unsafe fn handle_strstr() -> bool {
     let esp = read_reg32(ESP);
     let haystack = match safe_read32s(esp + 4) {
@@ -1685,18 +1725,34 @@ unsafe fn handle_strstr() -> bool {
         write_reg32(EAX, 0);
         return true;
     }
+    // Cache ordinary needles once. The old loop re-read the complete guest needle through
+    // virtual translation for every matching first byte. Longer needles keep exact behaviour
+    // through a second page cursor rather than allocating guest-controlled amounts of host RAM.
+    const NEEDLE_CACHE_CAP: usize = 256;
+    let mut needle_cache = [0u8; NEEDLE_CACHE_CAP];
+    let mut needle_reader = HcReadCursor::new();
+    let mut needle_len = 0usize;
+    while needle_len < NEEDLE_CACHE_CAP {
+        let ch = match needle_reader.read8(needle.wrapping_add(needle_len as i32)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if ch == 0 { break; }
+        needle_cache[needle_len] = ch as u8;
+        needle_len += 1;
+    }
+
     // Empty needle → return haystack (matches JS `sub.length === 0`).
-    let first = match hc_safe_read8(needle) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    if first == 0 {
+    if needle_len == 0 {
         write_reg32(EAX, haystack);
         return true;
     }
+    let cached_needle = needle_len < NEEDLE_CACHE_CAP;
+    let first = needle_cache[0] as i32;
+    let mut hay_reader = HcReadCursor::new();
     let mut i: u32 = 0;
     loop {
-        let hc = match hc_safe_read8(haystack + i as i32) {
+        let hc = match hay_reader.read8(haystack.wrapping_add(i as i32)) {
             Ok(v) => v,
             Err(_) => return false,
         };
@@ -1704,12 +1760,18 @@ unsafe fn handle_strstr() -> bool {
         if hc == first {
             let mut j: u32 = 1;
             let matched = loop {
-                let nc = match hc_safe_read8(needle + j as i32) {
-                    Ok(v) => v,
-                    Err(_) => return false,
+                let nc = if cached_needle {
+                    if j as usize >= needle_len { break true; }
+                    needle_cache[j as usize] as i32
+                }
+                else {
+                    match needle_reader.read8(needle.wrapping_add(j as i32)) {
+                        Ok(v) => v,
+                        Err(_) => return false,
+                    }
                 };
-                if nc == 0 { break true; }
-                let h2 = match hc_safe_read8(haystack + (i + j) as i32) {
+                if !cached_needle && nc == 0 { break true; }
+                let h2 = match hay_reader.read8(haystack.wrapping_add((i + j) as i32)) {
                     Ok(v) => v,
                     Err(_) => return false,
                 };

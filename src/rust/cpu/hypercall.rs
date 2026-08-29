@@ -347,6 +347,7 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         81 => handle_wait_for_single_object(),
         // Public D3DX math leaves (generic across D3D9 games).
         82 => handle_d3dx_vec3_catmull_rom(),
+        83 => handle_d3dx_matrix_inverse(),
 
         // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels,
         //    kept in a distinct range from the
@@ -867,6 +868,83 @@ unsafe fn handle_d3dx_vec3_catmull_rom() -> bool {
     for i in 0..3i32 {
         if safe_write32(p_out.wrapping_add(i * 4), out[i as usize].to_bits() as i32).is_err() {
             return false;
+        }
+    }
+    write_reg32(EAX, p_out);
+    true
+}
+
+/// D3DXMatrixInverse — invert a row-major 4x4 float matrix using the same
+/// partial-pivot Gaussian elimination as the JavaScript implementation. All
+/// input is read before output so documented in-place use remains safe. The
+/// intermediate calculations intentionally use f64 and only round to f32 at
+/// the API boundary, matching JavaScript Number semantics.
+unsafe fn handle_d3dx_matrix_inverse() -> bool {
+    let esp = read_reg32(ESP);
+    let p_out = match safe_read32s(esp + 4) { Ok(v) if v != 0 => v, _ => return false };
+    let p_determinant = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
+    let p_matrix = match safe_read32s(esp + 12) { Ok(v) if v != 0 => v, _ => return false };
+
+    let mut rows = [[0.0f64; 8]; 4];
+    for row in 0..4usize {
+        for col in 0..4usize {
+            let addr = p_matrix.wrapping_add(((row * 4 + col) * 4) as i32);
+            rows[row][col] = match safe_read32s(addr) {
+                Ok(v) => f32::from_bits(v as u32) as f64,
+                Err(_) => return false,
+            };
+        }
+        rows[row][4 + row] = 1.0;
+    }
+
+    let mut determinant = 1.0f64;
+    let mut sign = 1.0f64;
+    for col in 0..4usize {
+        let mut pivot_row = col;
+        let mut pivot_abs = rows[col][col].abs();
+        for row in (col + 1)..4usize {
+            let candidate = rows[row][col].abs();
+            if candidate > pivot_abs {
+                pivot_abs = candidate;
+                pivot_row = row;
+            }
+        }
+        if pivot_abs == 0.0 || !pivot_abs.is_finite() {
+            write_reg32(EAX, 0);
+            return true;
+        }
+        if pivot_row != col {
+            rows.swap(col, pivot_row);
+            sign = -sign;
+        }
+
+        let pivot = rows[col][col];
+        determinant *= pivot;
+        for i in 0..8usize {
+            rows[col][i] /= pivot;
+        }
+        for row in 0..4usize {
+            if row == col { continue; }
+            let factor = rows[row][col];
+            if factor == 0.0 { continue; }
+            for i in 0..8usize {
+                rows[row][i] -= factor * rows[col][i];
+            }
+        }
+    }
+
+    if p_determinant != 0 && safe_write32(
+        p_determinant,
+        ((determinant * sign) as f32).to_bits() as i32,
+    ).is_err() {
+        return false;
+    }
+    for row in 0..4usize {
+        for col in 0..4usize {
+            let addr = p_out.wrapping_add(((row * 4 + col) * 4) as i32);
+            if safe_write32(addr, (rows[row][4 + col] as f32).to_bits() as i32).is_err() {
+                return false;
+            }
         }
     }
     write_reg32(EAX, p_out);

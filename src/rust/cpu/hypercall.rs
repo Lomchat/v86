@@ -345,6 +345,8 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         // Uncontended mutex fast paths (see mutex mirror table @ OFF_HC_MUTEX_MIRROR_PTR).
         80 => handle_release_mutex(),
         81 => handle_wait_for_single_object(),
+        // Public D3DX math leaves (generic across D3D9 games).
+        82 => handle_d3dx_vec3_catmull_rom(),
 
         // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels,
         //    kept in a distinct range from the
@@ -814,6 +816,62 @@ unsafe fn handle_get_cursor_pos() -> bool {
 // ---------------------------------------------------------------------------
 // Tier 2: Math/FPU hypercall handlers
 // ---------------------------------------------------------------------------
+
+/// D3DXVec3CatmullRom — interpolate three float32 components without crossing
+/// the WASM→JS boundary. The stdcall stack is: out, v0, v1, v2, v3, s.
+/// Read every source before writing so documented in-place forms remain safe.
+/// Inaccessible pointers decline to the existing JavaScript implementation.
+unsafe fn handle_d3dx_vec3_catmull_rom() -> bool {
+    let esp = read_reg32(ESP);
+    let p_out = match safe_read32s(esp + 4) { Ok(v) if v != 0 => v, _ => return false };
+    let p0 = match safe_read32s(esp + 8) { Ok(v) if v != 0 => v, _ => return false };
+    let p1 = match safe_read32s(esp + 12) { Ok(v) if v != 0 => v, _ => return false };
+    let p2 = match safe_read32s(esp + 16) { Ok(v) if v != 0 => v, _ => return false };
+    let p3 = match safe_read32s(esp + 20) { Ok(v) if v != 0 => v, _ => return false };
+    let s = match safe_read32s(esp + 24) {
+        Ok(v) => f32::from_bits(v as u32),
+        Err(_) => return false,
+    };
+
+    let mut v0 = [0.0f32; 3];
+    let mut v1 = [0.0f32; 3];
+    let mut v2 = [0.0f32; 3];
+    let mut v3 = [0.0f32; 3];
+    for i in 0..3i32 {
+        let off = i * 4;
+        v0[i as usize] = match safe_read32s(p0.wrapping_add(off)) {
+            Ok(v) => f32::from_bits(v as u32), Err(_) => return false,
+        };
+        v1[i as usize] = match safe_read32s(p1.wrapping_add(off)) {
+            Ok(v) => f32::from_bits(v as u32), Err(_) => return false,
+        };
+        v2[i as usize] = match safe_read32s(p2.wrapping_add(off)) {
+            Ok(v) => f32::from_bits(v as u32), Err(_) => return false,
+        };
+        v3[i as usize] = match safe_read32s(p3.wrapping_add(off)) {
+            Ok(v) => f32::from_bits(v as u32), Err(_) => return false,
+        };
+    }
+
+    let s2 = s * s;
+    let s3 = s2 * s;
+    let mut out = [0.0f32; 3];
+    for i in 0..3usize {
+        out[i] = 0.5f32 * (
+            2.0f32 * v1[i] + (v2[i] - v0[i]) * s
+            + (2.0f32 * v0[i] - 5.0f32 * v1[i] + 4.0f32 * v2[i] - v3[i]) * s2
+            + (v3[i] - 3.0f32 * v2[i] + 3.0f32 * v1[i] - v0[i]) * s3
+        );
+    }
+
+    for i in 0..3i32 {
+        if safe_write32(p_out.wrapping_add(i * 4), out[i as usize].to_bits() as i32).is_err() {
+            return false;
+        }
+    }
+    write_reg32(EAX, p_out);
+    true
+}
 
 /// Helper: set ST(0) in-place without push/pop
 #[inline(always)]

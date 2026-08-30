@@ -1924,7 +1924,10 @@ pub struct JitContext<'a> {
 pub struct X87LocalCacheSlot {
     pub bits: WasmLocalI64,
     pub valid: WasmLocal,
-    pub dirty: WasmLocal,
+    /// Allocated only for blocks compiled with deferred writeback enabled.
+    /// Keeping it optional removes all dirty-writeback bookkeeping from blocks
+    /// compiled while config 39 is off.
+    pub dirty: Option<WasmLocal>,
 }
 
 pub struct Push32WriteCache {
@@ -6204,7 +6207,10 @@ pub fn jit_contiguous_cross_page_instructions_compiled() -> u32 {
 }
 
 pub fn x87_writeback_enabled() -> bool {
-    unsafe { JIT_X87_WRITEBACK }
+    // Deferred architectural stores require the block-local x87 cache. Keep
+    // config 39 inert when config 10 is disabled instead of emitting fault
+    // guards and writeback bookkeeping that can never retain a value.
+    unsafe { JIT_X87_WRITEBACK && JIT_X87_LOCALS }
 }
 
 #[no_mangle]

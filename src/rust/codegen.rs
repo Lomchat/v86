@@ -3351,7 +3351,7 @@ fn x87_local_cache_enabled() -> bool {
 fn gen_x87_local_slot(
     ctx: &mut JitContext,
     i: u32,
-) -> Option<(WasmLocalI64, WasmLocal, WasmLocal)> {
+) -> Option<(WasmLocalI64, WasmLocal, Option<WasmLocal>)> {
     if !x87_local_cache_enabled() {
         return None;
     }
@@ -3365,8 +3365,13 @@ fn gen_x87_local_slot(
         let bits = ctx.builder.set_new_local_i64();
         ctx.builder.const_i32(0);
         let valid = ctx.builder.set_new_local();
-        ctx.builder.const_i32(0);
-        let dirty = ctx.builder.set_new_local();
+        let dirty = if crate::jit::x87_writeback_enabled() {
+            ctx.builder.const_i32(0);
+            Some(ctx.builder.set_new_local())
+        }
+        else {
+            None
+        };
         ctx.x87_local_cache[idx] = Some(crate::jit::X87LocalCacheSlot { bits, valid, dirty });
     }
 
@@ -3374,7 +3379,7 @@ fn gen_x87_local_slot(
     Some((
         slot.bits.unsafe_clone(),
         slot.valid.unsafe_clone(),
-        slot.dirty.unsafe_clone(),
+        slot.dirty.as_ref().map(|dirty| dirty.unsafe_clone()),
     ))
 }
 
@@ -3389,7 +3394,7 @@ pub fn gen_x87_local_cache_flush_all_runtime(ctx: &mut JitContext) {
         let Some(slot) = ctx.x87_local_cache[i as usize].as_ref() else { continue };
         let bits = slot.bits.unsafe_clone();
         let valid = slot.valid.unsafe_clone();
-        let dirty = slot.dirty.unsafe_clone();
+        let dirty = slot.dirty.as_ref().unwrap().unsafe_clone();
         ctx.builder.get_local(&valid);
         ctx.builder.get_local(&dirty);
         ctx.builder.and_i32();
@@ -3423,11 +3428,11 @@ fn gen_exit_with_fault_if(ctx: &mut JitContext) {
 pub fn gen_x87_local_cache_invalidate_all_runtime(ctx: &mut JitContext) {
     // Invalidate at runtime; keep locals allocated for later refill.
     ctx.x87_cache_kept = true;
-    let valids: Vec<(WasmLocal, WasmLocal)> = ctx
+    let valids: Vec<(WasmLocal, Option<WasmLocal>)> = ctx
         .x87_local_cache
         .iter()
         .filter_map(|slot| slot.as_ref().map(|slot| {
-            (slot.valid.unsafe_clone(), slot.dirty.unsafe_clone())
+            (slot.valid.unsafe_clone(), slot.dirty.as_ref().map(|dirty| dirty.unsafe_clone()))
         }))
         .collect();
     if valids.is_empty() {
@@ -3438,8 +3443,10 @@ pub fn gen_x87_local_cache_invalidate_all_runtime(ctx: &mut JitContext) {
     for (valid, dirty) in valids {
         ctx.builder.const_i32(0);
         ctx.builder.set_local(&valid);
-        ctx.builder.const_i32(0);
-        ctx.builder.set_local(&dirty);
+        if let Some(dirty) = dirty {
+            ctx.builder.const_i32(0);
+            ctx.builder.set_local(&dirty);
+        }
     }
 }
 
@@ -3449,7 +3456,9 @@ pub fn gen_x87_local_cache_free_all(ctx: &mut JitContext) {
         if let Some(slot) = slot.take() {
             ctx.builder.free_local_i64(slot.bits);
             ctx.builder.free_local(slot.valid);
-            ctx.builder.free_local(slot.dirty);
+            if let Some(dirty) = slot.dirty {
+                ctx.builder.free_local(dirty);
+            }
         }
     }
 }
@@ -3470,7 +3479,9 @@ fn gen_x87_local_cache_push(
     if let Some(dropped) = ctx.x87_local_cache[7].take() {
         ctx.builder.free_local_i64(dropped.bits);
         ctx.builder.free_local(dropped.valid);
-        ctx.builder.free_local(dropped.dirty);
+        if let Some(dirty) = dropped.dirty {
+            ctx.builder.free_local(dirty);
+        }
     }
     for i in (1..8).rev() {
         ctx.x87_local_cache[i] = ctx.x87_local_cache[i - 1].take();
@@ -3482,8 +3493,10 @@ fn gen_x87_local_cache_push(
     ctx.builder.const_i32(FPU_RELAXED_TAG);
     ctx.builder.eq_i32();
     ctx.builder.set_local(&valid);
-    ctx.builder.const_i32(0);
-    ctx.builder.set_local(&dirty);
+    if let Some(dirty) = dirty {
+        ctx.builder.const_i32(0);
+        ctx.builder.set_local(&dirty);
+    }
 }
 
 /// Mirror an x87 pop by shifting the logical cache back toward ST(0). The new
@@ -3496,7 +3509,9 @@ fn gen_x87_local_cache_pop(ctx: &mut JitContext) {
     if let Some(dropped) = ctx.x87_local_cache[0].take() {
         ctx.builder.free_local_i64(dropped.bits);
         ctx.builder.free_local(dropped.valid);
-        ctx.builder.free_local(dropped.dirty);
+        if let Some(dirty) = dropped.dirty {
+            ctx.builder.free_local(dirty);
+        }
     }
     for i in 0..7 {
         ctx.x87_local_cache[i] = ctx.x87_local_cache[i + 1].take();
@@ -3534,8 +3549,10 @@ fn gen_fpu_load_relaxed_st_bits(
         ctx.builder.get_local(addr);
         ctx.builder.load_unaligned_i64(0);
         ctx.builder.tee_local_i64(&bits_cache);
-        ctx.builder.const_i32(0);
-        ctx.builder.set_local(&dirty);
+        if let Some(dirty) = dirty {
+            ctx.builder.const_i32(0);
+            ctx.builder.set_local(&dirty);
+        }
         ctx.builder.block_end();
         FpuBitsLocal { local: ctx.builder.set_new_local_i64() }
     }
@@ -3567,14 +3584,17 @@ fn gen_fpu_store_relaxed_f64_st(ctx: &mut JitContext, i: u32, addr: &WasmLocal) 
     // x87 operation is redundant. This matters in old game loops that perform
     // dozens of chained FMUL/FADD operations per source pixel.
 
-    if let Some((bits_cache, valid, dirty)) = gen_x87_local_slot(ctx, i) {
+    if let Some((bits_cache, _valid, dirty)) = gen_x87_local_slot(ctx, i) {
         crate::jit::x87_locals_note_cache_store_compiled();
         ctx.builder.get_local_i64(&bits);
         ctx.builder.set_local_i64(&bits_cache);
-        ctx.builder.const_i32(1);
-        ctx.builder.set_local(&valid);
-        ctx.builder.const_i32(if crate::jit::x87_writeback_enabled() { 1 } else { 0 });
-        ctx.builder.set_local(&dirty);
+        // Every fast caller has just read the destination through the same
+        // cache slot, which made `valid` true. Reasserting it after each x87
+        // arithmetic operation only emits a redundant const/set pair.
+        if let Some(dirty) = dirty {
+            ctx.builder.const_i32(1);
+            ctx.builder.set_local(&dirty);
+        }
     }
 
     if !crate::jit::x87_writeback_enabled() || !x87_local_cache_enabled() {

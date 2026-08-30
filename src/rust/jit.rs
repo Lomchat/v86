@@ -1603,6 +1603,16 @@ pub fn get_dispatch_stats() -> u32 { unsafe { DISPATCH_STATS as u32 } }
 // Keep the stock 200k default until a multi-workload benchmark justifies moving it.
 static mut JIT_THRESHOLD: u32 = 200 * 1000;
 
+/// Divisor applied to JIT_THRESHOLD for a page that ALREADY owns a compiled
+/// module. Such interpretation is a coverage gap, not a cold page: the module
+/// exists and lacks this entry point. 1 disables (identical to the historical
+/// single threshold).
+///
+/// Deliberately not the same knob as JIT_THRESHOLD: lowering that globally was
+/// measured 17-19% slower on a cold boot because it also compiles cold pages,
+/// nearly doubling the module count for identical guest work.
+static mut JIT_RECOMPILE_DIVISOR: u32 = 1;
+
 // less branches will generate if-else, more will generate brtable
 pub const BRTABLE_CUTOFF: usize = 10;
 
@@ -5718,6 +5728,12 @@ pub fn jit_increase_hotness_and_maybe_compile(
     let page = Page::page_of(phys_address);
     let already_deferred = unsafe { JIT_DEFERRED_COMPILE_QUEUE }
         && ctx.deferred_compile_pages.contains(&page);
+    // Interpreting on a page that already owns a module means compiled code
+    // exists here and simply does not cover this entry point. Such a page has
+    // already proven itself hot, and recompiling it only widens an existing
+    // module, so it does not need the full cold-page ramp. Read before the
+    // entry_points borrow below.
+    let page_has_module = unsafe { JIT_RECOMPILE_DIVISOR } > 1 && ctx.pages.contains_key(&page);
     let threshold_reached = {
         let (hotness, entry_points) = ctx.entry_points.entry(page).or_insert_with(|| {
             cpu::tlb_set_has_code(page, true);
@@ -5735,7 +5751,14 @@ pub fn jit_increase_hotness_and_maybe_compile(
             return;
         }
         *hotness = hotness.wrapping_add(heat);
-        *hotness >= unsafe { JIT_THRESHOLD }
+        let threshold = unsafe { JIT_THRESHOLD };
+        let effective = if page_has_module {
+            (threshold / unsafe { JIT_RECOMPILE_DIVISOR }).max(1)
+        }
+        else {
+            threshold
+        };
+        *hotness >= effective
     };
 
     if !threshold_reached {
@@ -6249,6 +6272,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         39 => JIT_X87_WRITEBACK = value != 0,
         40 => JIT_FPU_ORDERED_COMPARE_FIRST = value != 0,
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT = value != 0,
+        42 => JIT_RECOMPILE_DIVISOR = value.clamp(1, 64),
         _ => dbg_assert!(false),
     }
 }
@@ -6298,6 +6322,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         39 => JIT_X87_WRITEBACK as u32,
         40 => JIT_FPU_ORDERED_COMPARE_FIRST as u32,
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT as u32,
+        42 => JIT_RECOMPILE_DIVISOR,
         _ => 0,
     }
 }

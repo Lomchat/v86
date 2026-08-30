@@ -1609,6 +1609,18 @@ pub const BRTABLE_CUTOFF: usize = 10;
 // needs to be synced to const.js
 pub const WASM_TABLE_SIZE: u32 = 900;
 
+/// Count of full JIT cache flushes caused by wasm-table exhaustion.
+static mut JIT_CACHE_FLUSHES: u32 = 0;
+
+#[no_mangle]
+pub fn jit_get_cache_flushes() -> u32 { unsafe { JIT_CACHE_FLUSHES } }
+
+#[no_mangle]
+pub fn jit_reset_cache_flushes() { unsafe { JIT_CACHE_FLUSHES = 0 } }
+
+#[no_mangle]
+pub fn jit_get_wasm_table_size() -> u32 { WASM_TABLE_SIZE }
+
 // Light the invariant checks up in debug builds — the corruption class
 // (silent ExitProcess via #PF on garbage state) needs the free/publish
 // discipline asserted loudly, not assumed.
@@ -3539,6 +3551,11 @@ fn jit_analyze_and_generate(
     }
 
     if ctx.wasm_table_index_free_list.is_empty() {
+        // Always-on: a full flush discards every compiled module and forces the
+        // whole working set back through the interpreter and the hotness ramp.
+        // A cold boot compiles more modules than the table holds, so this fires
+        // during normal play and its rate is not otherwise observable.
+        unsafe { JIT_CACHE_FLUSHES = JIT_CACHE_FLUSHES.wrapping_add(1) };
         dbg_log!("wasm_table_index_free_list empty, clearing cache");
 
         // When no free slots are available, delete all cached modules. We could increase the

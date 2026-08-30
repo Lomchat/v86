@@ -153,6 +153,15 @@ static mut JIT_TIER2_LEAF_RETURN_LOCAL: bool = true;
 // starts at the validated four-instruction bound.
 static mut LEAF_CALL_FUSION_MAX_INSTR: u32 = 4;
 static mut LEAF_CALL_FUSION_SITES_COMPILED: u32 = 0;
+// Tier-2 cross-module tiny-leaf fusion (idx 36). The ordinary graph builder
+// deliberately refuses to absorb a target page whose registered entries are
+// already covered by another compiled module. When a direct E8 nevertheless
+// targets a proven tiny single-block C3 leaf, this optional post-pass copies only
+// that leaf into the caller module. The target code page is registered as a
+// dependency of the caller module, so the normal SMC invalidation path remains
+// authoritative. Kept OFF until cross-workload A/B validates the extra code.
+static mut JIT_TIER2_EXTERNAL_LEAF_CALL_FUSION: bool = false;
+static mut EXTERNAL_LEAF_CALL_FUSION_SITES_COMPILED: u32 = 0;
 
 // B1b: direct-mapped memo in front of the dynamic-chaining tlb_code walk
 // (measured 1.5% self + part of the 7% indirect-jump bucket, NFSU in-race).
@@ -1609,7 +1618,10 @@ struct Tier2Region {
 }
 
 enum CompilingPageState {
-    Compiling { pages: HashMap<Page, PageInfo> },
+    Compiling {
+        pages: HashMap<Page, PageInfo>,
+        dependency_pages: HashSet<Page>,
+    },
     CompilingWritten,
 }
 
@@ -1655,8 +1667,11 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
     }
 
     for state in ctx.compiling.values() {
-        if let CompilingPageState::Compiling { pages } = state {
-            dbg_assert!(pages.keys().all(|page| ctx.entry_points.contains_key(page)));
+        if let CompilingPageState::Compiling { pages, dependency_pages } = state {
+            dbg_assert!(pages
+                .keys()
+                .chain(dependency_pages.iter())
+                .all(|page| ctx.entry_points.contains_key(page)));
         }
     }
 
@@ -1669,8 +1684,11 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
     dbg_assert!(free.len() + used.len() + compiling.len() == (WASM_TABLE_SIZE - 1) as usize);
 
     for state in ctx.compiling.values() {
-        if let CompilingPageState::Compiling { pages } = state {
-            dbg_assert!(pages.keys().all(|page| ctx.entry_points.contains_key(page)));
+        if let CompilingPageState::Compiling { pages, dependency_pages } = state {
+            dbg_assert!(pages
+                .keys()
+                .chain(dependency_pages.iter())
+                .all(|page| ctx.entry_points.contains_key(page)));
         }
     }
 
@@ -1761,6 +1779,10 @@ pub struct BasicBlock {
     /// CFG remains unchanged; emission intercepts its terminal edge, runs this
     /// leaf, then guards the popped EIP before re-entering at the continuation.
     pub inline_leaf: Option<u32>,
+    /// This block was conservatively copied from another already-owned JIT
+    /// page. Its page participates in code invalidation but must not replace
+    /// that page's dispatcher owner when this module finishes compiling.
+    pub external_leaf_dependency: bool,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -2688,6 +2710,7 @@ fn jit_find_basic_blocks(
             number_of_instructions: 0,
             ret_speculation: Vec::new(),
             inline_leaf: None,
+            external_leaf_dependency: false,
         };
         loop {
             let addr_before_instruction = current_address;
@@ -3049,6 +3072,165 @@ fn jit_find_basic_blocks(
         }
     }
 
+    // A hot direct leaf often already owns a standalone JIT module. In that
+    // case follow_jump intentionally blacklists its page instead of growing a
+    // second module into it, so the same-module fusion above cannot see it. For
+    // exact near E8 calls only, conservatively re-analyse a registered target as
+    // one straight-line block and duplicate it when it is a tiny C3 leaf.
+    //
+    // Adding the synthetic block also adds its physical page to the module's
+    // page set below (jit_analyze_and_generate rebuilds that set from every
+    // BasicBlock). A write to either caller or callee code therefore invalidates
+    // the whole generated module through the existing jit_dirty_page machinery.
+    if tier2 && unsafe { JIT_TIER2_EXTERNAL_LEAF_CALL_FUSION } {
+        let mut candidates = Vec::new();
+        let mut fused_external_targets = HashSet::new();
+        for block in basic_blocks.values() {
+            if memory::read8(block.last_instruction_addr) as u8 != 0xE8
+                || !basic_blocks.contains_key(&block.end_addr)
+            {
+                continue;
+            }
+            let (jump_offset, jump_offset_is_32, missing_target) = match block.ty {
+                BasicBlockType::Normal {
+                    next_block_addr,
+                    jump_offset,
+                    jump_offset_is_32,
+                } => (jump_offset, jump_offset_is_32, next_block_addr.is_none()),
+                _ => continue,
+            };
+            if !jump_offset_is_32 || !missing_target {
+                continue;
+            }
+            let return_virt = block
+                .virt_addr
+                .wrapping_add(block.end_addr.wrapping_sub(block.addr) as i32);
+            let target_virt = return_virt.wrapping_add(jump_offset);
+            candidates.push((block.addr, target_virt));
+        }
+
+        for (call_addr, target_virt) in candidates {
+            let target = match cpu::translate_address_read_no_side_effects(target_virt) {
+                Ok(target) => target,
+                Err(()) => continue,
+            };
+            let target_page = Page::page_of(target);
+            // The structured graph contains one node per physical block. Emitting
+            // the same synthetic node inline at multiple call sites can make a
+            // later copy share the first site's structural placement. Keep one
+            // external copy per target and module; other calls retain the exact
+            // ordinary dispatcher path.
+            if !fused_external_targets.insert(target) {
+                continue;
+            }
+
+            // The target must be a known exact entry point. This distinguishes
+            // the intended "already compiled elsewhere" case from decoding an
+            // arbitrary address supplied by stale or self-modified call bytes.
+            let registered = ctx.pages.get(&target_page).map_or(false, |info| {
+                info.entry_points
+                    .iter()
+                    .any(|&(offset, _)| offset == target as u16 & 0xFFF)
+            });
+            if !registered
+                || is_near_end_of_page(target)
+                || region_target_excluded(target_virt as u32)
+                || tier2_region.map_or(false, |region| !region.pages.contains(&target_page))
+                || (!pages.contains(&target_page) && pages.len() as u32 >= max_pages)
+            {
+                continue;
+            }
+
+            let leaf = if let Some(existing) = basic_blocks.get(&target) {
+                if existing.number_of_instructions > unsafe { LEAF_CALL_FUSION_MAX_INSTR }
+                    || existing.has_sti
+                    || existing.ty != BasicBlockType::AbsoluteEip
+                    || memory::read8(existing.last_instruction_addr) as u8 != 0xC3
+                {
+                    continue;
+                }
+                None
+            }
+            else {
+                let mut current_address = target;
+                let mut leaf = BasicBlock {
+                    addr: target,
+                    virt_addr: target_virt,
+                    last_instruction_addr: 0,
+                    end_addr: 0,
+                    ty: BasicBlockType::Exit,
+                    is_entry_block: false,
+                    has_sti: false,
+                    number_of_instructions: 0,
+                    ret_speculation: Vec::new(),
+                    inline_leaf: None,
+                    external_leaf_dependency: true,
+                };
+                let mut valid = false;
+                for _ in 0..unsafe { LEAF_CALL_FUSION_MAX_INSTR } {
+                    let instruction_addr = current_address;
+                    let mut leaf_cpu = CpuContext {
+                        eip: current_address,
+                        ..cpu
+                    };
+                    let analysis = analysis::analyze_step(&mut leaf_cpu);
+                    current_address = leaf_cpu.eip;
+                    if Page::page_of(instruction_addr) != target_page
+                        || Page::page_of(current_address) != target_page
+                    {
+                        break;
+                    }
+                    leaf.number_of_instructions += 1;
+                    leaf.last_instruction_addr = instruction_addr;
+                    leaf.end_addr = current_address;
+                    match analysis.ty {
+                        AnalysisType::Normal
+                            if !analysis.no_next_instruction && !analysis.absolute_jump => {},
+                        AnalysisType::BlockBoundary
+                            if analysis.absolute_jump
+                                && memory::read8(instruction_addr) as u8 == 0xC3 =>
+                        {
+                            leaf.ty = BasicBlockType::AbsoluteEip;
+                            valid = true;
+                            break;
+                        },
+                        _ => break,
+                    }
+                }
+                if !valid {
+                    continue;
+                }
+
+                // Reject a target inside any block already decoded for this
+                // module. Exact reuse at `target` was handled above; all other
+                // overlap would make the CFG ambiguous.
+                if basic_blocks.values().any(|block| {
+                    leaf.addr < block.end_addr && block.addr < leaf.end_addr
+                }) {
+                    continue;
+                }
+                Some(leaf)
+            };
+
+            if let Some(leaf) = leaf {
+                basic_blocks.insert(target, leaf);
+                pages.insert(target_page);
+            }
+            if let Some(block) = basic_blocks.get_mut(&call_addr) {
+                if let BasicBlockType::Normal { next_block_addr, .. } = &mut block.ty {
+                    *next_block_addr = Some(target);
+                    block.inline_leaf = Some(target);
+                    unsafe {
+                        LEAF_CALL_FUSION_SITES_COMPILED =
+                            LEAF_CALL_FUSION_SITES_COMPILED.wrapping_add(1);
+                        EXTERNAL_LEAF_CALL_FUSION_SITES_COMPILED =
+                            EXTERNAL_LEAF_CALL_FUSION_SITES_COMPILED.wrapping_add(1);
+                    }
+                }
+            }
+        }
+    }
+
     // RET-target speculation post-pass. For every module-local
     // call site (a Normal block whose jump target isn't its fall-through AND whose
     // fall-through was registered as an entry — the CALL discovery shape at the
@@ -3275,12 +3457,24 @@ fn jit_analyze_and_generate(
         jit_find_basic_blocks(ctx, entry_points, cpu.clone(), tier2_region.as_ref());
 
     let mut pages = HashSet::new();
+    let mut owned_pages = HashSet::new();
+    let mut dependency_pages = HashSet::new();
 
     for b in basic_blocks.iter() {
         // Remove this assertion once page-crossing jit is enabled
         dbg_assert!(Page::page_of(b.addr) == Page::page_of(b.end_addr));
-        pages.insert(Page::page_of(b.addr));
+        let page = Page::page_of(b.addr);
+        pages.insert(page);
+        if b.external_leaf_dependency {
+            dependency_pages.insert(page);
+        }
+        else {
+            owned_pages.insert(page);
+        }
     }
+    // A page reached through ordinary CFG analysis remains owned even if the
+    // same module also copied an external leaf from it.
+    dependency_pages.retain(|page| !owned_pages.contains(page));
 
     let print = false;
 
@@ -3435,7 +3629,7 @@ fn jit_analyze_and_generate(
     // while non-entry blocks from the page remain. Register the rest with an empty
     // entry list — set_tlb_code leaves their state_table all-miss (u16::MAX), so the
     // only effect is that free_wasm_module's page sweep covers them.
-    for &p in &pages {
+    for &p in &owned_pages {
         page_info.entry(p).or_insert_with(|| PageInfo {
             wasm_table_index,
             state_flags,
@@ -3461,7 +3655,10 @@ fn jit_analyze_and_generate(
     dbg_assert!(!ctx.compiling.contains_key(&wasm_table_index));
     ctx.compiling.insert(
         wasm_table_index,
-        CompilingPageState::Compiling { pages: page_info },
+        CompilingPageState::Compiling {
+            pages: page_info,
+            dependency_pages,
+        },
     );
     unsafe {
         JIT_COMPILE_STARTED = JIT_COMPILE_STARTED.wrapping_add(1);
@@ -3504,7 +3701,7 @@ pub fn codegen_finalize_finished(
         JIT_COMPILE_TOTAL_US = JIT_COMPILE_TOTAL_US.wrapping_add(compile_us as u64);
         JIT_COMPILE_MAX_US = JIT_COMPILE_MAX_US.max(compile_us);
     }
-    let pages = match ctx.compiling.remove(&wasm_table_index) {
+    let (pages, dependency_pages) = match ctx.compiling.remove(&wasm_table_index) {
         None => {
             dbg_assert!(false);
             return;
@@ -3515,11 +3712,22 @@ pub fn codegen_finalize_finished(
             check_jit_state_invariants(&mut ctx);
             return;
         },
-        Some(CompilingPageState::Compiling { pages }) => {
+        Some(CompilingPageState::Compiling { pages, dependency_pages }) => {
             dbg_assert!(!pages.is_empty());
-            pages
+            (pages, dependency_pages)
         },
     };
+
+    // A dependency owner can disappear while WebAssembly compilation is in
+    // flight (for example because that page itself was promoted). The bytes are
+    // not safely attributable to a live owner anymore, so discard this module
+    // and let ordinary hotness compile a fresh candidate later.
+    if dependency_pages.iter().any(|page| !ctx.pages.contains_key(page)) {
+        profiler::stat_increment(stat::INVALIDATE_MODULE_WRITTEN_WHILE_COMPILED);
+        free_wasm_table_index(&mut ctx, wasm_table_index);
+        check_jit_state_invariants(&mut ctx);
+        return;
+    }
 
     for i in 0..unsafe { cpu::valid_tlb_entries_count } {
         let page = unsafe { cpu::valid_tlb_entries[i as usize] };
@@ -3550,6 +3758,22 @@ pub fn codegen_finalize_finished(
             check_for_unused_wasm_table_index.insert(old_entry.wasm_table_index);
         }
         ctx.pages.insert(page, info);
+    }
+
+    // External copied leaves do not take ownership of their source page. Attach
+    // this module to the existing owner's hidden list instead: dirtying the
+    // source page then frees both the owner and every dependent module, while
+    // ordinary dispatch into any other entry on that page remains unchanged.
+    for page in dependency_pages {
+        let owner = ctx
+            .pages
+            .get_mut(&page)
+            .expect("external leaf dependency must retain a page owner");
+        if owner.wasm_table_index != wasm_table_index
+            && !owner.hidden_wasm_table_indices.contains(&wasm_table_index)
+        {
+            owner.hidden_wasm_table_indices.push(wasm_table_index);
+        }
     }
 
     let unused: Vec<&WasmTableIndex> = check_for_unused_wasm_table_index
@@ -5325,7 +5549,9 @@ pub fn jit_increase_hotness_and_maybe_compile(
     let mut ctx = get_jit_state();
     let page = Page::page_of(phys_address);
     let page_is_compiling = ctx.compiling.values().any(|state| match state {
-        CompilingPageState::Compiling { pages } => pages.contains_key(&page),
+        CompilingPageState::Compiling { pages, dependency_pages } => {
+            pages.contains_key(&page) || dependency_pages.contains(&page)
+        },
         CompilingPageState::CompilingWritten => false,
     });
     let compile_cap_reached =
@@ -5542,7 +5768,9 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
 
             for state in ctx.compiling.values_mut() {
                 let touches_page = match state {
-                    CompilingPageState::Compiling { pages } => pages.contains_key(&page),
+                    CompilingPageState::Compiling { pages, dependency_pages } => {
+                        pages.contains_key(&page) || dependency_pages.contains(&page)
+                    },
                     CompilingPageState::CompilingWritten => false,
                 };
                 if touches_page {
@@ -5553,8 +5781,9 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     }
 
     for state in ctx.compiling.values() {
-        if let CompilingPageState::Compiling { pages } = state {
+        if let CompilingPageState::Compiling { pages, dependency_pages } = state {
             dbg_assert!(!pages.contains_key(&page));
+            dbg_assert!(!dependency_pages.contains(&page));
         }
     }
 
@@ -5814,6 +6043,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY = value != 0,
         34 => JIT_EXACT_PAGE_TAIL = value != 0,
         35 => JIT_REP_MOVS_REDUCED_SPILL = value != 0,
+        36 => JIT_TIER2_EXTERNAL_LEAF_CALL_FUSION = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -5857,6 +6087,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY as u32,
         34 => JIT_EXACT_PAGE_TAIL as u32,
         35 => JIT_REP_MOVS_REDUCED_SPILL as u32,
+        36 => JIT_TIER2_EXTERNAL_LEAF_CALL_FUSION as u32,
         _ => 0,
     }
 }
@@ -5864,6 +6095,11 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
 #[no_mangle]
 pub fn jit_leaf_call_fusion_sites_compiled() -> u32 {
     unsafe { LEAF_CALL_FUSION_SITES_COMPILED }
+}
+
+#[no_mangle]
+pub fn jit_external_leaf_call_fusion_sites_compiled() -> u32 {
+    unsafe { EXTERNAL_LEAF_CALL_FUSION_SITES_COMPILED }
 }
 
 #[no_mangle]

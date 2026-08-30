@@ -436,6 +436,22 @@ static mut DXT_CACHE_BYPASSES: u32 = 0;
 static mut DXT_FAST_ENABLED: bool = false;
 static mut DXT_FAST_ENCODES: u32 = 0;
 
+// Shadow comparison. The approximate encoder was rejected on the grounds that
+// its bytes differ from the title's, but "differs" is not a quality argument:
+// this output is texture data, never simulation state, so the decision needs the
+// magnitude of the pixel difference on real blocks. Phase 1 already carries both
+// the source block and the authoritative eight bytes, so measuring costs nothing
+// extra beyond one approximate encode, and nothing at all while disarmed.
+static mut DXT_SHADOW_ENABLED: bool = false;
+static mut DXT_SHADOW_BLOCKS: u32 = 0;
+static mut DXT_SHADOW_EXACT: u32 = 0;
+static mut DXT_SHADOW_WORST_CHANNEL: u32 = 0;
+static mut DXT_SHADOW_BLOCKS_OVER_4: u32 = 0;
+static mut DXT_SHADOW_BLOCKS_OVER_16: u32 = 0;
+static mut DXT_SHADOW_ALPHA_MISMATCH: u32 = 0;
+static mut DXT_SHADOW_SUM_ABS: f64 = 0.0;
+static mut DXT_SHADOW_SAMPLES: f64 = 0.0;
+
 #[inline(always)]
 fn dxt_clamp01(value: f32) -> f32 {
     if !value.is_finite() || value <= 0.0 { 0.0 }
@@ -659,6 +675,7 @@ unsafe fn handle_dxt_encode_cache() -> bool {
     if phase == 1 {
         let out0 = match safe_read32s(output) { Ok(v) => v as u32, Err(_) => return false };
         let out1 = match safe_read32s(output.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return false };
+        if DXT_SHADOW_ENABLED { dxt_shadow_compare(&words, mode, [out0, out1]); }
         let mut slot = set_base;
         let mut found_empty = false;
         for way in 0..DXT_CACHE_WAYS {
@@ -714,6 +731,94 @@ pub unsafe fn bfme_dxt_cache_get_stat(index: u32) -> u32 {
         5 => DXT_FAST_ENCODES,
         _ => 0,
     }
+}
+
+/// Decode a BC1 block the way a GPU does: c0 > c1 selects the four-colour
+/// layout, otherwise the three-colour layout whose fourth index is transparent.
+/// Returns the 16 texel colours plus a per-texel transparency mask.
+fn bc1_decode_block(block: [u32; 2]) -> ([[f32; 3]; 16], u16) {
+    let c0 = (block[0] & 0xffff) as u16;
+    let c1 = ((block[0] >> 16) & 0xffff) as u16;
+    let three_colour = c0 <= c1;
+    let palette = dxt_palette(c0, c1, three_colour);
+    let mut texels = [[0.0f32; 3]; 16];
+    let mut transparent = 0u16;
+    for i in 0..16 {
+        let selector = ((block[1] >> (i * 2)) & 3) as usize;
+        if three_colour && selector == 3 {
+            transparent |= 1 << i;
+        } else {
+            texels[i] = palette[selector];
+        }
+    }
+    (texels, transparent)
+}
+
+/// Compare the approximate encoder against the title's authoritative output for
+/// one block, in 8-bit channel units so the result is directly interpretable.
+unsafe fn dxt_shadow_compare(words: &[u32; DXT_SOURCE_WORDS], mode: i32, authoritative: [u32; 2]) {
+    let candidate = dxt_fast_encode(words, mode);
+    DXT_SHADOW_BLOCKS = DXT_SHADOW_BLOCKS.wrapping_add(1);
+    if candidate == authoritative {
+        DXT_SHADOW_EXACT = DXT_SHADOW_EXACT.wrapping_add(1);
+        DXT_SHADOW_SAMPLES += 48.0;
+        return;
+    }
+
+    let (want, want_mask) = bc1_decode_block(authoritative);
+    let (got, got_mask) = bc1_decode_block(candidate);
+    if want_mask != got_mask {
+        DXT_SHADOW_ALPHA_MISMATCH = DXT_SHADOW_ALPHA_MISMATCH.wrapping_add(1);
+    }
+    let mut block_worst = 0u32;
+    for i in 0..16 {
+        // A texel transparent on both sides carries no colour to compare.
+        if (want_mask >> i) & 1 == 1 && (got_mask >> i) & 1 == 1 { continue; }
+        for lane in 0..3 {
+            let delta = ((want[i][lane] - got[i][lane]).abs() * 255.0 + 0.5) as u32;
+            if delta > block_worst { block_worst = delta; }
+            DXT_SHADOW_SUM_ABS += delta as f64;
+            DXT_SHADOW_SAMPLES += 1.0;
+        }
+    }
+    if block_worst > DXT_SHADOW_WORST_CHANNEL { DXT_SHADOW_WORST_CHANNEL = block_worst; }
+    if block_worst > 4 { DXT_SHADOW_BLOCKS_OVER_4 = DXT_SHADOW_BLOCKS_OVER_4.wrapping_add(1); }
+    if block_worst > 16 { DXT_SHADOW_BLOCKS_OVER_16 = DXT_SHADOW_BLOCKS_OVER_16.wrapping_add(1); }
+}
+
+#[no_mangle]
+pub unsafe fn bfme_dxt_shadow_set_enabled(enabled: u32) {
+    DXT_SHADOW_ENABLED = enabled != 0;
+}
+
+#[no_mangle]
+pub unsafe fn bfme_dxt_shadow_get_enabled() -> u32 { DXT_SHADOW_ENABLED as u32 }
+
+#[no_mangle]
+pub unsafe fn bfme_dxt_shadow_get_stat(index: u32) -> f64 {
+    match index {
+        0 => DXT_SHADOW_BLOCKS as f64,
+        1 => DXT_SHADOW_EXACT as f64,
+        2 => DXT_SHADOW_WORST_CHANNEL as f64,
+        3 => DXT_SHADOW_BLOCKS_OVER_4 as f64,
+        4 => DXT_SHADOW_BLOCKS_OVER_16 as f64,
+        5 => DXT_SHADOW_ALPHA_MISMATCH as f64,
+        6 => DXT_SHADOW_SUM_ABS,
+        7 => DXT_SHADOW_SAMPLES,
+        _ => 0.0,
+    }
+}
+
+#[no_mangle]
+pub unsafe fn bfme_dxt_shadow_reset_stats() {
+    DXT_SHADOW_BLOCKS = 0;
+    DXT_SHADOW_EXACT = 0;
+    DXT_SHADOW_WORST_CHANNEL = 0;
+    DXT_SHADOW_BLOCKS_OVER_4 = 0;
+    DXT_SHADOW_BLOCKS_OVER_16 = 0;
+    DXT_SHADOW_ALPHA_MISMATCH = 0;
+    DXT_SHADOW_SUM_ABS = 0.0;
+    DXT_SHADOW_SAMPLES = 0.0;
 }
 
 #[no_mangle]

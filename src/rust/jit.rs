@@ -104,6 +104,13 @@ static mut JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY: bool = true;
 // Third and fourth targets are nested behind misses of the first two ways
 // (idx 33). Like way two, they never add work to a primary generated hit.
 static mut JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY: bool = true;
+// Compile every instruction that is wholly contained in the current physical
+// page instead of conservatively abandoning the final MAX_INSTRUCTION_LENGTH
+// bytes. Instructions that actually cross the page still stay interpreted: the
+// analyser discards them before they enter the block. Runtime-tunable for an A/B
+// with set_jit_config(34) + JIT cache clear.
+static mut JIT_EXACT_PAGE_TAIL: bool = false;
+static mut JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED: u32 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS: u64 = 0;
@@ -2682,6 +2689,19 @@ fn jit_find_basic_blocks(
             let has_next_instruction = !analysis.no_next_instruction;
             current_address = cpu.eip;
 
+            // The decoder may inspect the physically adjacent bytes, but a JIT
+            // block must never contain an instruction whose bytes cross the
+            // current guest page: the next virtual page can map elsewhere. In
+            // exact-tail mode, discard only that actual crossing instruction.
+            // Older code stopped up to 16 bytes early, leaving several complete
+            // instructions to the interpreter on every pass through a hot tail.
+            if unsafe { JIT_EXACT_PAGE_TAIL }
+                && Page::page_of(current_address) != Page::page_of(addr_before_instruction)
+            {
+                profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                break;
+            }
+
             dbg_assert!(Page::page_of(current_address) == Page::page_of(addr_before_instruction));
             let current_virt_addr = to_visit & !0xFFF | current_address as i32 & 0xFFF;
 
@@ -2694,6 +2714,12 @@ fn jit_find_basic_blocks(
             current_block.number_of_instructions += 1;
             current_block.last_instruction_addr = addr_before_instruction;
             current_block.end_addr = current_address;
+            if unsafe { JIT_EXACT_PAGE_TAIL } && is_near_end_of_page(current_address) {
+                unsafe {
+                    JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED =
+                        JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED.saturating_add(1);
+                }
+            }
 
             match analysis.ty {
                 AnalysisType::Normal | AnalysisType::STI => {
@@ -2901,7 +2927,7 @@ fn jit_find_basic_blocks(
                 },
             }
 
-            if is_near_end_of_page(current_address) {
+            if !unsafe { JIT_EXACT_PAGE_TAIL } && is_near_end_of_page(current_address) {
                 profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
                 break;
             }
@@ -5205,7 +5231,10 @@ fn jit_generate_basic_block(
             break;
         }
 
-        if was_block_boundary || is_near_end_of_page(end_addr) || end_addr > stop_addr {
+        if was_block_boundary
+            || (!unsafe { JIT_EXACT_PAGE_TAIL } && is_near_end_of_page(end_addr))
+            || end_addr > stop_addr
+        {
             dbg_log!(
                 "Overlapping basic blocks start={:x} expected_end={:x} end={:x} was_block_boundary={} near_end_of_page={}",
                 start_addr,
@@ -5725,6 +5754,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         31 => JIT_DYNAMIC_CHAIN_SITE_PIC_DIAG = value != 0,
         32 => JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY = value != 0,
         33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY = value != 0,
+        34 => JIT_EXACT_PAGE_TAIL = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -5766,6 +5796,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         31 => JIT_DYNAMIC_CHAIN_SITE_PIC_DIAG as u32,
         32 => JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY as u32,
         33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY as u32,
+        34 => JIT_EXACT_PAGE_TAIL as u32,
         _ => 0,
     }
 }
@@ -5773,6 +5804,11 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
 #[no_mangle]
 pub fn jit_leaf_call_fusion_sites_compiled() -> u32 {
     unsafe { LEAF_CALL_FUSION_SITES_COMPILED }
+}
+
+#[no_mangle]
+pub fn jit_exact_page_tail_instructions_compiled() -> u32 {
+    unsafe { JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED }
 }
 
 #[no_mangle]

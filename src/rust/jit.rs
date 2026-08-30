@@ -116,6 +116,10 @@ static mut JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED: u32 = 0;
 // Both physical pages become invalidation dependencies (config 38).
 static mut JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS: bool = true;
 static mut JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS_COMPILED: u32 = 0;
+// Keep relaxed-x87 results in block-scoped wasm locals and materialise them at
+// architectural boundaries instead of writing fpu_st after every arithmetic
+// instruction (config 39). Experimental until differential and game A/B pass.
+static mut JIT_X87_WRITEBACK: bool = false;
 // REP MOVS bridge with reduced register spilling and completed-copy direct
 // continuation (idx 35). The generated call
 // passes ESI/EDI/ECX directly to a JIT-aware wasm helper and reloads only those
@@ -1920,6 +1924,7 @@ pub struct JitContext<'a> {
 pub struct X87LocalCacheSlot {
     pub bits: WasmLocalI64,
     pub valid: WasmLocal,
+    pub dirty: WasmLocal,
 }
 
 pub struct Push32WriteCache {
@@ -5324,6 +5329,53 @@ fn opcode_is_x87(eip: u32) -> bool {
     false
 }
 
+/// True only for x87 encodings whose JIT wrappers explicitly preserve the
+/// relaxed ST-local cache.  Everything else is flushed before execution when
+/// deferred writeback is enabled.  Keeping this list deliberately small makes
+/// unknown/rare x87 helpers correct by construction while retaining the hot
+/// compiler-generated arithmetic chains.
+fn opcode_can_keep_x87_writeback(eip: u32) -> bool {
+    let opcode = read_jit_u8(eip);
+    // Prefixes are uncommon in the measured hot loops. Conservatively force a
+    // flush until their exact operand/address-size variants are covered.
+    if !(0xD8..=0xDF).contains(&opcode) {
+        return false;
+    }
+    let modrm = read_jit_u8(eip.wrapping_add(1));
+    let mod_bits = modrm >> 6;
+    let reg = modrm >> 3 & 7;
+    let rm = modrm & 7;
+    match opcode {
+        // All D8 arithmetic/compare forms use relaxed cache-aware wrappers.
+        0xD8 => true,
+        // FLD/FST/FSTP m32 and the cache-aware register forms.
+        0xD9 => {
+            (mod_bits != 3 && matches!(reg, 0 | 2 | 3))
+                || (mod_bits == 3 && matches!(reg, 0 | 1 | 3))
+                || (mod_bits == 3 && reg == 2 && rm == 0)
+                || (mod_bits == 3 && reg == 4 && rm <= 1)
+                || (mod_bits == 3 && reg == 5 && rm <= 6)
+        },
+        // Integer arithmetic/compare memory forms and FUCOMPP.
+        0xDA => mod_bits != 3 || (reg == 5 && rm == 1),
+        // FILD/FIST m32 and F(U)COMI register forms.
+        0xDB => (mod_bits != 3 && matches!(reg, 0 | 1 | 2 | 3))
+            || (mod_bits == 3 && matches!(reg, 5 | 6)),
+        // All DC arithmetic/compare forms use the same wrappers as D8.
+        0xDC => true,
+        // FLD/FST/FSTP m64, FXCH/FST(P) and FUCOMP register forms.
+        0xDD => (mod_bits != 3 && matches!(reg, 0 | 2 | 3))
+            || (mod_bits == 3 && matches!(reg, 1 | 2 | 3 | 5)),
+        // Integer memory arithmetic and register arithmetic/compare forms.
+        0xDE => true,
+        // FIST m16 plus the cache-aware register forms.
+        0xDF => (mod_bits != 3 && matches!(reg, 1 | 2 | 3))
+            || (mod_bits == 3 && matches!(reg, 1 | 2 | 3 | 5 | 6))
+            || (mod_bits == 3 && reg == 4 && rm == 0),
+        _ => false,
+    }
+}
+
 /// True if the instruction at `eip` MAY be an MMX op (0F-escape into the MMX opcode
 /// ranges, incl. EMMS 0F 77), after prefixes. MMX registers alias fpu_st storage
 /// (get_reg_mmx_offset), so these mutate st memory behind the x87 local cache exactly
@@ -5472,15 +5524,26 @@ fn jit_generate_basic_block(
                 stop_addr,
             );
         }
+        // Unknown x87 helpers and all MMX instructions access the architectural
+        // fpu_st array directly. Make deferred values visible before they run;
+        // the existing post-instruction invalidation then discards stale locals.
+        let x87_writeback_barrier = x87_writeback_enabled()
+            && ctx.x87_local_cache.iter().any(|s| s.is_some())
+            && ((opcode_is_x87(start_eip) && !opcode_can_keep_x87_writeback(start_eip))
+                || opcode_is_mmx(start_eip));
+        if x87_writeback_barrier {
+            codegen::gen_x87_local_cache_flush_all_runtime(ctx);
+        }
         let mut instruction_flags = 0;
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;
 
         // Raw x87 helpers mutate TOP/st memory behind the local cache; MMX ops
         // (incl. EMMS) alias the same fpu_st storage and must invalidate too.
-        if !ctx.x87_cache_kept
-            && ctx.x87_local_cache.iter().any(|s| s.is_some())
-            && (opcode_is_x87(start_eip) || opcode_is_mmx(start_eip))
+        if ctx.x87_local_cache.iter().any(|s| s.is_some())
+            && (x87_writeback_barrier
+                || (!ctx.x87_cache_kept
+                    && (opcode_is_x87(start_eip) || opcode_is_mmx(start_eip))))
         {
             codegen::gen_x87_local_cache_invalidate_all_runtime(ctx);
         }
@@ -6073,6 +6136,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         36 => JIT_SYNC_BOUNDARY_CONTINUATION = value != 0,
         37 => JIT_DEFERRED_COMPILE_QUEUE = value != 0,
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS = value != 0,
+        39 => JIT_X87_WRITEBACK = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -6119,6 +6183,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         36 => JIT_SYNC_BOUNDARY_CONTINUATION as u32,
         37 => JIT_DEFERRED_COMPILE_QUEUE as u32,
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS as u32,
+        39 => JIT_X87_WRITEBACK as u32,
         _ => 0,
     }
 }
@@ -6136,6 +6201,10 @@ pub fn jit_exact_page_tail_instructions_compiled() -> u32 {
 #[no_mangle]
 pub fn jit_contiguous_cross_page_instructions_compiled() -> u32 {
     unsafe { JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS_COMPILED }
+}
+
+pub fn x87_writeback_enabled() -> bool {
+    unsafe { JIT_X87_WRITEBACK }
 }
 
 #[no_mangle]

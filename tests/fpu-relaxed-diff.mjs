@@ -20,7 +20,7 @@ const { V86 } = await import("../build/libv86.mjs");
 
 const BASE = 0x100000, ENTRY_OFF = 0x40;
 const DATA = BASE + 0x3000;
-const N = 400000;                 // > JIT_THRESHOLD(200k) so the loop compiles naturally
+const N = Number(process.env.FPU_N ?? 400000); // > JIT_THRESHOLD(200k) by default
 const MEM_SIZE = 16 * 1024 * 1024;
 const TIMEOUT_MS = 30000;
 
@@ -482,7 +482,7 @@ function build_image(bodyName)
     return buf;
 }
 
-function run(bodyName, { jit, relaxed, x87Locals = false })
+function run(bodyName, { jit, relaxed, x87Locals = false, x87Writeback = false })
 {
     return new Promise((resolve) => {
         const startedAt = performance.now();
@@ -520,6 +520,10 @@ function run(bodyName, { jit, relaxed, x87Locals = false })
             // read-through local cache. The central invalidation in jit.rs must keep
             // it coherent across helper-path x87 ops (fld m80 / fild / fsqrt / etc.).
             cpu.wm?.exports?.set_jit_config?.(10, (jit && relaxed && x87Locals) ? 1 : 0);
+            // Config 39 keeps relaxed f64 results in block-scoped locals and
+            // materialises them at exits, faults and raw x87/MMX boundaries.
+            cpu.wm?.exports?.set_jit_config?.(39,
+                (jit && relaxed && x87Locals && x87Writeback) ? 1 : 0);
             cpu.wm?.exports?.profiler_init?.();
             timer = setTimeout(() => { if(!halted) finish("HANG"); }, TIMEOUT_MS);
             emulator.run();
@@ -529,10 +533,14 @@ function run(bodyName, { jit, relaxed, x87Locals = false })
 
 const fmt = (r) => `${r.status} acc=${r.ebx.toString(16).padStart(8,"0")}:${r.eax.toString(16).padStart(8,"0")} last=${r.ecx.toString(16).padStart(8,"0")} n=${r.edx} hit=${r.hit} fallback=${r.fallback}`;
 
-const variants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_sti", "m80_mem", "m80_pop", "m80_nopop", "tag_pop", "full", "fxch_sticky", "fcom_sticky", "consts_sign", "fist_round", "fist_round_neg", "fcomi_flags",
+const allVariants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_sti", "m80_mem", "m80_pop", "m80_nopop", "tag_pop", "full", "fxch_sticky", "fcom_sticky", "consts_sign", "fist_round", "fist_round_neg", "fcomi_flags",
     // newly-covered families (previously untested, where Bug #2 is hypothesised to live)
     "fcom_mem", "fst_reg", "fild_widths", "fist16_round", "consts_all", "fcomi_more", "tl_mix",
     "fnstsw_top", "fiarith32", "fiarith16"];
+const requestedVariants = process.env.FPU_VARIANTS?.split(",").filter(Boolean);
+const variants = requestedVariants?.length
+    ? allVariants.filter(v => requestedVariants.includes(v))
+    : allVariants;
 // FCOM/FXCH between two relaxed values must not fall back to the helper (that re-poisons
 // the slot). Only meaningful in relaxed(1).
 const stickyVariants = ["fxch_sticky", "fcom_sticky"];
@@ -580,6 +588,25 @@ for(const v of variants) {
         console.log(`${"".padEnd(14)}       non-halt (hang/crash): interp=${oracle.status}@${oracle.eip.toString(16)} jit=${suspect.status}@${suspect.eip.toString(16)}`);
     }
 }
+
+// Phase 3 validates deferred architectural writeback against the same helper-
+// based interpreter oracle. The broad variant set deliberately crosses raw
+// x87 helpers, TOP shifts, stores, comparisons and control-word changes.
+console.log(`\n===== x87-writeback(1) [jit+relaxed+x87-locals] =====`);
+for(const v of variants) {
+    const oracle  = await run(v, { jit:false, relaxed:true });
+    const suspect = await run(v, { jit:true, relaxed:true, x87Locals:true, x87Writeback:true });
+    const bothHalted = oracle.status === "halt" && suspect.status === "halt";
+    const same = bothHalted
+              && oracle.eax === suspect.eax && oracle.ebx === suspect.ebx
+              && oracle.ecx === suspect.ecx && oracle.edx === suspect.edx;
+    if(!same) anyDiverged = true;
+    console.log(`${v.padEnd(14)} interp: ${fmt(oracle)}`);
+    console.log(`${"".padEnd(14)} x87-wb: ${fmt(suspect)}  ${same ? "OK" : "<<< DIVERGED"}`);
+    if(!bothHalted) {
+        console.log(`${"".padEnd(14)}       non-halt (hang/crash): interp=${oracle.status}@${oracle.eip.toString(16)} jit=${suspect.status}@${suspect.eip.toString(16)}`);
+    }
+}
 console.log(anyDiverged ? "\nVERDICT: inline fast path DIVERGES from helpers" : "\nVERDICT: all variants match");
 
 // Optional local performance probe. Each sample includes identical emulator
@@ -600,6 +627,26 @@ if(!anyDiverged && process.env.FPU_PERF === "1") {
         const offMs = median(off), onMs = median(on);
         console.log(`${v.padEnd(14)} off=${offMs.toFixed(1)}ms on=${onMs.toFixed(1)}ms ` +
                     `delta=${((onMs / offMs - 1) * 100).toFixed(1)}%`);
+    }
+}
+if(!anyDiverged && process.env.FPU_WRITEBACK_PERF === "1") {
+    const perfVariants = ["d8mem", "reg", "pfx", "full", "tl_mix"].filter(v => variants.includes(v));
+    console.log("\n===== x87 deferred-writeback performance (lower is better) =====");
+    for(const v of perfVariants) {
+        const through = [], deferred = [];
+        for(let i = 0; i < 7; i++) {
+            const firstDeferred = (i & 1) !== 0;
+            const first = await run(v, { jit:true, relaxed:true, x87Locals:true,
+                                         x87Writeback:firstDeferred });
+            const second = await run(v, { jit:true, relaxed:true, x87Locals:true,
+                                          x87Writeback:!firstDeferred });
+            (firstDeferred ? deferred : through).push(first.elapsedMs);
+            (firstDeferred ? through : deferred).push(second.elapsedMs);
+        }
+        const median = values => [...values].sort((a, b) => a - b)[values.length >> 1];
+        const throughMs = median(through), deferredMs = median(deferred);
+        console.log(`${v.padEnd(14)} through=${throughMs.toFixed(1)}ms deferred=${deferredMs.toFixed(1)}ms ` +
+                    `delta=${((deferredMs / throughMs - 1) * 100).toFixed(1)}%`);
     }
 }
 process.exit(anyDiverged ? 1 : 0);

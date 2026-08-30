@@ -3740,12 +3740,42 @@ fn gen_fpu_compare_flags(
     less_flags: i32,
     equal_flags: i32,
 ) -> WasmLocal {
-    gen_f64_is_nan(ctx, x_bits);
-    gen_f64_is_nan(ctx, y_bits);
-    ctx.builder.or_i32();
-    ctx.builder.if_i32();
-    ctx.builder.const_i32(unordered_flags);
-    ctx.builder.else_();
+    if !crate::jit::fpu_ordered_compare_first_enabled() {
+        gen_f64_is_nan(ctx, x_bits);
+        gen_f64_is_nan(ctx, y_bits);
+        ctx.builder.or_i32();
+        ctx.builder.if_i32();
+        ctx.builder.const_i32(unordered_flags);
+        ctx.builder.else_();
+        ctx.builder.get_local_i64(x_bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.get_local_i64(y_bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.lt_f64();
+        ctx.builder.if_i32();
+        ctx.builder.const_i32(less_flags);
+        ctx.builder.else_();
+        ctx.builder.get_local_i64(x_bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.get_local_i64(y_bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.eq_f64();
+        ctx.builder.if_i32();
+        ctx.builder.const_i32(equal_flags);
+        ctx.builder.else_();
+        ctx.builder.const_i32(0);
+        ctx.builder.block_end();
+        ctx.builder.block_end();
+        ctx.builder.block_end();
+        return ctx.builder.set_new_local();
+    }
+
+    // Ordered values are overwhelmingly more common than NaNs in game math.
+    // Let native WebAssembly comparisons classify the three ordered cases
+    // first; IEEE-754 guarantees that <, == and > are all false if either
+    // operand is NaN, so the final else is exactly the unordered case. This
+    // removes two unconditional x!=x / y!=y tests from every normal x87
+    // comparison while preserving infinities, signed zero and NaN semantics.
     ctx.builder.get_local_i64(x_bits);
     ctx.builder.reinterpret_i64_as_f64();
     ctx.builder.get_local_i64(y_bits);
@@ -3762,7 +3792,15 @@ fn gen_fpu_compare_flags(
     ctx.builder.if_i32();
     ctx.builder.const_i32(equal_flags);
     ctx.builder.else_();
+    ctx.builder.get_local_i64(y_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.get_local_i64(x_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.lt_f64();
+    ctx.builder.if_i32();
     ctx.builder.const_i32(0);
+    ctx.builder.else_();
+    ctx.builder.const_i32(unordered_flags);
     ctx.builder.block_end();
     ctx.builder.block_end();
     ctx.builder.block_end();

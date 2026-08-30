@@ -44,6 +44,9 @@ const OUT2    = DATA + 104;
 const OUT3    = DATA + 108;
 const I16V    = DATA + 120;       // i16 7
 const I64V    = DATA + 128;       // i64 5
+const NAN32   = DATA + 136;
+const INF32   = DATA + 140;
+const NEGZERO32 = DATA + 144;
 
 function build_image(bodyName)
 {
@@ -79,6 +82,9 @@ function build_image(bodyName)
     dv.setFloat64(ROUND_NEG - BASE, -2.5, true);
     dv.setInt16(I16V - BASE, 7, true);
     dv.setBigInt64(I64V - BASE, 5n, true);
+    dv.setUint32(NAN32 - BASE, 0x7FC12345, true);
+    dv.setUint32(INF32 - BASE, 0x7F800000, true);
+    dv.setUint32(NEGZERO32 - BASE, 0x80000000, true);
 
     let o = ENTRY_OFF;
     const labels = {}, patches = [];
@@ -349,6 +355,23 @@ function build_image(bodyName)
             fild32(COUNTER); fcom_i32(COUNTER); fnstsw_ax(); movMemEax(ACC); fstp32(LAST); // FICOM m32
             fild32(COUNTER); fcomp_m32(C32); fnstsw_ax();                       // FCOMP m32 (pops)
         },
+        // Game-math clamp shape: an ordered lower bound is less than an ordinary
+        // positive component. Four independent FCOMP/FNSTSW pairs mirror a
+        // float4 clamp without making the result dependent on a branch body.
+        fcom_less() {
+            fldz(); fcomp_m32(C32); fnstsw_ax();
+            fldz(); fcomp_m32(C32); fnstsw_ax();
+            fldz(); fcomp_m32(C32); fnstsw_ax();
+            fldz(); fcomp_m32(C32); fnstsw_ax();
+            movMemEax(ACC);
+        },
+        // IEEE-754 boundary cases for the ordered-first classifier: unordered
+        // NaN, ordered infinity, and equality between +0 and -0.
+        fcom_special() {
+            fldz(); fcomp_m32(NAN32); fnstsw_ax(); movMemEax(ACC);
+            fldz(); fcomp_m32(INF32); fnstsw_ax(); movMemEax(ACC + 4);
+            fldz(); fcomp_m32(NEGZERO32); fnstsw_ax(); movMemEax(LAST);
+        },
         // FST / FSTP to a REGISTER (DD /2, DD /3 reg) — raw 16-byte slot copy path.
         fst_reg() {
             fild32(COUNTER);
@@ -482,7 +505,7 @@ function build_image(bodyName)
     return buf;
 }
 
-function run(bodyName, { jit, relaxed, x87Locals = false, x87Writeback = false })
+function run(bodyName, { jit, relaxed, x87Locals = false, x87Writeback = false, orderedCompare = true })
 {
     return new Promise((resolve) => {
         const startedAt = performance.now();
@@ -524,6 +547,7 @@ function run(bodyName, { jit, relaxed, x87Locals = false, x87Writeback = false }
             // materialises them at exits, faults and raw x87/MMX boundaries.
             cpu.wm?.exports?.set_jit_config?.(39,
                 (jit && relaxed && x87Locals && x87Writeback) ? 1 : 0);
+            cpu.wm?.exports?.set_jit_config?.(40, orderedCompare ? 1 : 0);
             cpu.wm?.exports?.profiler_init?.();
             timer = setTimeout(() => { if(!halted) finish("HANG"); }, TIMEOUT_MS);
             emulator.run();
@@ -535,7 +559,7 @@ const fmt = (r) => `${r.status} acc=${r.ebx.toString(16).padStart(8,"0")}:${r.ea
 
 const allVariants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_sti", "m80_mem", "m80_pop", "m80_nopop", "tag_pop", "full", "fxch_sticky", "fcom_sticky", "consts_sign", "fist_round", "fist_round_neg", "fcomi_flags",
     // newly-covered families (previously untested, where Bug #2 is hypothesised to live)
-    "fcom_mem", "fst_reg", "fild_widths", "fist16_round", "consts_all", "fcomi_more", "tl_mix",
+    "fcom_mem", "fcom_less", "fcom_special", "fst_reg", "fild_widths", "fist16_round", "consts_all", "fcomi_more", "tl_mix",
     "fnstsw_top", "fiarith32", "fiarith16"];
 const requestedVariants = process.env.FPU_VARIANTS?.split(",").filter(Boolean);
 const variants = requestedVariants?.length
@@ -648,5 +672,22 @@ if(!anyDiverged && process.env.FPU_WRITEBACK_PERF === "1") {
         console.log(`${v.padEnd(14)} through=${throughMs.toFixed(1)}ms deferred=${deferredMs.toFixed(1)}ms ` +
                     `delta=${((deferredMs / throughMs - 1) * 100).toFixed(1)}%`);
     }
+}
+if(!anyDiverged && process.env.FPU_COMPARE_PERF === "1") {
+    const legacy = [], ordered = [];
+    for(let i = 0; i < 7; i++) {
+        const firstOrdered = (i & 1) !== 0;
+        const first = await run("fcom_less", { jit:true, relaxed:true, x87Locals:true,
+                                              orderedCompare:firstOrdered });
+        const second = await run("fcom_less", { jit:true, relaxed:true, x87Locals:true,
+                                               orderedCompare:!firstOrdered });
+        (firstOrdered ? ordered : legacy).push(first.elapsedMs);
+        (firstOrdered ? legacy : ordered).push(second.elapsedMs);
+    }
+    const median = values => [...values].sort((a, b) => a - b)[values.length >> 1];
+    const legacyMs = median(legacy), orderedMs = median(ordered);
+    console.log("\n===== x87 comparison classification (lower is better) =====");
+    console.log(`legacy=${legacyMs.toFixed(1)}ms ordered-first=${orderedMs.toFixed(1)}ms ` +
+                `delta=${((orderedMs / legacyMs - 1) * 100).toFixed(1)}%`);
 }
 process.exit(anyDiverged ? 1 : 0);

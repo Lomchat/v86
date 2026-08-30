@@ -120,6 +120,9 @@ static mut JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS_COMPILED: u32 = 0;
 // architectural boundaries instead of writing fpu_st after every arithmetic
 // instruction (config 39). Experimental until differential and game A/B pass.
 static mut JIT_X87_WRITEBACK: bool = false;
+// Classify ordinary ordered x87 comparisons before checking the rare unordered
+// (NaN) case. Config 40 is compile-time so A/Bs rebuild only the JIT cache.
+static mut JIT_FPU_ORDERED_COMPARE_FIRST: bool = true;
 // REP MOVS bridge with reduced register spilling and completed-copy direct
 // continuation (idx 35). The generated call
 // passes ESI/EDI/ECX directly to a JIT-aware wasm helper and reloads only those
@@ -6140,6 +6143,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         37 => JIT_DEFERRED_COMPILE_QUEUE = value != 0,
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS = value != 0,
         39 => JIT_X87_WRITEBACK = value != 0,
+        40 => JIT_FPU_ORDERED_COMPARE_FIRST = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -6187,6 +6191,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         37 => JIT_DEFERRED_COMPILE_QUEUE as u32,
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS as u32,
         39 => JIT_X87_WRITEBACK as u32,
+        40 => JIT_FPU_ORDERED_COMPARE_FIRST as u32,
         _ => 0,
     }
 }
@@ -6211,6 +6216,10 @@ pub fn x87_writeback_enabled() -> bool {
     // config 39 inert when config 10 is disabled instead of emitting fault
     // guards and writeback bookkeeping that can never retain a value.
     unsafe { JIT_X87_WRITEBACK && JIT_X87_LOCALS }
+}
+
+pub fn fpu_ordered_compare_first_enabled() -> bool {
+    unsafe { JIT_FPU_ORDERED_COMPARE_FIRST }
 }
 
 #[no_mangle]

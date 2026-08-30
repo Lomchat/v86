@@ -123,6 +123,11 @@ static mut JIT_X87_WRITEBACK: bool = false;
 // Classify ordinary ordered x87 comparisons before checking the rare unordered
 // (NaN) case. Config 40 is compile-time so A/Bs rebuild only the JIT cache.
 static mut JIT_FPU_ORDERED_COMPARE_FIRST: bool = true;
+// A generated dynamic-chain site already computes the live scheduler guard.
+// When that guard fails, returning -1 locally is exactly equivalent to calling
+// the shared resolver, which immediately repeats the same guard and returns -1.
+// Config 41 keeps the optimization reversible for differential A/Bs.
+static mut JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT: bool = true;
 // REP MOVS bridge with reduced register spilling and completed-copy direct
 // continuation (idx 35). The generated call
 // passes ESI/EDI/ECX directly to a JIT-aware wasm helper and reloads only those
@@ -242,6 +247,53 @@ static mut DYNAMIC_CHAIN_SITE_DIAG_FOURTH_EPOCHS: [u32; DYNAMIC_CHAIN_SITE_PIC_C
 static mut DYNAMIC_CHAIN_SITE_PIC_NEXT: usize = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_HIGH_WATER: u32 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS: u32 = 0;
+
+// Opt-in dynamic-chain miss diagnosis. These counters are updated only while
+// dispatch statistics are enabled, so the production resolver keeps its normal
+// zero-instrumentation path. A generic RET_CHAIN_MISS alone cannot distinguish a
+// scheduler boundary from code that was never compiled, an x86-state mismatch,
+// or a compiled module that does not expose the requested entry point.
+static mut DYNAMIC_CHAIN_RESOLVE_BUDGET_MISSES: u64 = 0;
+static mut DYNAMIC_CHAIN_RESOLVE_NO_META_MISSES: u64 = 0;
+static mut DYNAMIC_CHAIN_RESOLVE_STATE_MISSES: u64 = 0;
+static mut DYNAMIC_CHAIN_RESOLVE_NO_ENTRY_MISSES: u64 = 0;
+static mut DYNAMIC_CHAIN_RESOLVE_MEMO_HITS: u64 = 0;
+static mut DYNAMIC_CHAIN_RESOLVE_META_HITS: u64 = 0;
+
+#[no_mangle]
+pub unsafe fn jit_dynamic_chain_resolver_diag_reset() {
+    DYNAMIC_CHAIN_RESOLVE_BUDGET_MISSES = 0;
+    DYNAMIC_CHAIN_RESOLVE_NO_META_MISSES = 0;
+    DYNAMIC_CHAIN_RESOLVE_STATE_MISSES = 0;
+    DYNAMIC_CHAIN_RESOLVE_NO_ENTRY_MISSES = 0;
+    DYNAMIC_CHAIN_RESOLVE_MEMO_HITS = 0;
+    DYNAMIC_CHAIN_RESOLVE_META_HITS = 0;
+}
+
+#[no_mangle]
+pub fn jit_dynamic_chain_resolver_diag_budget_misses() -> u64 {
+    unsafe { DYNAMIC_CHAIN_RESOLVE_BUDGET_MISSES }
+}
+#[no_mangle]
+pub fn jit_dynamic_chain_resolver_diag_no_meta_misses() -> u64 {
+    unsafe { DYNAMIC_CHAIN_RESOLVE_NO_META_MISSES }
+}
+#[no_mangle]
+pub fn jit_dynamic_chain_resolver_diag_state_misses() -> u64 {
+    unsafe { DYNAMIC_CHAIN_RESOLVE_STATE_MISSES }
+}
+#[no_mangle]
+pub fn jit_dynamic_chain_resolver_diag_no_entry_misses() -> u64 {
+    unsafe { DYNAMIC_CHAIN_RESOLVE_NO_ENTRY_MISSES }
+}
+#[no_mangle]
+pub fn jit_dynamic_chain_resolver_diag_memo_hits() -> u64 {
+    unsafe { DYNAMIC_CHAIN_RESOLVE_MEMO_HITS }
+}
+#[no_mangle]
+pub fn jit_dynamic_chain_resolver_diag_meta_hits() -> u64 {
+    unsafe { DYNAMIC_CHAIN_RESOLVE_META_HITS }
+}
 
 pub fn ret_cache_invalidate_all() {
     unsafe {
@@ -2254,6 +2306,8 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     if limit == 0 || elapsed >= limit || *global_pointers::in_hlt {
         if dispatch_stats_enabled() {
             profiler::stat_increment_always(stat::RET_CHAIN_MISS);
+            DYNAMIC_CHAIN_RESOLVE_BUDGET_MISSES =
+                DYNAMIC_CHAIN_RESOLVE_BUDGET_MISSES.saturating_add(1);
         }
         return -1;
     }
@@ -2272,6 +2326,8 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     {
         if dispatch_stats_enabled() {
             profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+            DYNAMIC_CHAIN_RESOLVE_MEMO_HITS =
+                DYNAMIC_CHAIN_RESOLVE_MEMO_HITS.saturating_add(1);
         }
         return cached.2;
     }
@@ -2290,6 +2346,8 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
         if unit_state != u16::MAX {
             if dispatch_stats_enabled() {
                 profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+                DYNAMIC_CHAIN_RESOLVE_META_HITS =
+                    DYNAMIC_CHAIN_RESOLVE_META_HITS.saturating_add(1);
             }
 
             let table_slot =
@@ -2302,6 +2360,18 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
 
     if dispatch_stats_enabled() {
         profiler::stat_increment_always(stat::RET_CHAIN_MISS);
+        if meta == 0 {
+            DYNAMIC_CHAIN_RESOLVE_NO_META_MISSES =
+                DYNAMIC_CHAIN_RESOLVE_NO_META_MISSES.saturating_add(1);
+        }
+        else if dispatch_meta_state_flags(meta) != state_flags.to_u32() {
+            DYNAMIC_CHAIN_RESOLVE_STATE_MISSES =
+                DYNAMIC_CHAIN_RESOLVE_STATE_MISSES.saturating_add(1);
+        }
+        else {
+            DYNAMIC_CHAIN_RESOLVE_NO_ENTRY_MISSES =
+                DYNAMIC_CHAIN_RESOLVE_NO_ENTRY_MISSES.saturating_add(1);
+        }
     }
     -1
 }
@@ -4097,6 +4167,17 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx.builder.and_i32();
     let miss_scheduler_ok = ctx.builder.set_new_local();
 
+    // The shared resolver starts by reading this exact budget/HLT state and
+    // returns -1 when it is false. Keep that overwhelmingly common quantum-exit
+    // path inside generated wasm: no cross-instance Rust call, no repeated
+    // instruction-counter loads. The true arm below remains the complete PIC +
+    // authoritative resolver path.
+    let budget_fast_exit = dynamic_chain_budget_fast_exit_enabled();
+    if budget_fast_exit {
+        ctx.builder.get_local(&miss_scheduler_ok);
+        ctx.builder.if_i32();
+    }
+
     // The primary-hit instruction stream above is identical whether this
     // option is enabled or not. Only its already-cold miss arm consults the
     // second target, so monomorphic sites pay no extra branch or memory load.
@@ -4160,6 +4241,12 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx.builder.block_end();
     ctx.builder.block_end();
     ctx.builder.block_end();
+    if budget_fast_exit {
+        ctx.builder.else_();
+        codegen::gen_dispatch_stat_increment(ctx.builder, stat::RET_CHAIN_MISS);
+        ctx.builder.const_i32(-1);
+        ctx.builder.block_end();
+    }
     ctx.builder.block_end();
 
     ctx.builder.free_local(miss_scheduler_ok);
@@ -6144,6 +6231,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS = value != 0,
         39 => JIT_X87_WRITEBACK = value != 0,
         40 => JIT_FPU_ORDERED_COMPARE_FIRST = value != 0,
+        41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -6192,6 +6280,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS as u32,
         39 => JIT_X87_WRITEBACK as u32,
         40 => JIT_FPU_ORDERED_COMPARE_FIRST as u32,
+        41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT as u32,
         _ => 0,
     }
 }
@@ -6220,6 +6309,10 @@ pub fn x87_writeback_enabled() -> bool {
 
 pub fn fpu_ordered_compare_first_enabled() -> bool {
     unsafe { JIT_FPU_ORDERED_COMPARE_FIRST }
+}
+
+pub fn dynamic_chain_budget_fast_exit_enabled() -> bool {
+    unsafe { JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT }
 }
 
 #[no_mangle]

@@ -294,6 +294,15 @@ pub static mut jit_cycle_start_instruction_counter: u32 = 0;
 // hypercall page on every tiny-block edge.
 pub static mut jit_cycle_limit_cached: u32 = 0;
 
+/// Synchronize an asynchronous host-side budget change with the copy embedded
+/// in generated edge guards. The hypercall page remains authoritative between
+/// slices; this setter only makes an urgent zero visible before the current JIT
+/// module can continue through another direct or dynamic edge.
+#[no_mangle]
+pub unsafe fn jit_set_cycle_limit_cached(limit: u32) {
+    jit_cycle_limit_cached = limit;
+}
+
 // should probably be kept in sync with APIC_TIMER_FREQ in apic.js
 pub const TSC_RATE: f64 = 1_000_000.0;
 

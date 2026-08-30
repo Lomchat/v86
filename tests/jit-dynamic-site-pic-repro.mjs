@@ -48,7 +48,7 @@ function image()
     return bytes;
 }
 
-function run(pic, secondWay = false)
+function run(pic, secondWay = false, budgetFastExit = true, cycleLimit = 100_003)
 {
     return new Promise(resolve => {
         const emulator = new V86({
@@ -68,6 +68,8 @@ function run(pic, secondWay = false)
                 status,
                 pic: cpu.get_jit_config?.(30) >>> 0,
                 secondWay: cpu.get_jit_config?.(32) >>> 0,
+                budgetFastExit: cpu.get_jit_config?.(41) >>> 0,
+                cycleLimit,
                 elapsedMs: Math.round(elapsedMs * 100) / 100,
                 eax: cpu.reg32[0] >>> 0,
                 ecx: cpu.reg32[1] >>> 0,
@@ -86,6 +88,9 @@ function run(pic, secondWay = false)
             cpu.set_jit_config(12, 1);  // dynamic RET chaining
             cpu.set_jit_config(30, pic ? 1 : 0);
             cpu.set_jit_config(32, secondWay ? 1 : 0);
+            cpu.set_jit_config(41, budgetFastExit ? 1 : 0);
+            const hp = cpu.wm.exports.get_hypercall_page_ptr() >>> 0;
+            new DataView(cpu.wasm_memory.buffer).setUint32(hp, cycleLimit >>> 0, true);
             cpu.jit_clear_cache?.();
             cpu.load_multiboot(image().buffer);
             started = performance.now();
@@ -140,4 +145,24 @@ console.log("jit-dynamic-site-pic-monomorphic-way-summary " + JSON.stringify({
     oneWayMs,
     twoWayMs,
     overheadPercent: Math.round((twoWayMs / oneWayMs - 1) * 10000) / 100,
+}));
+
+// Once a site has observed an exhausted cycle budget, the shared resolver can
+// only repeat that same synchronous check and return -1. Compare the generated
+// local exit against the historical resolver call over many real budget ends.
+const budgetOrder = [false, true, true, false, false, true];
+const budgetSamples = [];
+for(const budgetFastExit of budgetOrder)
+{
+    const result = await run(true, true, budgetFastExit, 64);
+    check(result);
+    budgetSamples.push(result);
+}
+const budgetOffMs = median(budgetSamples.filter(x => !x.budgetFastExit).map(x => x.elapsedMs));
+const budgetOnMs = median(budgetSamples.filter(x => x.budgetFastExit).map(x => x.elapsedMs));
+console.log("jit-dynamic-budget-fast-exit-samples " + JSON.stringify(budgetSamples));
+console.log("jit-dynamic-budget-fast-exit-summary " + JSON.stringify({
+    budgetOffMs,
+    budgetOnMs,
+    speedupPercent: Math.round((budgetOffMs / budgetOnMs - 1) * 10000) / 100,
 }));

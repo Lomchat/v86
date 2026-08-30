@@ -182,13 +182,16 @@ pub enum stat {
     // Why a block was interpreted rather than dispatched into a module.
     // ALWAYS-ON, one add per interpreted block, in an already-slow path.
     //   INTERP_BLOCK_NO_MODULE   — the page has no compiled module at all.
-    //   INTERP_BLOCK_MISSING_ENTRY — the page HAS a module, but this eip is not one
-    //                                of its entry points (or the state flags differ),
-    //                                so compiled code exists and is not reachable here.
-    // The split decides the remedy: the first is answered by compiling more, the
-    // second by covering more entry points per compilation.
+    //   INTERP_BLOCK_MISSING_ENTRY — the page has a module compiled for THIS cpu
+    //                                state, but this eip is not one of its entry
+    //                                points. Recompiling the page can cover it.
+    //   INTERP_BLOCK_STATE_MISMATCH — the page has a module compiled for a DIFFERENT
+    //                                cpu state. Recompiling cannot help; that needs a
+    //                                separate module, so this must not be lumped in
+    //                                with the entry-point gap above.
     INTERP_BLOCK_NO_MODULE,
     INTERP_BLOCK_MISSING_ENTRY,
+    INTERP_BLOCK_STATE_MISMATCH,
 }
 
 #[allow(non_upper_case_globals)]
@@ -217,7 +220,8 @@ pub fn profiler_interpreted_steps_get() -> f64 {
 pub fn profiler_interp_block_reason_get(index: u32) -> f64 {
     let stat = match index {
         0 => stat::INTERP_BLOCK_NO_MODULE,
-        _ => stat::INTERP_BLOCK_MISSING_ENTRY,
+        1 => stat::INTERP_BLOCK_MISSING_ENTRY,
+        _ => stat::INTERP_BLOCK_STATE_MISMATCH,
     };
     unsafe { stat_array[stat as usize] as f64 }
 }
@@ -227,6 +231,7 @@ pub fn profiler_interp_block_reason_reset() {
     unsafe {
         stat_array[stat::INTERP_BLOCK_NO_MODULE as usize] = 0;
         stat_array[stat::INTERP_BLOCK_MISSING_ENTRY as usize] = 0;
+        stat_array[stat::INTERP_BLOCK_STATE_MISMATCH as usize] = 0;
     }
 }
 

@@ -3264,11 +3264,19 @@ pub unsafe fn cycle_internal() {
             }
         }
 
-        profiler::stat_increment_always(if meta != 0 {
+        // Distinguish the two "page has code" cases: a module compiled for this
+        // cpu state that lacks this entry point (recompiling covers it) from a
+        // module compiled for a different state (recompiling cannot).
+        profiler::stat_increment_always(if meta == 0 {
+            stat::INTERP_BLOCK_NO_MODULE
+        }
+        else if initial_state_flags
+            == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta))
+        {
             stat::INTERP_BLOCK_MISSING_ENTRY
         }
         else {
-            stat::INTERP_BLOCK_NO_MODULE
+            stat::INTERP_BLOCK_STATE_MISMATCH
         });
 
         let initial_instruction_counter = *instruction_counter;

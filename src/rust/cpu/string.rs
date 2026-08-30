@@ -14,10 +14,13 @@ use crate::cpu::cpu::{
     get_seg, io_port_read16, io_port_read32, io_port_read8, io_port_write16, io_port_write32,
     io_port_write8, read_reg16, read_reg32, safe_read16, safe_read32s, safe_read8, safe_write16,
     safe_write32, safe_write8, set_reg_asize, test_privileges_for_io, translate_address_read,
-    translate_address_write_and_can_skip_dirty, writable_or_pagefault, write_reg16, write_reg32,
-    write_reg8, AL, AX, DX, EAX, ECX, EDI, ES, ESI, FLAG_DIRECTION,
+    translate_address_read_jit, translate_address_write_and_can_skip_dirty,
+    translate_address_write_jit_and_can_skip_dirty, writable_or_pagefault, write_reg16,
+    write_reg32, write_reg8, AL, AX, DX, EAX, ECX, EDI, ES, ESI, FLAG_DIRECTION,
 };
-use crate::cpu::global_pointers::{flags, instruction_pointer, previous_ip};
+use crate::cpu::global_pointers::{
+    flags, instruction_pointer, previous_ip, segment_is_null, segment_offsets,
+};
 use crate::cpu::memory;
 use crate::jit;
 use crate::page::Page;
@@ -52,6 +55,112 @@ enum Rep {
     None,
     Z,
     NZ,
+}
+
+// Return values for movs_rep_jit_fast:
+//   0 = handled, outputs are in the ESI/EDI/ECX memory slots
+//   1 = unsupported shape, retry through the historical full-spill helper
+//   2 = JIT page fault prepared, branch to exit_with_fault with locals intact
+#[no_mangle]
+pub unsafe fn movs_rep_jit_fast(src: i32, dst: i64, count: i64, packed: i32) -> i32 {
+    let is_asize_32 = packed & 4 != 0;
+    if !is_asize_32 {
+        return 1;
+    }
+
+    let size_bytes = match packed & 3 {
+        0 => 1u32,
+        1 => 2u32,
+        2 => 4u32,
+        _ => return 1,
+    };
+    let seg = (packed >> 8) & 0xFF;
+    if !(0..8).contains(&seg) {
+        return 1;
+    }
+
+    let mut src = src as u32;
+    let mut dst = dst as u32;
+    let mut count = count as u32;
+    if count == 0 {
+        write_reg32(ESI, src as i32);
+        write_reg32(EDI, dst as i32);
+        write_reg32(ECX, 0);
+        return 0;
+    }
+
+    // A null segment must raise #GP through the historical path, which already
+    // has every architectural register materialized in memory.
+    if *segment_is_null.offset(ES as isize) || *segment_is_null.offset(seg as isize) {
+        return 1;
+    }
+    let es = *segment_offsets.offset(ES as isize);
+    let ds = *segment_offsets.offset(seg as isize);
+    let direction = if *flags & FLAG_DIRECTION != 0 { -1 } else { 1 };
+
+    let (mut phys_dst, skip_dirty_page) = match
+        translate_address_write_jit_and_can_skip_dirty(es.wrapping_add(dst as i32))
+    {
+        Ok(value) => value,
+        Err(()) => return 2,
+    };
+    let mut phys_src = match translate_address_read_jit(ds.wrapping_add(src as i32)) {
+        Ok(value) => value,
+        Err(()) => return 2,
+    };
+
+    // MMIO/LFB and interfering overlap retain the exact historical routine.
+    // The translations above may set architectural page-table A/D bits, but no
+    // source/destination byte or guest register has changed before this re-entry.
+    if memory::in_mapped_range(phys_src) || memory::in_mapped_range(phys_dst) {
+        return 1;
+    }
+
+    let chunk = u32::min(
+        count,
+        u32::min(
+            count_until_end_of_page(direction, size_bytes as i32, phys_src),
+            count_until_end_of_page(direction, size_bytes as i32, phys_dst),
+        ),
+    );
+    if chunk == 0 {
+        return 1;
+    }
+    let bytes = chunk * size_bytes;
+    let overlap_interferes = if phys_src < phys_dst {
+        phys_dst - phys_src < bytes && direction == 1
+    }
+    else if phys_src > phys_dst {
+        phys_src - phys_dst < bytes && direction == -1
+    }
+    else {
+        false
+    };
+    if overlap_interferes {
+        return 1;
+    }
+
+    if !skip_dirty_page {
+        jit::jit_dirty_page(Page::page_of(phys_dst));
+    }
+    if direction == -1 {
+        let rewind = (chunk - 1) * size_bytes;
+        phys_src -= rewind;
+        phys_dst -= rewind;
+    }
+    memory::memcpy_no_mmap_or_dirty_check(phys_src, phys_dst, bytes);
+
+    let delta = (chunk * size_bytes) as i32 * direction;
+    src = src.wrapping_add(delta as u32);
+    dst = dst.wrapping_add(delta as u32);
+    count -= chunk;
+    write_reg32(ESI, src as i32);
+    write_reg32(EDI, dst as i32);
+    write_reg32(ECX, count as i32);
+    if count != 0 {
+        *instruction_pointer = *previous_ip;
+    }
+    0
 }
 
 // We implement all string instructions here and rely on the inliner on doing its job of optimising

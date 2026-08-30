@@ -111,6 +111,12 @@ static mut JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY: bool = true;
 // with set_jit_config(34) + JIT cache clear.
 static mut JIT_EXACT_PAGE_TAIL: bool = false;
 static mut JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED: u32 = 0;
+// REP MOVS bridge with reduced register spilling and completed-copy direct
+// continuation (idx 35). The generated call
+// passes ESI/EDI/ECX directly to a JIT-aware wasm helper and reloads only those
+// three registers. Unsupported memory shapes fall back to the historical full
+// spill helper before any guest-visible copy takes place.
+static mut JIT_REP_MOVS_REDUCED_SPILL: bool = true;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS: u64 = 0;
@@ -1876,6 +1882,10 @@ pub struct Push32WriteCache {
     pub valid: WasmLocal,
 }
 
+pub fn rep_movs_reduced_spill_enabled() -> bool {
+    unsafe { JIT_REP_MOVS_REDUCED_SPILL }
+}
+
 impl<'a> JitContext<'a> {
     pub fn reg(&self, i: u32) -> WasmLocal {
         match self.register_locals.get(i as usize) {
@@ -2921,6 +2931,26 @@ fn jit_find_basic_blocks(
                                 }
                             }
                         }
+                    }
+                    else if unsafe { JIT_REP_MOVS_REDUCED_SPILL }
+                        && opcode_is_rep_movs(addr_before_instruction)
+                    {
+                        // REP MOVS remains a separate block so a page-sized
+                        // partial copy can yield for interrupts. The generated
+                        // helper branches to the module exit while ECX is still
+                        // non-zero; a completed copy can therefore take this
+                        // ordinary intra-module fallthrough without a full
+                        // dispatcher round-trip.
+                        current_block.ty = BasicBlockType::Normal {
+                            next_block_addr: if is_near_end_of_page(current_address) {
+                                None
+                            }
+                            else {
+                                Some(current_address)
+                            },
+                            jump_offset: 0,
+                            jump_offset_is_32: true,
+                        };
                     }
 
                     break;
@@ -5052,6 +5082,28 @@ fn jit_generate_module(
     return entries;
 }
 
+/// True if the instruction at `eip` is REP MOVSB/MOVSW/MOVSD, after prefixes.
+/// The distinction matters only for the optional completed-copy fallthrough;
+/// every other string instruction keeps its historical block-exit semantics.
+fn opcode_is_rep_movs(eip: u32) -> bool {
+    let mut addr = eip;
+    let mut saw_rep = false;
+    for _ in 0..8 {
+        match read_jit_u8(addr) {
+            0xF2 | 0xF3 => {
+                saw_rep = true;
+                addr = addr.wrapping_add(1);
+            },
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 => {
+                addr = addr.wrapping_add(1);
+            },
+            0xA4 | 0xA5 => return saw_rep,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// True if the instruction at `eip` is an x87 escape, after prefixes.
 fn opcode_is_x87(eip: u32) -> bool {
     let mut addr = eip;
@@ -5099,6 +5151,12 @@ fn jit_generate_basic_block(
 ) {
     let needs_eip_updated = match block.ty {
         BasicBlockType::Exit => true,
+        BasicBlockType::Normal { .. }
+            if unsafe { JIT_REP_MOVS_REDUCED_SPILL }
+                && opcode_is_rep_movs(block.last_instruction_addr) =>
+        {
+            true
+        },
         _ => false,
     };
 
@@ -5755,6 +5813,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         32 => JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY = value != 0,
         33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY = value != 0,
         34 => JIT_EXACT_PAGE_TAIL = value != 0,
+        35 => JIT_REP_MOVS_REDUCED_SPILL = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -5797,6 +5856,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         32 => JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY as u32,
         33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY as u32,
         34 => JIT_EXACT_PAGE_TAIL as u32,
+        35 => JIT_REP_MOVS_REDUCED_SPILL as u32,
         _ => 0,
     }
 }

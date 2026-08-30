@@ -4848,6 +4848,58 @@ fn gen_string_ins(ctx: &mut JitContext, ins: String, size: u8, prefix: u8) {
     dbg_assert!(prefix == 0 || prefix == 0xF2 || prefix == 0xF3);
     dbg_assert!(size == 8 || size == 16 || size == 32);
 
+    if ins == String::MOVS
+        && (prefix == 0xF2 || prefix == 0xF3)
+        && crate::jit::rep_movs_reduced_spill_enabled()
+    {
+        let prefix = ctx.cpu.prefixes & PREFIX_MASK_SEGMENT;
+        dbg_assert!(prefix != SEG_PREFIX_ZERO);
+        let seg = if prefix != 0 { (prefix - 1) as u32 } else { regs::DS };
+        let size_code = if size == 8 { 0 } else if size == 16 { 1 } else { 2 };
+        let packed = size_code | (ctx.cpu.asize_32() as i32) << 2 | (seg as i32) << 8;
+
+        codegen::gen_get_reg32(ctx, regs::ESI);
+        codegen::gen_get_reg32(ctx, regs::EDI);
+        ctx.builder.extend_unsigned_i32_to_i64();
+        codegen::gen_get_reg32(ctx, regs::ECX);
+        ctx.builder.extend_unsigned_i32_to_i64();
+        ctx.builder.const_i32(packed);
+        ctx.builder
+            .call_fn4_i32_i64_i64_i32_ret("movs_rep_jit_fast");
+        let status = ctx.builder.set_new_local();
+
+        ctx.builder.get_local(&status);
+        ctx.builder.eqz_i32();
+        ctx.builder.if_void();
+        for reg in [regs::ESI, regs::EDI, regs::ECX] {
+            ctx.builder
+                .load_fixed_i32(global_pointers::get_reg32_offset(reg));
+            codegen::gen_set_reg32(ctx, reg);
+        }
+        // A REP helper intentionally handles at most one page. ECX != 0
+        // means instruction_pointer was rewound to previous_ip and the CPU
+        // must yield through the historical module exit before retrying.
+        codegen::gen_get_reg32(ctx, regs::ECX);
+        ctx.builder.br_if(ctx.exit_label);
+        ctx.builder.else_();
+        ctx.builder.get_local(&status);
+        ctx.builder.const_i32(2);
+        ctx.builder.eq_i32();
+        ctx.builder.br_if(ctx.exit_with_fault_label);
+
+        codegen::gen_move_registers_from_locals_to_memory(ctx);
+        ctx.builder.const_i32(ctx.cpu.asize_32() as i32);
+        ctx.builder.const_i32(seg as i32);
+        let name = if size == 8 { "movsb_rep" } else if size == 16 { "movsw_rep" } else { "movsd_rep" };
+        ctx.builder.call_fn2(name);
+        codegen::gen_move_registers_from_memory_to_locals(ctx);
+        codegen::gen_get_reg32(ctx, regs::ECX);
+        ctx.builder.br_if(ctx.exit_label);
+        ctx.builder.block_end();
+        ctx.builder.free_local(status);
+        return;
+    }
+
     if prefix == 0 {
         fn get_direction(ctx: &mut JitContext, size: u8) {
             let bytes: i32 = (size / 8).into();

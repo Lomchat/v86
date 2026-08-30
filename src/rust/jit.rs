@@ -117,6 +117,14 @@ static mut JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED: u32 = 0;
 // three registers. Unsupported memory shapes fall back to the historical full
 // spill helper before any guest-visible copy takes place.
 static mut JIT_REP_MOVS_REDUCED_SPILL: bool = true;
+// Continue a synchronous block-boundary fallthrough (notably OUT hypercall
+// stubs) inside the current module instead of returning through cycle_internal.
+// The generated edge is guarded by the authoritative runtime EIP, the LIVE
+// scheduler budget (the boundary may have changed it), and in_hlt. Any async
+// park, interrupt, fault, or preemption request therefore keeps the historical
+// module-exit path. Compile-time switch idx 36, OFF until cross-workload A/B.
+static mut JIT_SYNC_BOUNDARY_CONTINUATION: bool = false;
+static mut JIT_SYNC_BOUNDARY_CONTINUATION_SITES_COMPILED: u32 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS: u64 = 0;
@@ -1747,6 +1755,11 @@ pub struct BasicBlock {
     pub ty: BasicBlockType,
     pub has_sti: bool,
     pub number_of_instructions: u32,
+    /// Physical fallthrough after a non-control-flow block boundary. The
+    /// instruction helper may change EIP or request preemption at runtime, so
+    /// this is only a candidate for a guarded continuation, never an assumed
+    /// CFG edge.
+    pub sync_boundary_fallthrough: Option<u32>,
     /// RET-target speculation (superblock lite): for an AbsoluteEip
     /// block that is a genuine RET of a small leaf function called from within this
     /// module, the (virt, phys) return addresses of its module-local call sites. The
@@ -2686,6 +2699,7 @@ fn jit_find_basic_blocks(
             is_entry_block: false,
             has_sti: false,
             number_of_instructions: 0,
+            sync_boundary_fallthrough: None,
             ret_speculation: Vec::new(),
             inline_leaf: None,
         };
@@ -2862,6 +2876,9 @@ fn jit_find_basic_blocks(
                         // entry point
                         marked_as_entry.insert(current_virt_addr);
                         to_visit_stack.push(current_virt_addr);
+                        if !analysis.absolute_jump {
+                            current_block.sync_boundary_fallthrough = Some(current_address);
+                        }
                     }
 
                     if analysis.absolute_jump {
@@ -4308,6 +4325,59 @@ fn jit_generate_module(
 
                 match &block.ty {
                     BasicBlockType::Exit => {
+                        if unsafe { JIT_SYNC_BOUNDARY_CONTINUATION } {
+                            if let Some(next_block_addr) = block.sync_boundary_fallthrough {
+                                if let Some(&next_index) = index_for_addr.get(&next_block_addr) {
+                                    // The boundary helper may have parked/switched the
+                                    // thread or delivered an interrupt. Continue only
+                                    // when its architectural fallthrough is untouched.
+                                    let next_virt = block.virt_addr & !0xFFF
+                                        | next_block_addr as i32 & 0xFFF;
+                                    codegen::gen_get_eip(ctx.builder);
+                                    ctx.builder.const_i32(next_virt);
+                                    ctx.builder.eq_i32();
+
+                                    // Unlike ordinary direct edges, a JS/wasm boundary
+                                    // CAN lower the live cycle limit. Read the shared
+                                    // page rather than jit_cycle_limit_cached, then
+                                    // account for this module's pending instructions.
+                                    ctx.builder.load_fixed_i32(
+                                        std::ptr::addr_of!(hypercall::HYPERCALL_PAGE) as u32,
+                                    );
+                                    let live_limit = ctx.builder.tee_new_local();
+                                    ctx.builder.const_i32(0);
+                                    ctx.builder.ne_i32();
+                                    ctx.builder.and_i32();
+                                    ctx.builder.load_fixed_i32(
+                                        global_pointers::instruction_counter as u32,
+                                    );
+                                    ctx.builder.get_local(&ctx.instruction_counter);
+                                    ctx.builder.add_i32();
+                                    ctx.builder.load_fixed_i32(
+                                        std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter)
+                                            as u32,
+                                    );
+                                    ctx.builder.sub_i32();
+                                    ctx.builder.get_local(&live_limit);
+                                    ctx.builder.ltu_i32();
+                                    ctx.builder.and_i32();
+                                    ctx.builder.load_fixed_u8(global_pointers::in_hlt as u32);
+                                    ctx.builder.eqz_i32();
+                                    ctx.builder.and_i32();
+                                    ctx.builder.if_void();
+                                    ctx.builder.const_i32(next_index.into());
+                                    ctx.builder.set_local(target_block);
+                                    ctx.builder.br(main_loop_label);
+                                    ctx.builder.block_end();
+                                    ctx.builder.free_local(live_limit);
+                                    unsafe {
+                                        JIT_SYNC_BOUNDARY_CONTINUATION_SITES_COMPILED =
+                                            JIT_SYNC_BOUNDARY_CONTINUATION_SITES_COMPILED
+                                                .saturating_add(1);
+                                    }
+                                }
+                            }
+                        }
                         // Exit this function
                         codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
@@ -5814,6 +5884,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY = value != 0,
         34 => JIT_EXACT_PAGE_TAIL = value != 0,
         35 => JIT_REP_MOVS_REDUCED_SPILL = value != 0,
+        36 => JIT_SYNC_BOUNDARY_CONTINUATION = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -5857,6 +5928,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         33 => JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY as u32,
         34 => JIT_EXACT_PAGE_TAIL as u32,
         35 => JIT_REP_MOVS_REDUCED_SPILL as u32,
+        36 => JIT_SYNC_BOUNDARY_CONTINUATION as u32,
         _ => 0,
     }
 }
@@ -5869,6 +5941,11 @@ pub fn jit_leaf_call_fusion_sites_compiled() -> u32 {
 #[no_mangle]
 pub fn jit_exact_page_tail_instructions_compiled() -> u32 {
     unsafe { JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED }
+}
+
+#[no_mangle]
+pub fn jit_sync_boundary_continuation_sites_compiled() -> u32 {
+    unsafe { JIT_SYNC_BOUNDARY_CONTINUATION_SITES_COMPILED }
 }
 
 #[no_mangle]

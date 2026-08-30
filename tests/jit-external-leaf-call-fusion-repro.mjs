@@ -94,7 +94,7 @@ function run(enabled, mutate = false)
             cpu.reboot_internal();
             cpu.reset_memory();
             cpu.set_jit_config(1, 1);       // Tier-1: one page per module
-            cpu.set_jit_config(17, 1);      // copied dependency has a separate strict budget
+            cpu.set_jit_config(17, 2);      // Tier-2: room for one copied leaf page
             cpu.set_jit_config(20, 8);
             cpu.set_jit_config(23, 0);      // isolate this mechanism from regions
             cpu.set_jit_config(24, 0);

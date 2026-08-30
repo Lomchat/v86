@@ -178,6 +178,17 @@ pub enum stat {
     // Divided by the total retired count it answers the question that decides
     // every JIT-threshold experiment — how much of a cold phase is even JIT'd.
     INTERPRETED_STEPS_ALWAYS,
+
+    // Why a block was interpreted rather than dispatched into a module.
+    // ALWAYS-ON, one add per interpreted block, in an already-slow path.
+    //   INTERP_BLOCK_NO_MODULE   — the page has no compiled module at all.
+    //   INTERP_BLOCK_MISSING_ENTRY — the page HAS a module, but this eip is not one
+    //                                of its entry points (or the state flags differ),
+    //                                so compiled code exists and is not reachable here.
+    // The split decides the remedy: the first is answered by compiling more, the
+    // second by covering more entry points per compilation.
+    INTERP_BLOCK_NO_MODULE,
+    INTERP_BLOCK_MISSING_ENTRY,
 }
 
 #[allow(non_upper_case_globals)]
@@ -200,6 +211,23 @@ pub fn stat_increment_always_by(stat: stat, by: u64) { unsafe { stat_array[stat 
 #[no_mangle]
 pub fn profiler_interpreted_steps_get() -> f64 {
     unsafe { stat_array[stat::INTERPRETED_STEPS_ALWAYS as usize] as f64 }
+}
+
+#[no_mangle]
+pub fn profiler_interp_block_reason_get(index: u32) -> f64 {
+    let stat = match index {
+        0 => stat::INTERP_BLOCK_NO_MODULE,
+        _ => stat::INTERP_BLOCK_MISSING_ENTRY,
+    };
+    unsafe { stat_array[stat as usize] as f64 }
+}
+
+#[no_mangle]
+pub fn profiler_interp_block_reason_reset() {
+    unsafe {
+        stat_array[stat::INTERP_BLOCK_NO_MODULE as usize] = 0;
+        stat_array[stat::INTERP_BLOCK_MISSING_ENTRY as usize] = 0;
+    }
 }
 
 #[no_mangle]

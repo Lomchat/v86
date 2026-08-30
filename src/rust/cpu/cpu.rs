@@ -3264,6 +3264,13 @@ pub unsafe fn cycle_internal() {
             }
         }
 
+        profiler::stat_increment_always(if meta != 0 {
+            stat::INTERP_BLOCK_MISSING_ENTRY
+        }
+        else {
+            stat::INTERP_BLOCK_NO_MODULE
+        });
+
         let initial_instruction_counter = *instruction_counter;
         jit_run_interpreted(phys_addr);
 

@@ -91,7 +91,7 @@ function buildCrossingImage()
     return buf;
 }
 
-function run(exactTail, image = buildImage)
+function run(exactTail, image = buildImage, crossPage = false)
 {
     return new Promise(resolve => {
         const emulator = new V86({
@@ -112,8 +112,11 @@ function run(exactTail, image = buildImage)
                 ecx: cpu.reg32[1] >>> 0,
                 edx: cpu.reg32[2] >>> 0,
                 exactTail: cpu.get_jit_config?.(34) >>> 0,
+                crossPage: cpu.get_jit_config?.(38) >>> 0,
                 compiledTailInstructions:
                     cpu.wm.exports["jit_exact_page_tail_instructions_compiled"]?.() ?? -1,
+                compiledCrossPageInstructions:
+                    cpu.wm.exports["jit_contiguous_cross_page_instructions_compiled"]?.() ?? -1,
             });
         };
         let startedAt = 0;
@@ -122,8 +125,9 @@ function run(exactTail, image = buildImage)
             const cpu = emulator.v86.cpu;
             cpu.reboot_internal();
             cpu.reset_memory();
-            cpu.set_jit_config(1, 1); // keep the two pages in separate modules
+            cpu.set_jit_config(1, crossPage ? 2 : 1);
             cpu.set_jit_config(34, exactTail ? 1 : 0);
+            cpu.set_jit_config(38, crossPage ? 1 : 0);
             cpu.jit_clear_cache?.();
             cpu.load_multiboot(image().buffer);
             timer = setTimeout(() => finish("HANG"), TIMEOUT_MS);
@@ -170,9 +174,9 @@ console.log("jit-exact-page-tail " + JSON.stringify({
     throughputGainPct: +((offMs / onMs - 1) * 100).toFixed(2),
 }));
 
-for(const enabled of [false, true])
+for(const [exactTail, crossPage] of [[false, false], [true, false], [false, true], [true, true]])
 {
-    const result = await run(enabled, buildCrossingImage);
+    const result = await run(exactTail, buildCrossingImage, crossPage);
     console.log("jit-exact-page-tail-crossing " + JSON.stringify(result));
     if(result.status !== "halt"
         || result.eax !== CROSS_ITER * CROSS_INCREMENTS
@@ -182,14 +186,24 @@ for(const enabled of [false, true])
         console.error("FAIL: genuine cross-page instruction semantics changed");
         process.exit(1);
     }
-    if(enabled && result.compiledTailInstructions <= 0)
+    if(exactTail && result.compiledTailInstructions <= 0)
     {
         console.error("FAIL: exact-tail mode did not compile the safe prefix");
         process.exit(1);
     }
-    if(!enabled && result.compiledTailInstructions !== 0)
+    if(!exactTail && result.compiledTailInstructions !== 0)
     {
         console.error("FAIL: disabled mode compiled the page tail");
+        process.exit(1);
+    }
+    if(crossPage && result.compiledCrossPageInstructions <= 0)
+    {
+        console.error("FAIL: contiguous cross-page mode compiled no crossing instruction");
+        process.exit(1);
+    }
+    if(!crossPage && result.compiledCrossPageInstructions !== 0)
+    {
+        console.error("FAIL: disabled cross-page mode compiled a crossing instruction");
         process.exit(1);
     }
 }

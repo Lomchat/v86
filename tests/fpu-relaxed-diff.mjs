@@ -485,6 +485,7 @@ function build_image(bodyName)
 function run(bodyName, { jit, relaxed, x87Locals = false })
 {
     return new Promise((resolve) => {
+        const startedAt = performance.now();
         const img = build_image(bodyName);
         const emulator = new V86({ autostart:false, memory_size:MEM_SIZE,
                                    disable_jit: jit ? 0 : 1, log_level:0 });
@@ -500,6 +501,7 @@ function run(bodyName, { jit, relaxed, x87Locals = false })
                       eax: cpu.reg32[0] >>> 0, ecx: cpu.reg32[1] >>> 0,
                       edx: cpu.reg32[2] >>> 0, ebx: cpu.reg32[3] >>> 0,
                       hit, fallback,
+                      elapsedMs: performance.now() - startedAt,
                       eip: cpu.instruction_pointer[0] >>> 0 });
         };
         emulator.bus.register("cpu-event-halt", () => { halted = true; finish("halt"); });
@@ -579,4 +581,25 @@ for(const v of variants) {
     }
 }
 console.log(anyDiverged ? "\nVERDICT: inline fast path DIVERGES from helpers" : "\nVERDICT: all variants match");
+
+// Optional local performance probe. Each sample includes identical emulator
+// startup/JIT warm-up cost; alternating OFF/ON avoids a systematic order bias.
+if(!anyDiverged && process.env.FPU_PERF === "1") {
+    const perfVariants = ["push", "reg", "pfx", "full"];
+    console.log("\n===== x87 local-cache performance (lower is better) =====");
+    for(const v of perfVariants) {
+        const off = [], on = [];
+        for(let i = 0; i < 7; i++) {
+            const firstOn = (i & 1) !== 0;
+            const first = await run(v, { jit:true, relaxed:true, x87Locals:firstOn });
+            const second = await run(v, { jit:true, relaxed:true, x87Locals:!firstOn });
+            (firstOn ? on : off).push(first.elapsedMs);
+            (firstOn ? off : on).push(second.elapsedMs);
+        }
+        const median = values => [...values].sort((a, b) => a - b)[values.length >> 1];
+        const offMs = median(off), onMs = median(on);
+        console.log(`${v.padEnd(14)} off=${offMs.toFixed(1)}ms on=${onMs.toFixed(1)}ms ` +
+                    `delta=${((onMs / offMs - 1) * 100).toFixed(1)}%`);
+    }
+}
 process.exit(anyDiverged ? 1 : 0);

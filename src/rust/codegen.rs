@@ -131,6 +131,42 @@ pub fn gen_page_switch_check(
     }
 }
 
+/// Guard a page-straddling instruction before it executes. The analyser proved
+/// that `virt_after` mapped to `phys_after` when the module was built, but the
+/// guest may have changed its page tables without writing either physical code
+/// page. On mismatch, leave the architectural EIP at the crossing instruction
+/// and return to the dispatcher so the interpreter observes the new mapping.
+pub fn gen_cross_page_instruction_mapping_guard(
+    ctx: &mut JitContext,
+    virt_after_low_bits: i32,
+    phys_after: u32,
+) {
+    dbg_assert!(virt_after_low_bits & !0xFFF == 0);
+
+    gen_get_eip(ctx.builder);
+    ctx.builder.const_i32(!0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(virt_after_low_bits);
+    ctx.builder.or_i32();
+    ctx.builder.const_i32(0x1000);
+    ctx.builder.add_i32();
+    let address_local = ctx.builder.set_new_local();
+    gen_get_phys_eip_plus_mem(ctx, &address_local);
+    ctx.builder.free_local(address_local);
+
+    ctx.builder
+        .const_i32(phys_after as i32 + unsafe { memory::mem8 } as i32);
+    ctx.builder.ne_i32();
+    ctx.builder.if_void();
+    // The block pre-charged every instruction. This one did not execute.
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.const_i32(1);
+    ctx.builder.sub_i32();
+    ctx.builder.set_local(&ctx.instruction_counter);
+    ctx.builder.br(ctx.exit_label);
+    ctx.builder.block_end();
+}
+
 pub fn gen_update_instruction_counter(ctx: &mut JitContext) {
     ctx.builder
         .const_i32(global_pointers::instruction_counter as i32);
@@ -3341,6 +3377,52 @@ pub fn gen_x87_local_cache_free_all(ctx: &mut JitContext) {
     }
 }
 
+/// Keep the logical ST(i) read-through cache coherent across an x87 push.
+/// The architectural TOP changes, but the cached values themselves only shift
+/// by one logical slot; invalidating all eight loses the hottest value in
+/// classic FLD/FMUL/FADD/FSTP game loops.
+fn gen_x87_local_cache_push(
+    ctx: &mut JitContext,
+    mantissa: &WasmLocalI64,
+    tag: &WasmLocal,
+) {
+    if !x87_local_cache_enabled() {
+        return;
+    }
+    ctx.x87_cache_kept = true;
+    if let Some(dropped) = ctx.x87_local_cache[7].take() {
+        ctx.builder.free_local_i64(dropped.bits);
+        ctx.builder.free_local(dropped.valid);
+    }
+    for i in (1..8).rev() {
+        ctx.x87_local_cache[i] = ctx.x87_local_cache[i - 1].take();
+    }
+    let (bits, valid) = gen_x87_local_slot(ctx, 0).unwrap();
+    ctx.builder.get_local_i64(mantissa);
+    ctx.builder.set_local_i64(&bits);
+    ctx.builder.get_local(tag);
+    ctx.builder.const_i32(FPU_RELAXED_TAG);
+    ctx.builder.eq_i32();
+    ctx.builder.set_local(&valid);
+}
+
+/// Mirror an x87 pop by shifting the logical cache back toward ST(0). The new
+/// ST(7) was outside the previous logical window and remains unknown.
+fn gen_x87_local_cache_pop(ctx: &mut JitContext) {
+    if !x87_local_cache_enabled() {
+        return;
+    }
+    ctx.x87_cache_kept = true;
+    if let Some(dropped) = ctx.x87_local_cache[0].take() {
+        ctx.builder.free_local_i64(dropped.bits);
+        ctx.builder.free_local(dropped.valid);
+    }
+    for i in 0..7 {
+        ctx.x87_local_cache[i] = ctx.x87_local_cache[i + 1].take();
+    }
+    ctx.x87_local_cache[7] = None;
+}
+
 fn gen_fpu_relaxed_st_ok(ctx: &mut JitContext, i: u32, addr: &WasmLocal) {
     if let Some((_bits, valid)) = gen_x87_local_slot(ctx, i) {
         ctx.builder.get_local(&valid);
@@ -3399,9 +3481,12 @@ fn gen_fpu_store_relaxed_f64_st(ctx: &mut JitContext, i: u32, addr: &WasmLocal) 
     ctx.builder.get_local(addr);
     ctx.builder.get_local_i64(&bits);
     ctx.builder.store_unaligned_i64(0);
-    ctx.builder.get_local(addr);
-    ctx.builder.const_i32(FPU_RELAXED_TAG);
-    ctx.builder.store_unaligned_u16(8);
+
+    // Every caller reaches this helper only after proving that the destination
+    // ST entry already carries FPU_RELAXED_TAG. Arithmetic changes the payload,
+    // never the representation, so rewriting the same 16-bit tag after every
+    // x87 operation is redundant. This matters in old game loops that perform
+    // dozens of chained FMUL/FADD operations per source pixel.
 
     if let Some((bits_cache, valid)) = gen_x87_local_slot(ctx, i) {
         crate::jit::x87_locals_note_cache_store_compiled();
@@ -3849,7 +3934,6 @@ fn gen_fpu_relaxed_binop_mem(
         return;
     }
     let modrm_slow = modrm_byte.clone();
-    let target_addr = gen_fpu_st_addr(ctx, target_sti);
     let st0_addr = gen_fpu_st_addr(ctx, 0);
     gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
     ctx.builder.eqz_i32();
@@ -3863,10 +3947,10 @@ fn gen_fpu_relaxed_binop_mem(
     gen_fpu_relaxed_record_hit(ctx);
     gen_fpu_relaxed_load_binop_operands_mem(ctx, op, &st0_addr, src, modrm_byte);
     gen_fpu_apply_f64_binop(ctx, op);
-    gen_fpu_store_relaxed_f64_st(ctx, target_sti, &target_addr);
+    debug_assert_eq!(target_sti, 0);
+    gen_fpu_store_relaxed_f64_st(ctx, target_sti, &st0_addr);
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
-    ctx.builder.free_local(target_addr);
 }
 
 pub fn gen_fpu_relaxed_binop_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, target_sti: u32, op: FpuFastBinOp, slow_helper: &str) {
@@ -3895,7 +3979,6 @@ pub fn gen_fpu_relaxed_binop_sti(
         ctx.builder.call_fn3_i32_i64_i32(slow_helper);
         return;
     }
-    let target_addr = gen_fpu_st_addr(ctx, target_sti);
     let st0_addr = gen_fpu_st_addr(ctx, 0);
     let op_addr = gen_fpu_st_addr(ctx, sti);
     gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
@@ -3912,11 +3995,11 @@ pub fn gen_fpu_relaxed_binop_sti(
     gen_fpu_relaxed_record_hit(ctx);
     gen_fpu_relaxed_load_binop_operands_sti(ctx, op, &st0_addr, sti, &op_addr);
     gen_fpu_apply_f64_binop(ctx, op);
-    gen_fpu_store_relaxed_f64_st(ctx, target_sti, &target_addr);
+    let target_addr = if target_sti == 0 { &st0_addr } else { &op_addr };
+    gen_fpu_store_relaxed_f64_st(ctx, target_sti, target_addr);
     ctx.builder.block_end();
     ctx.builder.free_local(op_addr);
     ctx.builder.free_local(st0_addr);
-    ctx.builder.free_local(target_addr);
 }
 
 pub fn gen_fpu_relaxed_pop(ctx: &mut JitContext) {
@@ -3925,7 +4008,7 @@ pub fn gen_fpu_relaxed_pop(ctx: &mut JitContext) {
         ctx.builder.call_fn0("fpu_pop");
         return;
     }
-    gen_x87_local_cache_invalidate_all_runtime(ctx);
+    gen_x87_local_cache_pop(ctx);
     ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
     let ptr_local = ctx.builder.set_new_local();
     ctx.builder.const_i32(1);
@@ -3961,7 +4044,7 @@ pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
     }
     let tag = ctx.builder.set_new_local();
     let mantissa = ctx.builder.set_new_local_i64();
-    gen_x87_local_cache_invalidate_all_runtime(ctx);
+    gen_x87_local_cache_push(ctx, &mantissa, &tag);
 
     ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
     ctx.builder.const_i32(1);

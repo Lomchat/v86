@@ -111,6 +111,11 @@ static mut JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY: bool = true;
 // with set_jit_config(34) + JIT cache clear.
 static mut JIT_EXACT_PAGE_TAIL: bool = false;
 static mut JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED: u32 = 0;
+// Compile an instruction whose bytes straddle two guest pages when (and only
+// when) the second virtual page currently maps to the physically adjacent page.
+// Both physical pages become invalidation dependencies (config 38).
+static mut JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS: bool = true;
+static mut JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS_COMPILED: u32 = 0;
 // REP MOVS bridge with reduced register spilling and completed-copy direct
 // continuation (idx 35). The generated call
 // passes ESI/EDI/ECX directly to a JIT-aware wasm helper and reloads only those
@@ -2741,20 +2746,37 @@ fn jit_find_basic_blocks(
             let has_next_instruction = !analysis.no_next_instruction;
             current_address = cpu.eip;
 
-            // The decoder may inspect the physically adjacent bytes, but a JIT
-            // block must never contain an instruction whose bytes cross the
-            // current guest page: the next virtual page can map elsewhere. In
-            // exact-tail mode, discard only that actual crossing instruction.
-            // Older code stopped up to 16 bytes early, leaving several complete
-            // instructions to the interpreter on every pass through a hot tail.
-            if unsafe { JIT_EXACT_PAGE_TAIL }
-                && Page::page_of(current_address) != Page::page_of(addr_before_instruction)
-            {
-                profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
-                break;
+            // The decoder reads physically adjacent bytes. That is correct for
+            // an instruction crossing a guest-page boundary only when the next
+            // virtual page maps to that exact physical page. Prove the mapping
+            // before retaining the instruction; otherwise preserve the legacy
+            // interpreter fallback. Crossing control transfers stay excluded
+            // until their segment and relative-EIP semantics are proven too.
+            let crossed_page =
+                Page::page_of(current_address) != Page::page_of(addr_before_instruction);
+            let mut crossed_page_virt_target = None;
+            if crossed_page {
+                let virt_instruction = (to_visit as u32 & !0xFFF)
+                    | (addr_before_instruction & 0xFFF);
+                let virt_after = virt_instruction.wrapping_add(
+                    current_address.wrapping_sub(addr_before_instruction),
+                );
+                let next_phys_page = Page::page_of(current_address);
+                let mapping_is_contiguous = unsafe { JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS }
+                    && matches!(analysis.ty, AnalysisType::Normal)
+                    && (pages.contains(&next_phys_page) || pages.len() < max_pages as usize)
+                    && cpu::translate_address_read_no_side_effects(virt_after as i32)
+                        == Ok(current_address);
+                if !mapping_is_contiguous {
+                    profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                    break;
+                }
+                crossed_page_virt_target = Some(virt_after as i32);
             }
 
-            dbg_assert!(Page::page_of(current_address) == Page::page_of(addr_before_instruction));
+            dbg_assert!(
+                !crossed_page || unsafe { JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS }
+            );
             let current_virt_addr = to_visit & !0xFFF | current_address as i32 & 0xFFF;
 
             if analysis.ty == AnalysisType::STI && is_near_end_of_page(current_address) {
@@ -2771,6 +2793,31 @@ fn jit_find_basic_blocks(
                     JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED =
                         JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED.saturating_add(1);
                 }
+            }
+
+            if let Some(virt_after) = crossed_page_virt_target {
+                // End immediately after the crossing instruction. +0x1000 makes
+                // the existing page-change EIP update produce the true sequential
+                // virtual address from the old page's base and the new low bits.
+                current_block.ty = BasicBlockType::Normal {
+                    next_block_addr: follow_jump(
+                        virt_after,
+                        ctx,
+                        &mut pages,
+                        &mut page_blacklist,
+                        max_pages,
+                        tier2_region,
+                        &mut marked_as_entry,
+                        &mut to_visit_stack,
+                    ),
+                    jump_offset: 0x1000,
+                    jump_offset_is_32: true,
+                };
+                unsafe {
+                    JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS_COMPILED =
+                        JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS_COMPILED.saturating_add(1);
+                }
+                break;
             }
 
             match analysis.ty {
@@ -3002,7 +3049,10 @@ fn jit_find_basic_blocks(
                 },
             }
 
-            if !unsafe { JIT_EXACT_PAGE_TAIL } && is_near_end_of_page(current_address) {
+            if !unsafe {
+                JIT_EXACT_PAGE_TAIL || JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS
+            } && is_near_end_of_page(current_address)
+            {
                 profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
                 break;
             }
@@ -3322,9 +3372,12 @@ fn jit_analyze_and_generate(
     let mut pages = HashSet::new();
 
     for b in basic_blocks.iter() {
-        // Remove this assertion once page-crossing jit is enabled
-        dbg_assert!(Page::page_of(b.addr) == Page::page_of(b.end_addr));
         pages.insert(Page::page_of(b.addr));
+        // A retained boundary-straddling instruction consumes bytes from the
+        // page containing end_addr - 1. Register it even if region growth could
+        // not retain the following block, so dirty-page invalidation covers
+        // every byte used by this translation.
+        pages.insert(Page::page_of(b.end_addr.wrapping_sub(1)));
     }
 
     let print = false;
@@ -5410,6 +5463,15 @@ fn jit_generate_basic_block(
             should_elide_current_flags(&*ctx.cpu, start_eip, block, basic_blocks);
         // Relaxed x87 wrappers set this when they keep the st cache coherent.
         ctx.x87_cache_kept = false;
+        if start_eip == block.last_instruction_addr
+            && Page::page_of(start_eip) != Page::page_of(stop_addr.wrapping_sub(1))
+        {
+            codegen::gen_cross_page_instruction_mapping_guard(
+                ctx,
+                stop_addr as i32 & 0xFFF,
+                stop_addr,
+            );
+        }
         let mut instruction_flags = 0;
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;
@@ -5435,15 +5497,19 @@ fn jit_generate_basic_block(
         let end_addr = ctx.cpu.eip;
 
         if end_addr == stop_addr {
-            // no page was crossed
-            dbg_assert!(Page::page_of(end_addr) == Page::page_of(start_addr));
+            dbg_assert!(
+                Page::page_of(end_addr) == Page::page_of(start_addr)
+                    || unsafe { JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS }
+            );
             codegen::gen_x87_local_cache_free_all(ctx);
             codegen::gen_push32_write_cache_free(ctx);
             break;
         }
 
         if was_block_boundary
-            || (!unsafe { JIT_EXACT_PAGE_TAIL } && is_near_end_of_page(end_addr))
+            || (!unsafe {
+                JIT_EXACT_PAGE_TAIL || JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS
+            } && is_near_end_of_page(end_addr))
             || end_addr > stop_addr
         {
             dbg_log!(
@@ -6006,6 +6072,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         35 => JIT_REP_MOVS_REDUCED_SPILL = value != 0,
         36 => JIT_SYNC_BOUNDARY_CONTINUATION = value != 0,
         37 => JIT_DEFERRED_COMPILE_QUEUE = value != 0,
+        38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -6051,6 +6118,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         35 => JIT_REP_MOVS_REDUCED_SPILL as u32,
         36 => JIT_SYNC_BOUNDARY_CONTINUATION as u32,
         37 => JIT_DEFERRED_COMPILE_QUEUE as u32,
+        38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS as u32,
         _ => 0,
     }
 }
@@ -6063,6 +6131,11 @@ pub fn jit_leaf_call_fusion_sites_compiled() -> u32 {
 #[no_mangle]
 pub fn jit_exact_page_tail_instructions_compiled() -> u32 {
     unsafe { JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED }
+}
+
+#[no_mangle]
+pub fn jit_contiguous_cross_page_instructions_compiled() -> u32 {
+    unsafe { JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS_COMPILED }
 }
 
 #[no_mangle]

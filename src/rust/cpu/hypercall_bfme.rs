@@ -206,81 +206,188 @@ unsafe fn sparse_float4_decline(code: u32) -> bool {
     true
 }
 
-/// lotrbfme.exe 1.03 FR @ 0x00e2f4f0. Arguments materialized by the guest
-/// wrapper are [entries, entries_end, destination_base, source_float4, frame].
+/// lotrbfme.exe 1.03 FR @ 0x00e2f4c8. Consume the complete three-level sparse
+/// accumulation nest in one WASM entry instead of crossing the guest/HLE
+/// boundary for every usually-two-element innermost range. The exact hook
+/// wrapper preserves the live registers; EAX and EDX identify the first source
+/// group and float4 respectively, while the remaining bounds live in the
+/// function frame.
+///
 /// Binary64 holds each exact f32 product plus f32 accumulator before the same
-/// final binary32 rounding performed by the original x87 FSTP.
+/// final binary32 rounding performed by the relaxed x87 path's FSTP. A complete
+/// validation pass precedes all writes so a failure can still execute the
+/// untouched guest loop atomically.
 unsafe fn handle_sparse_float4() -> bool {
+    // The OUT stub itself loads EAX=function_id and EDX=0xB077. Recover the
+    // guest values saved by assembleBfmeSparseFloat4Wrapper instead of reading
+    // those two clobbered registers. Stack after CALL return address:
+    // EAX, EDI, ECX, EDX, ESI, EBX, EBP.
     let esp = read_reg32(ESP);
-    let entries = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
-    let entries_end = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
-    let destination_base = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
-    let source = match safe_read32s(esp.wrapping_add(16)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
-    let frame = match safe_read32s(esp.wrapping_add(20)) { Ok(v) => v, Err(_) => return sparse_float4_decline(1) };
+    let source_begin = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let mut source_float4 = match safe_read32s(esp.wrapping_add(16)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let frame = match safe_read32s(esp.wrapping_add(28)) { Ok(v) => v, Err(_) => return sparse_float4_decline(1) };
+    let sparse_begin = match safe_read32s(frame.wrapping_sub(0x2c)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let sparse_end = match safe_read32s(frame.wrapping_sub(0x10)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let destination_tables = match safe_read32s(frame.wrapping_sub(0x08)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let source_end = match safe_read32s(frame.wrapping_sub(0x28)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
     SPARSE_FLOAT4_ATTEMPTS = SPARSE_FLOAT4_ATTEMPTS.wrapping_add(1);
     SPARSE_FLOAT4_LAST_FAILURE = 0;
     if !SPARSE_FLOAT4_ENABLED { return sparse_float4_decline(8); }
-    let bytes = entries_end.wrapping_sub(entries);
-    if entries == 0 || entries_end <= entries || bytes & 7 != 0 { return sparse_float4_decline(2); }
-    let count = bytes >> 3;
-    if count == 0 || count > 0x0100_0000 { return sparse_float4_decline(3); }
-    let outer = match safe_read32s(frame.wrapping_sub(4)) { Ok(v) if v != 0 => v, _ => return sparse_float4_decline(4) };
-    let multiplier = match read_f32(outer.wrapping_add(4)) { Some(v) => v as f64, None => return sparse_float4_decline(4) };
-    let mut source_lanes = [0f64; 4];
-    for lane in 0..4i32 {
-        source_lanes[lane as usize] = match read_f32((source as i32).wrapping_sub(8).wrapping_add(lane * 4)) {
-            Some(v) => v as f64,
-            None => return sparse_float4_decline(5),
+    let sparse_bytes = sparse_end.wrapping_sub(sparse_begin);
+    if source_begin == 0 || source_begin >= source_end || sparse_begin == 0
+        || sparse_end <= sparse_begin || sparse_bytes & 7 != 0 {
+        return sparse_float4_decline(2);
+    }
+    let sparse_count = sparse_bytes >> 3;
+    if sparse_count == 0 || sparse_count > 0x0010_0000 { return sparse_float4_decline(3); }
+    if source_float4 < 8 || source_float4.checked_add(8).is_none() { return sparse_float4_decline(4); }
+
+    let initial_source_float4 = source_float4;
+    let mut min_table_index = u32::MAX;
+    let mut max_table_index = 0u32;
+    let mut source_group = source_begin;
+    let mut item_count = 0u32;
+    let mut group_count = 0u32;
+    while source_group < source_end {
+        let relative_end = match safe_read32s(source_group as i32) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(5) };
+        let group_end = match source_group.checked_add(relative_end) { Some(v) => v, None => return sparse_float4_decline(5) };
+        let entries = match source_group.checked_add(4) { Some(v) => v, None => return sparse_float4_decline(5) };
+        if group_end <= entries || group_end > source_end || group_end.wrapping_sub(entries) & 7 != 0 {
+            return sparse_float4_decline(5);
+        }
+        if !validate_guest_range(source_float4 - 8, 16, false) { return sparse_float4_decline(4); }
+
+        let inner_count = group_end.wrapping_sub(entries) >> 3;
+        item_count = match item_count.checked_add(inner_count.saturating_mul(sparse_count)) {
+            Some(v) if v <= 0x1000_0000 => v,
+            _ => return sparse_float4_decline(3),
         };
-    }
+        group_count = match group_count.checked_add(1) {
+            Some(v) if v <= 0x0100_0000 => v,
+            _ => return sparse_float4_decline(3),
+        };
 
+        let mut sparse = sparse_begin;
+        while sparse < sparse_end {
+            let table_index = match safe_read32s(sparse as i32) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(6) };
+            min_table_index = min_table_index.min(table_index);
+            max_table_index = max_table_index.max(table_index);
+            if read_f32(sparse.wrapping_add(4) as i32).is_none() { return sparse_float4_decline(6); }
+            let table_offset = match table_index.checked_mul(12) { Some(v) => v, None => return sparse_float4_decline(6) };
+            let table_slot = match destination_tables.checked_add(table_offset) { Some(v) => v, None => return sparse_float4_decline(6) };
+            let destination_base = match safe_read32s(table_slot as i32) { Ok(v) if v != 0 => v as u32, _ => return sparse_float4_decline(6) };
 
-    let source_start = match source.checked_sub(8) { Some(v) => v, None => return sparse_float4_decline(5) };
-    let multiplier_address = match (outer as u32).checked_add(4) { Some(v) => v, None => return sparse_float4_decline(4) };
-    if entries.checked_add(bytes).is_none() { return sparse_float4_decline(2); }
-
-    // Validate every scattered destination before mutating any of them. This
-    // preserves the relocated original as a genuine all-or-nothing fallback.
-    // Repeated destination indices remain valid and retain sequential sums.
-    for i in 0..count {
-        let entry = entries.wrapping_add(i.wrapping_mul(8)) as i32;
-        let index = match safe_read32s(entry) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(6) };
-        if read_f32(entry.wrapping_add(4)).is_none() { return sparse_float4_decline(6); }
-        let destination_offset = match index.checked_mul(16) { Some(v) => v, None => return sparse_float4_decline(7) };
-        let destination = match destination_base.checked_add(destination_offset) { Some(v) => v, None => return sparse_float4_decline(7) };
-        if destination.checked_add(16).is_none()
-            || ranges_overlap(destination, 16, entries, bytes)
-            || ranges_overlap(destination, 16, source_start, 16)
-            || ranges_overlap(destination, 16, multiplier_address, 4)
-            || !validate_guest_range(destination, 16, true) {
-            return sparse_float4_decline(7);
-        }
-        for lane in 0..4i32 {
-            if read_f32(destination.wrapping_add((lane * 4) as u32) as i32).is_none() {
-                return sparse_float4_decline(7);
+            let mut entry = entries;
+            while entry < group_end {
+                let index = match safe_read32s(entry as i32) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(7) };
+                if read_f32(entry.wrapping_add(4) as i32).is_none() { return sparse_float4_decline(7); }
+                let destination_offset = match index.checked_mul(16) { Some(v) => v, None => return sparse_float4_decline(7) };
+                let destination = match destination_base.checked_add(destination_offset) { Some(v) => v, None => return sparse_float4_decline(7) };
+                if destination.checked_add(16).is_none()
+                    || ranges_overlap(destination, 16, source_begin, source_end - source_begin)
+                    || ranges_overlap(destination, 16, sparse_begin, sparse_bytes)
+                    || !validate_guest_range(destination, 16, true) {
+                    return sparse_float4_decline(7);
+                }
+                for lane in 0..4u32 {
+                    if read_f32(destination.wrapping_add(lane * 4) as i32).is_none() {
+                        return sparse_float4_decline(7);
+                    }
+                }
+                entry = entry.wrapping_add(8);
             }
+            sparse = sparse.wrapping_add(8);
         }
+        source_group = group_end;
+        source_float4 = source_float4.wrapping_add(16);
+    }
+    if source_group != source_end { return sparse_float4_decline(5); }
+
+    let source_float_bytes = match group_count.checked_mul(16) {
+        Some(v) => v,
+        None => return sparse_float4_decline(4),
+    };
+    let source_float_begin = initial_source_float4 - 8;
+    if !validate_guest_range(source_float_begin, source_float_bytes, false) {
+        return sparse_float4_decline(4);
+    }
+    let table_window_begin = match min_table_index.checked_mul(12)
+        .and_then(|offset| destination_tables.checked_add(offset)) {
+        Some(v) => v,
+        None => return sparse_float4_decline(6),
+    };
+    let table_window_end = match max_table_index.checked_mul(12)
+        .and_then(|offset| destination_tables.checked_add(offset))
+        .and_then(|slot| slot.checked_add(4)) {
+        Some(v) => v,
+        None => return sparse_float4_decline(6),
+    };
+    let table_window_bytes = table_window_end - table_window_begin;
+
+    // Complete the atomic-fallback proof: no destination may overwrite a
+    // source vector or a destination-table slot that a later iteration reads.
+    source_group = source_begin;
+    source_float4 = initial_source_float4;
+    while source_group < source_end {
+        let group_end = source_group.wrapping_add(safe_read32s(source_group as i32).unwrap() as u32);
+        let entries = source_group.wrapping_add(4);
+        let mut sparse = sparse_begin;
+        while sparse < sparse_end {
+            let table_index = safe_read32s(sparse as i32).unwrap() as u32;
+            let table_slot = destination_tables.wrapping_add(table_index * 12);
+            let destination_base = safe_read32s(table_slot as i32).unwrap() as u32;
+            let mut entry = entries;
+            while entry < group_end {
+                let index = safe_read32s(entry as i32).unwrap() as u32;
+                let destination = destination_base.wrapping_add(index * 16);
+                if ranges_overlap(destination, 16, source_float_begin, source_float_bytes)
+                    || ranges_overlap(destination, 16, table_window_begin, table_window_bytes) {
+                    return sparse_float4_decline(7);
+                }
+                entry = entry.wrapping_add(8);
+            }
+            sparse = sparse.wrapping_add(8);
+        }
+        source_group = group_end;
+        source_float4 = source_float4.wrapping_add(16);
     }
 
-    let mut last_destination = 0u32;
-    for i in 0..count {
-        let entry = entries.wrapping_add(i.wrapping_mul(8)) as i32;
-        let index = match safe_read32s(entry) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(6) };
-        let weight = match read_f32(entry.wrapping_add(4)) { Some(v) => v as f64 * multiplier, None => return sparse_float4_decline(6) };
-        let destination = destination_base.wrapping_add(index.wrapping_mul(16));
-        for lane in 0..4i32 {
-            let address = destination.wrapping_add((lane * 4) as u32) as i32;
-            let current = match read_f32(address) { Some(v) => v as f64, None => return sparse_float4_decline(7) };
-            if !write_f32(address, current + weight * source_lanes[lane as usize]) {
-                return sparse_float4_decline(7);
-            }
+    source_group = source_begin;
+    source_float4 = initial_source_float4;
+    while source_group < source_end {
+        let group_end = source_group.wrapping_add(safe_read32s(source_group as i32).unwrap() as u32);
+        let entries = source_group.wrapping_add(4);
+        let mut source_lanes = [0f64; 4];
+        for lane in 0..4u32 {
+            source_lanes[lane as usize] = read_f32(source_float4.wrapping_sub(8).wrapping_add(lane * 4) as i32).unwrap() as f64;
         }
-        last_destination = destination.wrapping_add(12);
+        let mut sparse = sparse_begin;
+        while sparse < sparse_end {
+            let table_index = safe_read32s(sparse as i32).unwrap() as u32;
+            let multiplier = read_f32(sparse.wrapping_add(4) as i32).unwrap() as f64;
+            let destination_base = safe_read32s(destination_tables.wrapping_add(table_index * 12) as i32).unwrap() as u32;
+            let mut entry = entries;
+            while entry < group_end {
+                let index = safe_read32s(entry as i32).unwrap() as u32;
+                let weight = read_f32(entry.wrapping_add(4) as i32).unwrap() as f64 * multiplier;
+                let destination = destination_base.wrapping_add(index * 16);
+                for lane in 0..4u32 {
+                    let address = destination.wrapping_add(lane * 4) as i32;
+                    let current = read_f32(address).unwrap() as f64;
+                    if !write_f32(address, current + weight * source_lanes[lane as usize]) {
+                        unreachable!("validated sparse float4 destination became unwritable");
+                    }
+                }
+                entry = entry.wrapping_add(8);
+            }
+            sparse = sparse.wrapping_add(8);
+        }
+        source_group = group_end;
+        source_float4 = source_float4.wrapping_add(16);
     }
-    write_reg32(EAX, entries_end as i32);
-    write_reg32(ESI, last_destination as i32);
+    write_reg32(ESI, 1);
     SPARSE_FLOAT4_CALLS = SPARSE_FLOAT4_CALLS.wrapping_add(1);
-    SPARSE_FLOAT4_ITEMS = SPARSE_FLOAT4_ITEMS.wrapping_add(count);
+    SPARSE_FLOAT4_ITEMS = SPARSE_FLOAT4_ITEMS.wrapping_add(item_count);
     true
 }
 

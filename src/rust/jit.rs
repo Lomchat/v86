@@ -1622,6 +1622,85 @@ pub const WASM_TABLE_SIZE: u32 = 900;
 /// Count of full JIT cache flushes caused by wasm-table exhaustion.
 static mut JIT_CACHE_FLUSHES: u32 = 0;
 
+/// CLOCK reference bit per table slot, set when a module is dispatched into.
+/// Exhaustion otherwise discards every module AND its page's hotness, so the
+/// whole working set has to re-cross JIT_THRESHOLD interpreted instructions
+/// before any of it runs compiled again — for a working set the size of the
+/// table that is two orders of magnitude more interpretation than the flush
+/// itself costs.
+static mut MODULE_RECENTLY_USED: [bool; WASM_TABLE_SIZE as usize] =
+    [false; WASM_TABLE_SIZE as usize];
+
+/// 0 = upstream behaviour (full flush on exhaustion), 1 = evict only modules
+/// unused since the previous sweep.
+static mut JIT_PARTIAL_EVICTION: u32 = 0;
+static mut JIT_PARTIAL_EVICTIONS: u32 = 0;
+static mut JIT_EVICTED_MODULES: u32 = 0;
+static mut JIT_EVICTION_FALLBACKS: u32 = 0;
+
+/// Share of the cache dropped when every module was referenced since the last
+/// sweep: enough to make progress, small enough that the hot set survives.
+const EVICTION_FALLBACK_DIVISOR: usize = 4;
+
+#[inline]
+pub fn jit_note_module_used(wasm_table_index: u16) {
+    unsafe {
+        if JIT_PARTIAL_EVICTION != 0 {
+            let slot = wasm_table_index as usize;
+            if slot < WASM_TABLE_SIZE as usize {
+                MODULE_RECENTLY_USED[slot] = true;
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub fn jit_get_partial_evictions() -> u32 { unsafe { JIT_PARTIAL_EVICTIONS } }
+
+#[no_mangle]
+pub fn jit_get_evicted_modules() -> u32 { unsafe { JIT_EVICTED_MODULES } }
+
+#[no_mangle]
+pub fn jit_get_eviction_fallbacks() -> u32 { unsafe { JIT_EVICTION_FALLBACKS } }
+
+/// Reclaim table slots on exhaustion, preferring modules that have not been
+/// dispatched into since the previous sweep. Returns how many pages were
+/// dropped. A workload that streams through code faster than it revisits it can
+/// legitimately have every slot referenced; rather than give up and let the
+/// caller discard everything, a bounded fraction is dropped so the hot majority
+/// still survives.
+fn jit_evict_unused(ctx: &mut JitState) -> usize {
+    let mut victims = Vec::new();
+    for (&page, info) in ctx.pages.iter() {
+        let slot = info.wasm_table_index.to_u16() as usize;
+        if slot < WASM_TABLE_SIZE as usize && unsafe { MODULE_RECENTLY_USED[slot] } {
+            // Second chance: referenced since the last sweep, so clear the bit
+            // and let the next sweep judge it on fresh evidence.
+            unsafe { MODULE_RECENTLY_USED[slot] = false };
+        }
+        else {
+            victims.push(page);
+        }
+    }
+
+    if victims.is_empty() {
+        // Everything was referenced. Every bit is now clear, so the next sweep
+        // will discriminate properly; this one still has to free something.
+        let quota = (ctx.pages.len() / EVICTION_FALLBACK_DIVISOR).max(1);
+        victims.extend(ctx.pages.keys().take(quota).copied());
+        unsafe { JIT_EVICTION_FALLBACKS = JIT_EVICTION_FALLBACKS.wrapping_add(1) };
+    }
+
+    for &page in &victims {
+        jit_dirty_page_ctx(ctx, page);
+    }
+    unsafe {
+        JIT_PARTIAL_EVICTIONS = JIT_PARTIAL_EVICTIONS.wrapping_add(1);
+        JIT_EVICTED_MODULES = JIT_EVICTED_MODULES.wrapping_add(victims.len() as u32);
+    }
+    victims.len()
+}
+
 #[no_mangle]
 pub fn jit_get_cache_flushes() -> u32 { unsafe { JIT_CACHE_FLUSHES } }
 
@@ -3558,6 +3637,13 @@ fn jit_analyze_and_generate(
             dbg_log!("=> Group");
             group.print(0);
         }
+    }
+
+    if ctx.wasm_table_index_free_list.is_empty() && unsafe { JIT_PARTIAL_EVICTION } != 0 {
+        // Reclaim only what is cold, so the hot working set keeps both its
+        // modules and its hotness. A sweep that frees nothing means every module
+        // is in use, and the full flush below is the only way to make progress.
+        jit_evict_unused(ctx);
     }
 
     if ctx.wasm_table_index_free_list.is_empty() {
@@ -6095,6 +6181,10 @@ fn jit_clear_cache(ctx: &mut JitState) {
     // Dynamic site-PIC slots deliberately remain monotonic: async compilation
     // can still finish after this clear (see its declaration above).
     unsafe { CHAIN_SITE_MEMO_NEXT = 0 };
+
+    // A stale reference bit would protect whichever module is handed that slot
+    // next, letting a cold module survive a sweep it never earned.
+    unsafe { MODULE_RECENTLY_USED = [false; WASM_TABLE_SIZE as usize] };
 }
 
 pub fn jit_page_has_code(page: Page) -> bool { jit_page_has_code_ctx(&mut get_jit_state(), page) }
@@ -6273,6 +6363,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         40 => JIT_FPU_ORDERED_COMPARE_FIRST = value != 0,
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT = value != 0,
         42 => JIT_RECOMPILE_DIVISOR = value.clamp(1, 64),
+        43 => JIT_PARTIAL_EVICTION = (value != 0) as u32,
         _ => dbg_assert!(false),
     }
 }
@@ -6323,6 +6414,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         40 => JIT_FPU_ORDERED_COMPARE_FIRST as u32,
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT as u32,
         42 => JIT_RECOMPILE_DIVISOR,
+        43 => JIT_PARTIAL_EVICTION,
         _ => 0,
     }
 }

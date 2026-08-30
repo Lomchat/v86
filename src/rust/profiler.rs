@@ -171,6 +171,13 @@ pub enum stat {
     // Counts only the runtime arm that stays in the current compiled module;
     // each hit replaces one otherwise mandatory module exit + re-entry.
     SYNC_BOUNDARY_CONTINUE,
+
+    // Retired guest instructions that ran through the interpreter rather than a
+    // compiled module. ALWAYS-ON and ungated: one u64 add per interpreted block,
+    // inside a path that is already an order of magnitude slower than the JIT.
+    // Divided by the total retired count it answers the question that decides
+    // every JIT-threshold experiment — how much of a cold phase is even JIT'd.
+    INTERPRETED_STEPS_ALWAYS,
 }
 
 #[allow(non_upper_case_globals)]
@@ -185,6 +192,20 @@ pub fn stat_increment_by(stat: stat, by: u64) {
 }
 
 pub fn stat_increment_always(stat: stat) { unsafe { stat_array[stat as usize] += 1 } }
+
+pub fn stat_increment_always_by(stat: stat, by: u64) { unsafe { stat_array[stat as usize] += by } }
+
+/// Retired guest instructions executed by the interpreter. Read alongside the
+/// worker's retired-instruction odometer to get the interpreted fraction.
+#[no_mangle]
+pub fn profiler_interpreted_steps_get() -> f64 {
+    unsafe { stat_array[stat::INTERPRETED_STEPS_ALWAYS as usize] as f64 }
+}
+
+#[no_mangle]
+pub fn profiler_interpreted_steps_reset() {
+    unsafe { stat_array[stat::INTERPRETED_STEPS_ALWAYS as usize] = 0 }
+}
 
 #[no_mangle]
 pub fn profiler_init() {

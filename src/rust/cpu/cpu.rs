@@ -3286,6 +3286,10 @@ pub unsafe fn cycle_internal() {
             stat::RUN_INTERPRETED_STEPS,
             (*instruction_counter - initial_instruction_counter) as u64,
         );
+        profiler::stat_increment_always_by(
+            stat::INTERPRETED_STEPS_ALWAYS,
+            (*instruction_counter - initial_instruction_counter) as u64,
+        );
         dbg_assert!(
             *instruction_counter != initial_instruction_counter,
             "Instruction counter didn't change"

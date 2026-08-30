@@ -59,7 +59,7 @@ function buildImage()
     return buf;
 }
 
-function run(maxPending, clearDuringRun = false)
+function run(maxPending, clearDuringRun = false, deferredQueue = false)
 {
     return new Promise(resolve => {
         const emulator = new V86({ autostart: false, memory_size: MEM_SIZE, disable_jit: 0, log_level: 0 });
@@ -73,6 +73,7 @@ function run(maxPending, clearDuringRun = false)
             const result = {
                 maxPending,
                 clearDuringRun,
+                deferredQueue,
                 clearCount,
                 status,
                 elapsedMs: +((haltedAt || performance.now()) - startedAt).toFixed(2),
@@ -83,6 +84,10 @@ function run(maxPending, clearDuringRun = false)
                 pending: w.jit_get_compile_pending?.() ?? -1,
                 highWater: w.jit_get_compile_pending_high_water?.() ?? -1,
                 capSkips: w.jit_get_compile_cap_skips?.() ?? -1,
+                deferredQueued: w.jit_get_compile_deferred_queued?.() ?? -1,
+                deferredStarted: w.jit_get_compile_deferred_started?.() ?? -1,
+                deferredDropped: w.jit_get_compile_deferred_dropped?.() ?? -1,
+                deferredPending: w.jit_get_compile_deferred_pending?.() ?? -1,
                 compileTotalMs: +((w.jit_get_compile_total_us?.() ?? 0) / 1000).toFixed(2),
                 compileMaxMs: +((w.jit_get_compile_max_us?.() ?? 0) / 1000).toFixed(2),
             };
@@ -101,6 +106,7 @@ function run(maxPending, clearDuringRun = false)
             cpu.reset_memory();
             cpu.set_jit_config(1, 1);             // one guest page per wasm module
             cpu.set_jit_config(25, maxPending);   // bounded async compile window
+            cpu.set_jit_config(37, deferredQueue ? 1 : 0);
             cpu.jit_clear_cache?.();
             cpu.load_multiboot(buildImage().buffer);
             timer = setTimeout(() => finish("HANG"), TIMEOUT_MS);
@@ -123,12 +129,16 @@ for(const maxPending of [1, 2, 4, 1, 2, 4, 1, 2, 4]) results.push(await run(maxP
 // Regression guard for per-generated-site memo ownership: clearing while async
 // compiles are completing must never let a new module reuse an old memo slot.
 results.push(await run(4, true));
+results.push(await run(4, true, true));
+// Controlled admission A/B at the production compile width.
+for(const deferredQueue of [false, true, true, false, false, true])
+    results.push(await run(2, false, deferredQueue));
 console.log("jit-parallel-compile " + JSON.stringify(results));
 
 const expectedEax = (ITERATIONS - 1) * PAGE_COUNT;
 for(const result of results)
 {
-    if(result.status !== "halt" || result.eax !== expectedEax || result.ecx !== 0 || result.pending !== 0)
+    if(result.status !== "halt" || result.eax !== expectedEax || result.ecx !== 0 || result.pending !== 0 || result.deferredPending !== 0)
     {
         console.error("FAIL: incorrect architectural result or unfinished compilation", result);
         process.exit(1);
@@ -142,6 +152,12 @@ for(const result of results)
 if(!results.filter(x => x.maxPending === 4).some(x => x.highWater > 1))
 {
     console.error("FAIL: parallel mode never had more than one compilation in flight");
+    process.exit(1);
+}
+const queuedRuns = results.filter(x => x.deferredQueue);
+if(!queuedRuns.every(x => x.deferredQueued > 0 && x.deferredStarted > 0))
+{
+    console.error("FAIL: deferred queue never admitted hot pages", queuedRuns);
     process.exit(1);
 }
 const clearRun = results.find(x => x.clearDuringRun);

@@ -127,6 +127,10 @@ static mut JIT_REP_MOVS_REDUCED_SPILL: bool = true;
 // a BFME II setup window, and no regression in a long 3D A/B.
 static mut JIT_SYNC_BOUNDARY_CONTINUATION: bool = true;
 static mut JIT_SYNC_BOUNDARY_CONTINUATION_SITES_COMPILED: u32 = 0;
+// Queue one hot page once when the asynchronous WebAssembly compile window is
+// full, then admit it as soon as a slot completes. This avoids re-running the
+// cap/compiling scans on every interpreted slice. Experimental config idx 37.
+static mut JIT_DEFERRED_COMPILE_QUEUE: bool = false;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS: u64 = 0;
@@ -1589,6 +1593,9 @@ pub fn rust_init() {
         JIT_COMPILE_PENDING_HIGH_WATER = 0;
         JIT_COMPILE_TOTAL_US = 0;
         JIT_COMPILE_MAX_US = 0;
+        JIT_COMPILE_DEFERRED_QUEUED = 0;
+        JIT_COMPILE_DEFERRED_STARTED = 0;
+        JIT_COMPILE_DEFERRED_DROPPED = 0;
     }
 
     let _ = JIT_STATE
@@ -1623,6 +1630,17 @@ enum CompilingPageState {
     CompilingWritten,
 }
 
+#[derive(Copy, Clone)]
+struct DeferredCompile {
+    page: Page,
+    virt_address: i32,
+    phys_address: u32,
+    cs_offset: u32,
+    state_flags: CachedStateFlags,
+}
+
+const JIT_DEFERRED_COMPILE_QUEUE_CAP: usize = 1024;
+
 static mut JIT_MAX_PENDING_COMPILES: u32 = 1;
 static mut JIT_COMPILE_STARTED: u32 = 0;
 static mut JIT_COMPILE_COMPLETED: u32 = 0;
@@ -1630,6 +1648,9 @@ static mut JIT_COMPILE_CAP_SKIPS: u32 = 0;
 static mut JIT_COMPILE_PENDING_HIGH_WATER: u32 = 0;
 static mut JIT_COMPILE_TOTAL_US: u64 = 0;
 static mut JIT_COMPILE_MAX_US: u32 = 0;
+static mut JIT_COMPILE_DEFERRED_QUEUED: u32 = 0;
+static mut JIT_COMPILE_DEFERRED_STARTED: u32 = 0;
+static mut JIT_COMPILE_DEFERRED_DROPPED: u32 = 0;
 
 struct JitState {
     wasm_builder: WasmBuilder,
@@ -1645,6 +1666,8 @@ struct JitState {
     // flight so one cold module does not force every other hot page to remain
     // interpreted until its Promise settles.
     compiling: HashMap<WasmTableIndex, CompilingPageState>,
+    deferred_compiles: VecDeque<DeferredCompile>,
+    deferred_compile_pages: HashSet<Page>,
     // B3 hotness tiering: pages promoted to tier-2 (jit_tier2_note_execution) — modules
     // whose entries land on these pages compile with the expanded tier-2 budgets.
     // Survives jit_clear_cache (the pages are still the hot ones); dies with the wasm
@@ -1722,6 +1745,8 @@ impl JitState {
 
             wasm_table_index_free_list: Vec::from_iter(wasm_table_indices),
             compiling: HashMap::new(),
+            deferred_compiles: VecDeque::new(),
+            deferred_compile_pages: HashSet::new(),
             tier2_pages: HashSet::new(),
             tier2_page_last_seen: HashMap::new(),
             tier2_regions: HashMap::new(),
@@ -3470,6 +3495,7 @@ fn jit_analyze_and_generate(
     profiler::stat_increment_by(stat::COMPILE_PAGE, pages.len() as u64);
 
     for &p in &pages {
+        ctx.deferred_compile_pages.remove(&p);
         ctx.entry_points
             .entry(p)
             .or_insert_with(|| (0, HashSet::new()));
@@ -3502,6 +3528,54 @@ fn jit_analyze_and_generate(
     check_jit_state_invariants(ctx);
 }
 
+fn page_is_compiling(ctx: &JitState, page: Page) -> bool {
+    ctx.compiling.values().any(|state| match state {
+        CompilingPageState::Compiling { pages } => pages.contains_key(&page),
+        CompilingPageState::CompilingWritten => false,
+    })
+}
+
+fn drain_deferred_compiles(ctx: &mut JitState) {
+    if !unsafe { JIT_DEFERRED_COMPILE_QUEUE } {
+        return;
+    }
+
+    let max_pending = unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize };
+    while ctx.compiling.len() < max_pending {
+        let Some(candidate) = ctx.deferred_compiles.pop_front() else { break };
+
+        // Dirty-page invalidation and cache clears lazily cancel a candidate by
+        // removing it from this set; its small FIFO record can then be skipped.
+        if !ctx.deferred_compile_pages.remove(&candidate.page) {
+            continue;
+        }
+        if !ctx.entry_points.contains_key(&candidate.page)
+            || page_is_compiling(ctx, candidate.page)
+            || cpu::translate_address_read_no_side_effects(candidate.virt_address)
+                != Ok(candidate.phys_address)
+        {
+            unsafe {
+                JIT_COMPILE_DEFERRED_DROPPED = JIT_COMPILE_DEFERRED_DROPPED.wrapping_add(1);
+            }
+            continue;
+        }
+
+        let pending_before = ctx.compiling.len();
+        jit_analyze_and_generate(
+            ctx,
+            candidate.virt_address,
+            candidate.phys_address,
+            candidate.cs_offset,
+            candidate.state_flags,
+        );
+        if ctx.compiling.len() > pending_before {
+            unsafe {
+                JIT_COMPILE_DEFERRED_STARTED = JIT_COMPILE_DEFERRED_STARTED.wrapping_add(1);
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub fn codegen_finalize_finished(
     wasm_table_index: WasmTableIndex,
@@ -3531,6 +3605,7 @@ pub fn codegen_finalize_finished(
         Some(CompilingPageState::CompilingWritten) => {
             profiler::stat_increment(stat::INVALIDATE_MODULE_WRITTEN_WHILE_COMPILED);
             free_wasm_table_index(&mut ctx, wasm_table_index);
+            drain_deferred_compiles(&mut ctx);
             check_jit_state_invariants(&mut ctx);
             return;
         },
@@ -3586,6 +3661,7 @@ pub fn codegen_finalize_finished(
         free_wasm_table_index(&mut ctx, index);
     }
 
+    drain_deferred_compiles(&mut ctx);
     check_jit_state_invariants(&mut ctx);
 }
 
@@ -5400,40 +5476,72 @@ pub fn jit_increase_hotness_and_maybe_compile(
 
     let mut ctx = get_jit_state();
     let page = Page::page_of(phys_address);
-    let page_is_compiling = ctx.compiling.values().any(|state| match state {
-        CompilingPageState::Compiling { pages } => pages.contains_key(&page),
-        CompilingPageState::CompilingWritten => false,
-    });
-    let compile_cap_reached =
-        ctx.compiling.len() >= unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize };
-    let (hotness, entry_points) = ctx.entry_points.entry(page).or_insert_with(|| {
-        cpu::tlb_set_has_code(page, true);
-        profiler::stat_increment(stat::RUN_INTERPRETED_NEW_PAGE);
-        (0, HashSet::new())
-    });
+    let already_deferred = unsafe { JIT_DEFERRED_COMPILE_QUEUE }
+        && ctx.deferred_compile_pages.contains(&page);
+    let threshold_reached = {
+        let (hotness, entry_points) = ctx.entry_points.entry(page).or_insert_with(|| {
+            cpu::tlb_set_has_code(page, true);
+            profiler::stat_increment(stat::RUN_INTERPRETED_NEW_PAGE);
+            (0, HashSet::new())
+        });
 
-    if !is_near_end_of_page(phys_address) {
-        entry_points.insert(phys_address as u16 & 0xFFF);
-    }
+        if !is_near_end_of_page(phys_address) {
+            entry_points.insert(phys_address as u16 & 0xFFF);
+        }
 
-    *hotness += heat;
-    if *hotness >= unsafe { JIT_THRESHOLD } {
-        if page_is_compiling || compile_cap_reached {
-            if compile_cap_reached {
-                unsafe {
-                    JIT_COMPILE_CAP_SKIPS = JIT_COMPILE_CAP_SKIPS.wrapping_add(1);
-                }
-            }
+        // A queued page keeps learning entry points, but does not repeatedly pay
+        // the hotness/cap path while waiting for a compiler slot.
+        if already_deferred {
             return;
         }
-        // only try generating if we're in the correct address space
-        if cpu::translate_address_read_no_side_effects(virt_address) == Ok(phys_address) {
+        *hotness = hotness.wrapping_add(heat);
+        *hotness >= unsafe { JIT_THRESHOLD }
+    };
+
+    if !threshold_reached {
+        return;
+    }
+
+    if page_is_compiling(&ctx, page) {
+        return;
+    }
+
+    let compile_cap_reached =
+        ctx.compiling.len() >= unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize };
+    if compile_cap_reached {
+        unsafe {
+            JIT_COMPILE_CAP_SKIPS = JIT_COMPILE_CAP_SKIPS.wrapping_add(1);
+        }
+        if unsafe { JIT_DEFERRED_COMPILE_QUEUE }
+            && ctx.deferred_compiles.len() < JIT_DEFERRED_COMPILE_QUEUE_CAP
+            && ctx.deferred_compile_pages.insert(page)
+        {
+            ctx.deferred_compiles.push_back(DeferredCompile {
+                page,
+                virt_address,
+                phys_address,
+                cs_offset,
+                state_flags,
+            });
+            if let Some((hotness, _)) = ctx.entry_points.get_mut(&page) {
+                *hotness = 0;
+            }
+            unsafe {
+                JIT_COMPILE_DEFERRED_QUEUED = JIT_COMPILE_DEFERRED_QUEUED.wrapping_add(1);
+            }
+        }
+        return;
+    }
+
+    // only try generating if we're in the correct address space
+    if cpu::translate_address_read_no_side_effects(virt_address) == Ok(phys_address) {
+        if let Some((hotness, _)) = ctx.entry_points.get_mut(&page) {
             *hotness = 0;
-            jit_analyze_and_generate(&mut ctx, virt_address, phys_address, cs_offset, state_flags)
         }
-        else {
-            profiler::stat_increment(stat::COMPILE_WRONG_ADDRESS_SPACE);
-        }
+        jit_analyze_and_generate(&mut ctx, virt_address, phys_address, cs_offset, state_flags)
+    }
+    else {
+        profiler::stat_increment(stat::COMPILE_WRONG_ADDRESS_SPACE);
     }
 }
 
@@ -5585,6 +5693,9 @@ fn free_wasm_module_forest(ctx: &mut JitState, roots: Vec<WasmTableIndex>) {
 
 /// Register a write in this page: Delete all present code
 fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
+    // A deferred record is left in the FIFO as a cheap tombstone and skipped by
+    // drain_deferred_compiles; the membership set is the cancellation authority.
+    ctx.deferred_compile_pages.remove(&page);
     // A region is valid only for the exact code bytes/modules from which it was
     // learned. Any member page becoming dirty invalidates the complete plan;
     // ordinary hotness can learn a fresh one from the replacement code.
@@ -5702,6 +5813,8 @@ pub fn jit_dirty_cache_small(start_addr: u32, end_addr: u32) {
 pub fn jit_clear_cache_js() { jit_clear_cache(&mut get_jit_state()) }
 
 fn jit_clear_cache(ctx: &mut JitState) {
+    ctx.deferred_compiles.clear();
+    ctx.deferred_compile_pages.clear();
     let mut pages_with_code = HashSet::new();
 
     for &p in ctx.entry_points.keys() {
@@ -5891,6 +6004,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         34 => JIT_EXACT_PAGE_TAIL = value != 0,
         35 => JIT_REP_MOVS_REDUCED_SPILL = value != 0,
         36 => JIT_SYNC_BOUNDARY_CONTINUATION = value != 0,
+        37 => JIT_DEFERRED_COMPILE_QUEUE = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -5935,6 +6049,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         34 => JIT_EXACT_PAGE_TAIL as u32,
         35 => JIT_REP_MOVS_REDUCED_SPILL as u32,
         36 => JIT_SYNC_BOUNDARY_CONTINUATION as u32,
+        37 => JIT_DEFERRED_COMPILE_QUEUE as u32,
         _ => 0,
     }
 }
@@ -5964,6 +6079,20 @@ pub fn jit_get_compile_completed() -> u32 { unsafe { JIT_COMPILE_COMPLETED } }
 pub fn jit_get_compile_cap_skips() -> u32 { unsafe { JIT_COMPILE_CAP_SKIPS } }
 
 #[no_mangle]
+pub fn jit_get_compile_deferred_queued() -> u32 { unsafe { JIT_COMPILE_DEFERRED_QUEUED } }
+
+#[no_mangle]
+pub fn jit_get_compile_deferred_started() -> u32 { unsafe { JIT_COMPILE_DEFERRED_STARTED } }
+
+#[no_mangle]
+pub fn jit_get_compile_deferred_dropped() -> u32 { unsafe { JIT_COMPILE_DEFERRED_DROPPED } }
+
+#[no_mangle]
+pub fn jit_get_compile_deferred_pending() -> u32 {
+    get_jit_state().deferred_compile_pages.len() as u32
+}
+
+#[no_mangle]
 pub fn jit_get_compile_pending() -> u32 { get_jit_state().compiling.len() as u32 }
 
 #[no_mangle]
@@ -5986,6 +6115,9 @@ pub fn jit_reset_compile_stats() {
         JIT_COMPILE_PENDING_HIGH_WATER = get_jit_state().compiling.len() as u32;
         JIT_COMPILE_TOTAL_US = 0;
         JIT_COMPILE_MAX_US = 0;
+        JIT_COMPILE_DEFERRED_QUEUED = 0;
+        JIT_COMPILE_DEFERRED_STARTED = 0;
+        JIT_COMPILE_DEFERRED_DROPPED = 0;
     }
 }
 

@@ -129,8 +129,9 @@ static mut JIT_SYNC_BOUNDARY_CONTINUATION: bool = true;
 static mut JIT_SYNC_BOUNDARY_CONTINUATION_SITES_COMPILED: u32 = 0;
 // Queue one hot page once when the asynchronous WebAssembly compile window is
 // full, then admit it as soon as a slot completes. This avoids re-running the
-// cap/compiling scans on every interpreted slice. Experimental config idx 37.
-static mut JIT_DEFERRED_COMPILE_QUEUE: bool = false;
+// cap/compiling scans on every interpreted slice. Config idx 37; enabled after
+// the bounded lifecycle benchmark, with a runtime kill-switch retained.
+static mut JIT_DEFERRED_COMPILE_QUEUE: bool = true;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_SECOND_WAY_HITS: u64 = 0;

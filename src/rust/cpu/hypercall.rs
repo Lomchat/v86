@@ -56,13 +56,13 @@ use std::ptr::{addr_of, addr_of_mut};
 
 use crate::cpu::memory;
 use crate::cpu::cpu::{
-    read_reg32, safe_read32s, safe_write32, write_reg32, EAX, EBP, EDX, ESP, FS,
+    read_reg32, safe_read32s, safe_write32, write_reg32, EAX, EDX, ESP,
 };
 use crate::cpu::hypercall_rtti::{rt_dynamic_cast, RtDynamicCastResult};
 use crate::cpu::fpu::{
     fpu_get_st0, fpu_get_sti, fpu_pop, fpu_push, fpu_truncate_to_i64, fpu_write_st,
 };
-use crate::cpu::global_pointers::{fpu_stack_ptr, instruction_counter, segment_offsets};
+use crate::cpu::global_pointers::{fpu_stack_ptr, instruction_counter};
 use crate::softfloat::F80;
 
 /// Dedicated page for hypercall shared data + preemption control.
@@ -348,7 +348,6 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         // Public D3DX math leaves (generic across D3D9 games).
         82 => handle_d3dx_vec3_catmull_rom(),
         83 => handle_d3dx_matrix_inverse(),
-        84 => handle_msvc_eh_prolog(),
 
         // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels,
         //    kept in a distinct range from the
@@ -988,61 +987,6 @@ unsafe fn handle_ftol() -> bool {
     fpu_pop();
     write_reg32(EAX, v as i32);          // low 32
     write_reg32(EDX, (v >> 32) as i32);  // high 32
-    true
-}
-
-/// Statically-linked MSVC `_EH_prolog`.
-///
-/// The generated guest wrapper pushes the incoming EAX (the exception-handler
-/// address) before loading its hypercall function id. If `saved_esp` is the
-/// resulting ESP, then the caller's original stack pointer is `saved_esp + 4`.
-/// Recreate the exact four-word registration record and register state expected
-/// after the real helper's RET; the wrapper's own RET performs the final pop.
-unsafe fn handle_msvc_eh_prolog() -> bool {
-    let saved_esp = read_reg32(ESP);
-    let caller_esp = saved_esp.wrapping_add(4);
-    let return_addr = match safe_read32s(caller_esp) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let handler = match safe_read32s(saved_esp) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let fs_base = *segment_offsets.offset(FS as isize);
-    if fs_base == 0 {
-        return false;
-    }
-    let old_seh = match safe_read32s(fs_base) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let old_ebp = read_reg32(EBP);
-    let wrapper_ret_slot = caller_esp.wrapping_sub(16);
-    let frame = caller_esp.wrapping_sub(12);
-
-    // Preflight every destination before mutating anything. A valid Win32 stack
-    // is writable, but the reads keep malformed calls on the JS/original
-    // fallback without leaving a half-built SEH frame.
-    for addr in [wrapper_ret_slot, frame, frame + 4, frame + 8, frame + 12] {
-        if safe_read32s(addr).is_err() {
-            return false;
-        }
-    }
-
-    if safe_write32(wrapper_ret_slot, return_addr).is_err()
-        || safe_write32(frame, old_seh).is_err()
-        || safe_write32(frame + 4, handler).is_err()
-        || safe_write32(frame + 8, -1).is_err()
-        || safe_write32(frame + 12, old_ebp).is_err()
-        || safe_write32(fs_base, frame).is_err()
-    {
-        return false;
-    }
-
-    write_reg32(ESP, wrapper_ret_slot);
-    write_reg32(EBP, caller_esp);
-    write_reg32(EAX, return_addr);
     true
 }
 

@@ -1611,7 +1611,7 @@ static mut JIT_THRESHOLD: u32 = 200 * 1000;
 /// Deliberately not the same knob as JIT_THRESHOLD: lowering that globally was
 /// measured 17-19% slower on a cold boot because it also compiles cold pages,
 /// nearly doubling the module count for identical guest work.
-static mut JIT_RECOMPILE_DIVISOR: u32 = 1;
+static mut JIT_RECOMPILE_DIVISOR: u32 = 8;
 
 // less branches will generate if-else, more will generate brtable
 pub const BRTABLE_CUTOFF: usize = 10;

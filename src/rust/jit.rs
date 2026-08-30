@@ -162,6 +162,7 @@ static mut LEAF_CALL_FUSION_SITES_COMPILED: u32 = 0;
 // authoritative. Kept OFF until cross-workload A/B validates the extra code.
 static mut JIT_TIER2_EXTERNAL_LEAF_CALL_FUSION: bool = false;
 static mut EXTERNAL_LEAF_CALL_FUSION_SITES_COMPILED: u32 = 0;
+const EXTERNAL_LEAF_DEPENDENCY_MAX_PAGES: usize = 2;
 
 // B1b: direct-mapped memo in front of the dynamic-chaining tlb_code walk
 // (measured 1.5% self + part of the 7% indirect-jump bucket, NFSU in-race).
@@ -3085,6 +3086,7 @@ fn jit_find_basic_blocks(
     if tier2 && unsafe { JIT_TIER2_EXTERNAL_LEAF_CALL_FUSION } {
         let mut candidates = Vec::new();
         let mut fused_external_targets = HashSet::new();
+        let mut external_dependency_pages = HashSet::new();
         for block in basic_blocks.values() {
             if memory::read8(block.last_instruction_addr) as u8 != 0xE8
                 || !basic_blocks.contains_key(&block.end_addr)
@@ -3136,7 +3138,9 @@ fn jit_find_basic_blocks(
                 || is_near_end_of_page(target)
                 || region_target_excluded(target_virt as u32)
                 || tier2_region.map_or(false, |region| !region.pages.contains(&target_page))
-                || (!pages.contains(&target_page) && pages.len() as u32 >= max_pages)
+                || (!pages.contains(&target_page)
+                    && !external_dependency_pages.contains(&target_page)
+                    && external_dependency_pages.len() >= EXTERNAL_LEAF_DEPENDENCY_MAX_PAGES)
             {
                 continue;
             }
@@ -3214,6 +3218,7 @@ fn jit_find_basic_blocks(
 
             if let Some(leaf) = leaf {
                 basic_blocks.insert(target, leaf);
+                external_dependency_pages.insert(target_page);
                 pages.insert(target_page);
             }
             if let Some(block) = basic_blocks.get_mut(&call_addr) {
@@ -3586,13 +3591,14 @@ fn jit_analyze_and_generate(
     // tier-2 budgets are active (see max_pages in jit_find_basic_blocks) — assert
     // against the widest configured budget, not the base knob.
     dbg_assert!(
-        pages.len()
+        owned_pages.len()
             <= unsafe {
                 MAX_PAGES
                     .max(JIT_INDIRECT_REGION_MAX_PAGES)
                     .max(TIER2_MAX_PAGES)
             } as usize
     );
+    dbg_assert!(dependency_pages.len() <= EXTERNAL_LEAF_DEPENDENCY_MAX_PAGES);
 
     let basic_block_by_addr: HashMap<u32, BasicBlock> =
         basic_blocks.into_iter().map(|b| (b.addr, b)).collect();

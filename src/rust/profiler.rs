@@ -166,6 +166,11 @@ pub enum stat {
     ABSEIP_DISPATCH,
     RET_CHAIN_HIT,
     RET_CHAIN_MISS,
+
+    // Guarded continuation after a synchronous block boundary (config 36).
+    // Counts only the runtime arm that stays in the current compiled module;
+    // each hit replaces one otherwise mandatory module exit + re-entry.
+    SYNC_BOUNDARY_CONTINUE,
 }
 
 #[allow(non_upper_case_globals)]
@@ -217,7 +222,8 @@ pub fn profiler_fpu_relaxed_fallback_get() -> f64 {
 // Block-chaining readout. Reads the dispatch-characterisation counters directly out of
 // stat_array regardless of the `profiler` feature (unlike profiler_stat_get). Index order:
 // 0=BLOCK_EXECUTION 1=MODULE_REENTRY 2=MODULE_EXIT_CHAINABLE 3=MODULE_EXIT_DYNAMIC
-// 4=MODULE_EXIT_INDIRECT 5=MODULE_CHAINED_EDGE 6=MODULE_CHAIN_BUDGET_EXIT 7=MODULE_CHAIN_MISS.
+// 4=MODULE_EXIT_INDIRECT 5=MODULE_CHAINED_EDGE 6=MODULE_CHAIN_BUDGET_EXIT 7=MODULE_CHAIN_MISS
+// 13=SYNC_BOUNDARY_CONTINUE.
 #[no_mangle]
 pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
     let stat = match index {
@@ -234,6 +240,7 @@ pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
         10 => stat::ABSEIP_DISPATCH,
         11 => stat::RET_CHAIN_HIT,
         12 => stat::RET_CHAIN_MISS,
+        13 => stat::SYNC_BOUNDARY_CONTINUE,
         _ => return 0.0,
     };
     unsafe { stat_array[stat as usize] as f64 }

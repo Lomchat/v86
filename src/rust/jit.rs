@@ -122,8 +122,10 @@ static mut JIT_REP_MOVS_REDUCED_SPILL: bool = true;
 // The generated edge is guarded by the authoritative runtime EIP, the LIVE
 // scheduler budget (the boundary may have changed it), and in_hlt. Any async
 // park, interrupt, fault, or preemption request therefore keeps the historical
-// module-exit path. Compile-time switch idx 36, OFF until cross-workload A/B.
-static mut JIT_SYNC_BOUNDARY_CONTINUATION: bool = false;
+// module-exit path. Compile-time switch idx 36; enabled after a guarded redirect
+// test, +52–55% synthetic throughput, 728,912 directly counted continuations in
+// a BFME II setup window, and no regression in a long 3D A/B.
+static mut JIT_SYNC_BOUNDARY_CONTINUATION: bool = true;
 static mut JIT_SYNC_BOUNDARY_CONTINUATION_SITES_COMPILED: u32 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_CALLS: u64 = 0;
 static mut DYNAMIC_CHAIN_SITE_PIC_DIAG_TARGET_MISSES: u64 = 0;
@@ -4365,6 +4367,10 @@ fn jit_generate_module(
                                     ctx.builder.eqz_i32();
                                     ctx.builder.and_i32();
                                     ctx.builder.if_void();
+                                    codegen::gen_dispatch_stat_increment(
+                                        ctx.builder,
+                                        stat::SYNC_BOUNDARY_CONTINUE,
+                                    );
                                     ctx.builder.const_i32(next_index.into());
                                     ctx.builder.set_local(target_block);
                                     ctx.builder.br(main_loop_label);

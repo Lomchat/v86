@@ -1654,6 +1654,33 @@ static mut JIT_RECOMPILE_DIVISOR: u32 = 8;
 /// optimisation disabled.
 static mut JIT_HONOR_URGENT_EXIT_IN_SLICE: u32 = 0;
 
+/// Guard dynamic chaining on the park address rather than on a zeroed budget.
+///
+/// The budget check exists to preserve one invariant: never chain past an async
+/// park, because the parked thread's return address was overwritten with the spin
+/// loop and chaining into it would loop inside the module without ever reaching
+/// the outer loop's park check. Using "the budget is zero" as a proxy is far
+/// wider than the invariant — it disables chaining for the whole remainder of any
+/// slice in which any thunk asked to exit. Testing the park address directly is
+/// the exact condition, and it changes no scheduling: the slice already runs to
+/// its local budget either way.
+static mut JIT_CHAIN_PARK_GUARD: u32 = 0;
+
+#[no_mangle]
+pub fn jit_chain_park_guard() -> u32 { unsafe { JIT_CHAIN_PARK_GUARD } }
+
+/// Address the generated chaining guards read for the slice budget. With the
+/// park guard on this is the slice's own budget, which an urgent exit does not
+/// zero, so a chaining edge is refused only when the budget is genuinely spent.
+fn chain_budget_address() -> u32 {
+    if unsafe { JIT_CHAIN_PARK_GUARD } != 0 {
+        std::ptr::addr_of!(cpu::jit_slice_limit) as u32
+    }
+    else {
+        std::ptr::addr_of!(cpu::jit_cycle_limit_cached) as u32
+    }
+}
+
 #[no_mangle]
 pub fn jit_honor_urgent_exit_in_slice() -> u32 { unsafe { JIT_HONOR_URGENT_EXIT_IN_SLICE } }
 
@@ -1661,7 +1688,14 @@ pub fn jit_honor_urgent_exit_in_slice() -> u32 { unsafe { JIT_HONOR_URGENT_EXIT_
 pub const BRTABLE_CUTOFF: usize = 10;
 
 // needs to be synced to const.js
-pub const WASM_TABLE_SIZE: u32 = 900;
+//
+// 900 does not hold a game's working set. Measured in a BFME 1 session on real
+// hardware: 8,906 compilations against 900 slots, i.e. the same pages compiled,
+// evicted and recompiled about ten times, at 4.1 compilations per rendered
+// frame. Every eviction also costs the return-prediction cache (freeing a slot
+// invalidates it globally), so the churn compounds. Sized to hold the working
+// set instead; the static tables below grow linearly and stay under 300 KB.
+pub const WASM_TABLE_SIZE: u32 = 4096;
 
 /// Count of full JIT cache flushes caused by wasm-table exhaustion.
 static mut JIT_CACHE_FLUSHES: u32 = 0;
@@ -2464,11 +2498,22 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     // same quantum as do_many_cycles_native (limit==0 urgent exit and in_hlt still bail) —
     // this is what keeps the async-park/spin-loop invariant: an urgent
     // exit request zeroes the budget, so we never chain past it.
-    let limit = hypercall::read_cycle_limit();
+    let park_guard = JIT_CHAIN_PARK_GUARD != 0;
+    // The park signal, not the urgent-exit signal: a parked thread's return
+    // address is the spin loop, so refusing that one target is the whole
+    // invariant. Everything else stays bounded by the slice's real budget.
+    let limit = if park_guard {
+        cpu::jit_slice_limit
+    }
+    else {
+        hypercall::read_cycle_limit()
+    };
     let elapsed = (*global_pointers::instruction_counter)
         .wrapping_sub(cpu::jit_cycle_start_instruction_counter);
+    let parked = park_guard
+        && hypercall::eip_at_park(*global_pointers::instruction_pointer as u32);
 
-    if limit == 0 || elapsed >= limit || *global_pointers::in_hlt {
+    if limit == 0 || elapsed >= limit || *global_pointers::in_hlt || parked {
         if dispatch_stats_enabled() {
             profiler::stat_increment_always(stat::RET_CHAIN_MISS);
             DYNAMIC_CHAIN_RESOLVE_BUDGET_MISSES =
@@ -4117,9 +4162,7 @@ fn gen_chain_or_exit_to_known_successor(
     // this slice. A direct JIT edge cannot cross the thunk/module exit that may
     // change it, so use the cached value instead of re-reading and branching on
     // the hypercall page at every tiny-block edge.
-    ctx.builder.load_fixed_i32(
-        std::ptr::addr_of!(cpu::jit_cycle_limit_cached) as u32,
-    );
+    ctx.builder.load_fixed_i32(chain_budget_address());
     let cycle_limit = ctx.builder.set_new_local();
 
     // limit != 0 && (global + pending - slice_start) < limit && !in_hlt
@@ -4317,7 +4360,7 @@ fn gen_dynamic_chain_site_pic_lookup(
     // The historical helper checks this before every chain. Keep the same
     // scheduler boundary on the generated hit path; a failed guard enters the
     // helper, which returns -1 without refreshing the memo.
-    ctx.builder.load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_limit_cached) as u32);
+    ctx.builder.load_fixed_i32(chain_budget_address());
     let cycle_limit = ctx.builder.tee_new_local();
     ctx.builder.const_i32(0);
     ctx.builder.ne_i32();
@@ -4340,7 +4383,7 @@ fn gen_dynamic_chain_site_pic_lookup(
 
     // Compute the scheduler guard once for every polymorphic way. This whole
     // arm is skipped by the unchanged primary hit path above.
-    ctx.builder.load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_limit_cached) as u32);
+    ctx.builder.load_fixed_i32(chain_budget_address());
     let miss_cycle_limit = ctx.builder.tee_new_local();
     ctx.builder.const_i32(0);
     ctx.builder.ne_i32();
@@ -6442,6 +6485,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         42 => JIT_RECOMPILE_DIVISOR = value.clamp(1, 64),
         43 => JIT_PARTIAL_EVICTION = (value != 0) as u32,
         44 => JIT_HONOR_URGENT_EXIT_IN_SLICE = (value != 0) as u32,
+        45 => JIT_CHAIN_PARK_GUARD = (value != 0) as u32,
         _ => dbg_assert!(false),
     }
 }
@@ -6494,6 +6538,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         42 => JIT_RECOMPILE_DIVISOR,
         43 => JIT_PARTIAL_EVICTION,
         44 => JIT_HONOR_URGENT_EXIT_IN_SLICE,
+        45 => JIT_CHAIN_PARK_GUARD,
         _ => 0,
     }
 }

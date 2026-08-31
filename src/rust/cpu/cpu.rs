@@ -294,6 +294,17 @@ pub static mut jit_cycle_start_instruction_counter: u32 = 0;
 // hypercall page on every tiny-block edge.
 pub static mut jit_cycle_limit_cached: u32 = 0;
 
+/// The slice's own instruction budget, set once per do_many_cycles_native and
+/// never zeroed by an urgent exit.
+///
+/// jit_cycle_limit_cached doubles as the urgent-exit signal, so a thunk asking to
+/// end the slice makes every chaining edge refuse for the remainder — measured on
+/// a map load as 1,602,938 refusals from a zeroed budget against 458 from a slice
+/// that genuinely ran its course. But zeroing it does not end the slice: the
+/// native loop tests a local copy. Bounding chaining by the real budget keeps
+/// preemption honest without conflating it with the park signal.
+pub static mut jit_slice_limit: u32 = 0;
+
 /// Synchronize an asynchronous host-side budget change with the copy embedded
 /// in generated edge guards. The hypercall page remains authoritative between
 /// slices; this setter only makes an urgent zero visible before the current JIT
@@ -3534,6 +3545,7 @@ pub unsafe fn do_many_cycles_native() {
     jit_cycle_start_instruction_counter = initial_instruction_counter;
     let limit = hypercall::read_cycle_limit();
     jit_cycle_limit_cached = limit;
+    jit_slice_limit = limit;
     // Park-address exit: the spin loop (JMP $ at the async-park address) is a PARKING
     // slot, not code — once EIP lands there, burning the rest of the slice budget
     // honestly executing it is pure waste (measured in-race on NFSU: 1.8B spin

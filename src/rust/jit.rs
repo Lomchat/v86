@@ -295,12 +295,43 @@ pub fn jit_dynamic_chain_resolver_diag_meta_hits() -> u64 {
     unsafe { DYNAMIC_CHAIN_RESOLVE_META_HITS }
 }
 
+/// Which hazard forced a global invalidation. The epoch covers two unrelated
+/// ones — a recycled table slot and a changed code mapping — and only the first
+/// could be narrowed to the affected slot, so knowing the split decides whether
+/// narrowing is worth anything.
+static mut RET_CACHE_INVALIDATED_BY_SLOT: u32 = 0;
+static mut RET_CACHE_INVALIDATED_BY_TLB: u32 = 0;
+
+#[no_mangle]
+pub fn jit_ret_cache_invalidations_by_slot() -> u32 { unsafe { RET_CACHE_INVALIDATED_BY_SLOT } }
+
+#[no_mangle]
+pub fn jit_ret_cache_invalidations_by_tlb() -> u32 { unsafe { RET_CACHE_INVALIDATED_BY_TLB } }
+
+#[no_mangle]
+pub fn jit_ret_cache_invalidations_reset() {
+    unsafe {
+        RET_CACHE_INVALIDATED_BY_SLOT = 0;
+        RET_CACHE_INVALIDATED_BY_TLB = 0;
+    }
+}
+
 pub fn ret_cache_invalidate_all() {
     unsafe {
         RET_CACHE_EPOCH += 1;
         let next = CHAIN_TARGET_EPOCH.wrapping_add(1);
         CHAIN_TARGET_EPOCH = if next == 0 { 1 } else { next };
     }
+}
+
+pub fn ret_cache_invalidate_all_slot_free() {
+    unsafe { RET_CACHE_INVALIDATED_BY_SLOT = RET_CACHE_INVALIDATED_BY_SLOT.wrapping_add(1) };
+    ret_cache_invalidate_all();
+}
+
+pub fn ret_cache_invalidate_all_tlb() {
+    unsafe { RET_CACHE_INVALIDATED_BY_TLB = RET_CACHE_INVALIDATED_BY_TLB.wrapping_add(1) };
+    ret_cache_invalidate_all();
 }
 
 // Count of double-frees the release-safe guard in free_wasm_table_index absorbed.
@@ -2395,6 +2426,26 @@ pub fn jit_find_cache_entry_in_page(
 /// RET/AbsoluteEip dynamic chaining: budget-guarded tlb_code lookup at the runtime eip,
 /// returning the packed (table_slot << 16 | unit_state) target convention, with its own
 /// RET_CHAIN_HIT/RET_CHAIN_MISS stats.
+static mut DYNAMIC_CHAIN_BUDGET_ZERO: u64 = 0;
+static mut DYNAMIC_CHAIN_BUDGET_SPENT: u64 = 0;
+static mut DYNAMIC_CHAIN_BUDGET_HLT: u64 = 0;
+
+#[no_mangle]
+pub fn jit_dynamic_chain_budget_zero() -> u64 { unsafe { DYNAMIC_CHAIN_BUDGET_ZERO } }
+#[no_mangle]
+pub fn jit_dynamic_chain_budget_spent() -> u64 { unsafe { DYNAMIC_CHAIN_BUDGET_SPENT } }
+#[no_mangle]
+pub fn jit_dynamic_chain_budget_hlt() -> u64 { unsafe { DYNAMIC_CHAIN_BUDGET_HLT } }
+
+#[no_mangle]
+pub fn jit_dynamic_chain_budget_reset() {
+    unsafe {
+        DYNAMIC_CHAIN_BUDGET_ZERO = 0;
+        DYNAMIC_CHAIN_BUDGET_SPENT = 0;
+        DYNAMIC_CHAIN_BUDGET_HLT = 0;
+    }
+}
+
 #[no_mangle]
 pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32 {
     // same quantum as do_many_cycles_native (limit==0 urgent exit and in_hlt still bail) —
@@ -2409,6 +2460,19 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
             profiler::stat_increment_always(stat::RET_CHAIN_MISS);
             DYNAMIC_CHAIN_RESOLVE_BUDGET_MISSES =
                 DYNAMIC_CHAIN_RESOLVE_BUDGET_MISSES.saturating_add(1);
+            // The three conditions have nothing in common as causes: an urgent
+            // exit requested by the host, a slice that genuinely ran its course,
+            // and a halted CPU. Only the first two are worth acting on, and they
+            // call for opposite fixes.
+            if limit == 0 {
+                DYNAMIC_CHAIN_BUDGET_ZERO = DYNAMIC_CHAIN_BUDGET_ZERO.saturating_add(1);
+            }
+            else if elapsed >= limit {
+                DYNAMIC_CHAIN_BUDGET_SPENT = DYNAMIC_CHAIN_BUDGET_SPENT.saturating_add(1);
+            }
+            else {
+                DYNAMIC_CHAIN_BUDGET_HLT = DYNAMIC_CHAIN_BUDGET_HLT.saturating_add(1);
+            }
         }
         return -1;
     }
@@ -5950,7 +6014,7 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
     // path frees replaced indices without going through free_wasm_module (that gap was
     // the null-function crash of the first landing — see the RET_CACHE comment). Also
     // reset the tier-2 execution counter for the recycled index (B3).
-    ret_cache_invalidate_all();
+    ret_cache_invalidate_all_slot_free();
     unsafe {
         let slot = wasm_table_index.to_u16() as usize;
         MODULE_EXEC_COUNTS[slot] = 0;

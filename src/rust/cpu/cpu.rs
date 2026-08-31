@@ -3542,11 +3542,18 @@ pub unsafe fn do_many_cycles_native() {
     // so thunk-stub tails (OUT + RET N into the spin loop) execute normally first —
     // exiting mid-stub instead breaks the async-park ESP bookkeeping (observed as
     // "async RET N mismatch" → stack-EIP fault → guest SEH ExitProcess(0)).
+    let honor_urgent = jit::jit_honor_urgent_exit_in_slice() != 0;
     while (*instruction_counter).wrapping_sub(initial_instruction_counter) < limit
         && !*in_hlt
         && !hypercall::eip_at_park(*instruction_pointer as u32)
     {
         cycle_internal();
+        // A thunk that asked to end the slice zeroed the cached budget. Testing it
+        // here is what actually ends the slice; without it the request only costs
+        // the rest of the slice its chaining.
+        if honor_urgent && jit_cycle_limit_cached == 0 {
+            break;
+        }
     }
 }
 

@@ -1644,6 +1644,19 @@ static mut JIT_THRESHOLD: u32 = 200 * 1000;
 /// nearly doubling the module count for identical guest work.
 static mut JIT_RECOMPILE_DIVISOR: u32 = 8;
 
+/// Whether the native cycle loop re-checks the urgent-exit signal each iteration.
+///
+/// requestImmediateExit() zeroes the shared budget and the JIT's cached copy, but
+/// do_many_cycles_native tests a local snapshot taken at slice entry — so the loop
+/// keeps running. The zero only stops generated edges from chaining. A caller that
+/// asked to end the slice therefore gets the opposite of what it wanted: the guest
+/// runs on to the full 500,003-instruction budget with every budget-guarded
+/// optimisation disabled.
+static mut JIT_HONOR_URGENT_EXIT_IN_SLICE: u32 = 0;
+
+#[no_mangle]
+pub fn jit_honor_urgent_exit_in_slice() -> u32 { unsafe { JIT_HONOR_URGENT_EXIT_IN_SLICE } }
+
 // less branches will generate if-else, more will generate brtable
 pub const BRTABLE_CUTOFF: usize = 10;
 
@@ -6428,6 +6441,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT = value != 0,
         42 => JIT_RECOMPILE_DIVISOR = value.clamp(1, 64),
         43 => JIT_PARTIAL_EVICTION = (value != 0) as u32,
+        44 => JIT_HONOR_URGENT_EXIT_IN_SLICE = (value != 0) as u32,
         _ => dbg_assert!(false),
     }
 }
@@ -6479,6 +6493,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT as u32,
         42 => JIT_RECOMPILE_DIVISOR,
         43 => JIT_PARTIAL_EVICTION,
+        44 => JIT_HONOR_URGENT_EXIT_IN_SLICE,
         _ => 0,
     }
 }

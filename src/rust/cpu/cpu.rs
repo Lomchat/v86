@@ -3093,6 +3093,7 @@ pub unsafe fn cycle_internal() {
     let mut jit_entry = None;
     let mut tier2_profile_exit = false;
     let initial_eip = *instruction_pointer;
+    crate::trace_profiler::hotpage_note(initial_eip as u32);
     // dbg_on_instruction stays: it's gated by DBG_ENABLED (off by default), the guest debugger's
     // interpreter hook.
     // BottleShip: when ONLY breakpoints are active (no step-trace), restrict the per-block hook to

@@ -22,6 +22,93 @@ use std::collections::HashMap;
 use crate::jit;
 use crate::page::Page;
 
+/// Discovery histogram: dispatch entries per guest page, with no prior knowledge.
+///
+/// The trace2 machinery above can only instrument pages named in advance, so it
+/// cannot find a hot page nobody has guessed — and a JS-timer sampler cannot
+/// either, because a guest that stalls for seconds inside one synchronous slice
+/// never lets the event loop run. This counts inside the dispatch loop instead,
+/// so a stall is exactly the thing it can see.
+///
+/// Direct-mapped and lossy on collision: a discovery pass wants the few dominant
+/// pages, and the collision count says whether the answer can be trusted.
+const HOTPAGE_SLOTS: usize = 16384;
+static mut HOTPAGE_ARMED: bool = false;
+static mut HOTPAGE_TAG: [u32; HOTPAGE_SLOTS] = [0; HOTPAGE_SLOTS];
+static mut HOTPAGE_COUNT: [u64; HOTPAGE_SLOTS] = [0; HOTPAGE_SLOTS];
+static mut HOTPAGE_COLLISIONS: u64 = 0;
+static mut HOTPAGE_TOTAL: u64 = 0;
+static mut HOTPAGE_SNAPSHOT: Vec<(u32, u64)> = Vec::new();
+
+#[inline]
+pub fn hotpage_note(eip: u32) {
+    unsafe {
+        if !HOTPAGE_ARMED {
+            return;
+        }
+        // +1 so tag 0 can mean "slot empty" without losing page 0.
+        let tag = (eip >> 12).wrapping_add(1);
+        let idx = (tag.wrapping_mul(2654435761) >> 13) as usize & (HOTPAGE_SLOTS - 1);
+        HOTPAGE_TOTAL += 1;
+        if HOTPAGE_TAG[idx] == tag {
+            HOTPAGE_COUNT[idx] += 1;
+        }
+        else if HOTPAGE_TAG[idx] == 0 {
+            HOTPAGE_TAG[idx] = tag;
+            HOTPAGE_COUNT[idx] = 1;
+        }
+        else {
+            HOTPAGE_COLLISIONS += 1;
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe fn hotpage_arm(on: u32) {
+    HOTPAGE_ARMED = on != 0;
+}
+
+#[no_mangle]
+pub unsafe fn hotpage_reset() {
+    HOTPAGE_TAG = [0; HOTPAGE_SLOTS];
+    HOTPAGE_COUNT = [0; HOTPAGE_SLOTS];
+    HOTPAGE_COLLISIONS = 0;
+    HOTPAGE_TOTAL = 0;
+    HOTPAGE_SNAPSHOT.clear();
+}
+
+/// Freeze the live table into a descending snapshot; returns its length.
+#[no_mangle]
+pub unsafe fn hotpage_snapshot() -> u32 {
+    let mut v: Vec<(u32, u64)> = Vec::new();
+    for i in 0..HOTPAGE_SLOTS {
+        if HOTPAGE_TAG[i] != 0 {
+            v.push(((HOTPAGE_TAG[i] - 1) << 12, HOTPAGE_COUNT[i]));
+        }
+    }
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    HOTPAGE_SNAPSHOT = v;
+    HOTPAGE_SNAPSHOT.len() as u32
+}
+
+#[no_mangle]
+pub unsafe fn hotpage_addr(i: u32) -> u32 {
+    HOTPAGE_SNAPSHOT.get(i as usize).map_or(0, |e| e.0)
+}
+
+#[no_mangle]
+pub unsafe fn hotpage_count_at(i: u32) -> u32 {
+    HOTPAGE_SNAPSHOT
+        .get(i as usize)
+        .map_or(0, |e| e.1.min(u32::MAX as u64) as u32)
+}
+
+#[no_mangle]
+pub unsafe fn hotpage_collisions() -> u32 { HOTPAGE_COLLISIONS.min(u32::MAX as u64) as u32 }
+
+#[no_mangle]
+pub unsafe fn hotpage_total() -> u32 { HOTPAGE_TOTAL.min(u32::MAX as u64) as u32 }
+
 pub const MAX_WATCHED_PAGES: usize = 64;
 pub const MAX_BLOCK_SLOTS: usize = 8192;
 pub const MAX_INDIRECT_TARGETS: usize = 8192;

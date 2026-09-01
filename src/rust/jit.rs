@@ -1794,6 +1794,28 @@ fn jit_evict_unused(ctx: &mut JitState) -> usize {
     victims.len()
 }
 
+/// Pages whose compiled module was discarded because the page was written to.
+/// A module that keeps being thrown away is recompiled from scratch, and every
+/// instruction executed between the two is interpreted — so this separates
+/// "never got hot" from "got hot repeatedly and kept losing its code" as the
+/// reason a hot page has no module.
+static mut JIT_PAGE_INVALIDATIONS_WITH_CODE: u32 = 0;
+static mut JIT_PAGE_INVALIDATIONS_NO_CODE: u32 = 0;
+
+#[no_mangle]
+pub fn jit_get_page_invalidations_with_code() -> u32 { unsafe { JIT_PAGE_INVALIDATIONS_WITH_CODE } }
+
+#[no_mangle]
+pub fn jit_get_page_invalidations_no_code() -> u32 { unsafe { JIT_PAGE_INVALIDATIONS_NO_CODE } }
+
+#[no_mangle]
+pub fn jit_reset_page_invalidations() {
+    unsafe {
+        JIT_PAGE_INVALIDATIONS_WITH_CODE = 0;
+        JIT_PAGE_INVALIDATIONS_NO_CODE = 0;
+    }
+}
+
 #[no_mangle]
 pub fn jit_get_cache_flushes() -> u32 { unsafe { JIT_CACHE_FLUSHES } }
 
@@ -1911,6 +1933,12 @@ static mut JIT_COMPILE_DEFERRED_QUEUED: u32 = 0;
 static mut JIT_COMPILE_DEFERRED_STARTED: u32 = 0;
 static mut JIT_COMPILE_DEFERRED_DROPPED: u32 = 0;
 
+/// Interpreted-execution state of one physical page that has no module yet.
+struct PageHotness {
+    hotness: u32,
+    entry_points: HashSet<u16>,
+}
+
 struct JitState {
     wasm_builder: WasmBuilder,
 
@@ -1918,7 +1946,7 @@ struct JitState {
     // (faster, but uses much more memory)
     // or a compressed bitmap (likely faster)
     // or HashSet<u32> rather than nested
-    entry_points: HashMap<Page, (u32, HashSet<u16>)>,
+    entry_points: HashMap<Page, PageHotness>,
     pages: HashMap<Page, PageInfo>,
     wasm_table_index_free_list: Vec<WasmTableIndex>,
     // WebAssembly compilation is asynchronous. Keep a small bounded set in
@@ -2946,7 +2974,9 @@ fn jit_find_basic_blocks(
 
         if !pages.contains(&phys_page) {
             // page seen for the first time, handle entry points
-            if let Some((hotness, entry_points)) = ctx.entry_points.get_mut(&phys_page) {
+            if let Some(PageHotness { hotness, entry_points, .. }) =
+                ctx.entry_points.get_mut(&phys_page)
+            {
                 let existing_entry_points = match ctx.pages.get(&phys_page) {
                     Some(PageInfo { entry_points, .. }) => {
                         HashSet::from_iter(entry_points.iter().map(|x| x.0))
@@ -3338,8 +3368,10 @@ fn jit_find_basic_blocks(
                                 .map_or(false, |phys| {
                                     ctx.entry_points
                                         .get(&Page::page_of(phys))
-                                        .map_or(false, |(_, eps)| {
-                                            eps.contains(&(phys as u16 & 0xFFF))
+                                        .map_or(false, |page_hotness| {
+                                            page_hotness
+                                                .entry_points
+                                                .contains(&(phys as u16 & 0xFFF))
                                         })
                                 });
                                 if !registered {
@@ -3654,9 +3686,9 @@ fn jit_analyze_and_generate(
 
     dbg_assert!(ctx.compiling.len() < unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize });
 
-    let (_, entry_points) = match ctx.entry_points.get(&page) {
+    let entry_points = match ctx.entry_points.get(&page) {
         None => return,
-        Some(entry_points) => entry_points,
+        Some(page_hotness) => &page_hotness.entry_points,
     };
 
     let existing_entry_points = match ctx.pages.get(&page) {
@@ -3902,7 +3934,7 @@ fn jit_analyze_and_generate(
         ctx.deferred_compile_pages.remove(&p);
         ctx.entry_points
             .entry(p)
-            .or_insert_with(|| (0, HashSet::new()));
+            .or_insert_with(|| PageHotness { hotness: 0, entry_points: HashSet::new() });
     }
 
     cpu::tlb_set_has_code_multiple(&pages, true);
@@ -5975,14 +6007,15 @@ pub fn jit_increase_hotness_and_maybe_compile(
     // entry_points borrow below.
     let page_has_module = unsafe { JIT_RECOMPILE_DIVISOR } > 1 && ctx.pages.contains_key(&page);
     let threshold_reached = {
-        let (hotness, entry_points) = ctx.entry_points.entry(page).or_insert_with(|| {
+        let threshold = unsafe { JIT_THRESHOLD };
+        let page_hotness = ctx.entry_points.entry(page).or_insert_with(|| {
             cpu::tlb_set_has_code(page, true);
             profiler::stat_increment(stat::RUN_INTERPRETED_NEW_PAGE);
-            (0, HashSet::new())
+            PageHotness { hotness: 0, entry_points: HashSet::new() }
         });
 
         if !is_near_end_of_page(phys_address) {
-            entry_points.insert(phys_address as u16 & 0xFFF);
+            page_hotness.entry_points.insert(phys_address as u16 & 0xFFF);
         }
 
         // A queued page keeps learning entry points, but does not repeatedly pay
@@ -5990,15 +6023,14 @@ pub fn jit_increase_hotness_and_maybe_compile(
         if already_deferred {
             return;
         }
-        *hotness = hotness.wrapping_add(heat);
-        let threshold = unsafe { JIT_THRESHOLD };
+        page_hotness.hotness = page_hotness.hotness.wrapping_add(heat);
         let effective = if page_has_module {
             (threshold / unsafe { JIT_RECOMPILE_DIVISOR }).max(1)
         }
         else {
             threshold
         };
-        *hotness >= effective
+        page_hotness.hotness >= effective
     };
 
     if !threshold_reached {
@@ -6026,8 +6058,8 @@ pub fn jit_increase_hotness_and_maybe_compile(
                 cs_offset,
                 state_flags,
             });
-            if let Some((hotness, _)) = ctx.entry_points.get_mut(&page) {
-                *hotness = 0;
+            if let Some(page_hotness) = ctx.entry_points.get_mut(&page) {
+                page_hotness.hotness = 0;
             }
             unsafe {
                 JIT_COMPILE_DEFERRED_QUEUED = JIT_COMPILE_DEFERRED_QUEUED.wrapping_add(1);
@@ -6038,8 +6070,8 @@ pub fn jit_increase_hotness_and_maybe_compile(
 
     // only try generating if we're in the correct address space
     if cpu::translate_address_read_no_side_effects(virt_address) == Ok(phys_address) {
-        if let Some((hotness, _)) = ctx.entry_points.get_mut(&page) {
-            *hotness = 0;
+        if let Some(page_hotness) = ctx.entry_points.get_mut(&page) {
+            page_hotness.hotness = 0;
         }
         jit_analyze_and_generate(&mut ctx, virt_address, phys_address, cs_offset, state_flags)
     }
@@ -6254,9 +6286,15 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
 
     if did_have_code {
         cpu::tlb_set_has_code(page, false);
+        unsafe {
+            JIT_PAGE_INVALIDATIONS_WITH_CODE = JIT_PAGE_INVALIDATIONS_WITH_CODE.wrapping_add(1)
+        };
     }
 
     if !did_have_code {
+        unsafe {
+            JIT_PAGE_INVALIDATIONS_NO_CODE = JIT_PAGE_INVALIDATIONS_NO_CODE.wrapping_add(1)
+        };
         profiler::stat_increment(stat::DIRTY_PAGE_DID_NOT_HAVE_CODE);
     }
 }

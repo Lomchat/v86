@@ -813,6 +813,20 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
     1
 }
 static mut JIT_DEAD_FLAG_ELISION: bool = false;
+
+/// Prove flags dead across instructions that can fault.
+///
+/// The walk stops at a faulting overwriter because a #PF before the overwrite
+/// would leave the fault frame needing the architectural flags. That is right
+/// for a system emulator, and it is why only 11% of candidates are proven dead
+/// on a real BFME 1 frame (8,358 of 76,649): `mov` is 32% of this binary, so
+/// almost every walk meets a memory access first.
+///
+/// The flags a fault frame would carry are only observable if a guest exception
+/// handler reads EFlags out of its CONTEXT — which SEH allows and essentially no
+/// game does. QEMU's TCG makes the same trade. Off by default because the risk
+/// is real rather than theoretical; the payoff is the other 89%.
+static mut JIT_DEAD_FLAG_ELISION_ACROSS_FAULTS: bool = false;
 static mut JIT_FASTMEM_READS: bool = false;
 static mut JIT_X87_LOCALS: bool = false;
 static mut JIT_PUSH_RUN_COALESCING: bool = false;
@@ -891,6 +905,7 @@ fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
 fn ret_chaining_enabled() -> bool { unsafe { JIT_RET_CHAINING } }
 fn ret_speculation_enabled() -> bool { unsafe { JIT_RET_SPECULATION } }
 fn dead_flag_elision_enabled() -> bool { unsafe { JIT_DEAD_FLAG_ELISION } }
+fn dead_flag_elision_across_faults() -> bool { unsafe { JIT_DEAD_FLAG_ELISION_ACROSS_FAULTS } }
 
 // Indices 0/1 remain as stable stat-array slots + TS label names ('tlbFullClear',
 // 'tlbClear'); the TLB-clear sites no longer bump (see cpu.rs), so nothing emits
@@ -2203,9 +2218,14 @@ enum FlagClass {
     // Provably touches NO flags AND cannot fault (register-only mov/lea/movzx/movsx/nop) — safe to
     // skip over while walking forward to the next flag-overwriter.
     NeutralNoFault,
+    // Touches no flags but has a memory operand, so it can fault. Distinct from
+    // Stop because the only thing it costs is the fault frame's flags, not the
+    // liveness answer — and `mov` is 32% of this binary, so folding it into Stop
+    // is what holds the elision rate at 11%.
+    NeutralMayFault,
     // Everything else: reads a flag (Jcc/ADC/SBB/SETcc/CMOVcc/PUSHF/LAHF/…), modifies flags
-    // partially (INC/DEC/shift/rotate/SAHF/POPF), can fault (any memory operand), or is
-    // control-flow/unrecognized. Conservatively stops the walk WITHOUT eliding.
+    // partially (INC/DEC/shift/rotate/SAHF/POPF), or is control-flow/unrecognized.
+    // Conservatively stops the walk WITHOUT eliding.
     Stop,
 }
 
@@ -2277,12 +2297,12 @@ fn classify_flag_class(addr: u32) -> FlagClass {
         },
 
         // --- Flag-neutral, non-faulting (register-only forms only; memory forms can #PF) ---
-        0x88 | 0x89 | 0x8A | 0x8B => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::Stop }, // MOV r/m<->reg
+        0x88 | 0x89 | 0x8A | 0x8B => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::NeutralMayFault }, // MOV r/m<->reg
         0x8D => FlagClass::NeutralNoFault,                                                               // LEA (no deref, no flags)
         0xB0..=0xBF => FlagClass::NeutralNoFault,                                                        // MOV reg, imm
-        0xC6 | 0xC7 => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::Stop },               // MOV r/m, imm
+        0xC6 | 0xC7 => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::NeutralMayFault },               // MOV r/m, imm
         0x90 => FlagClass::NeutralNoFault,                                                               // NOP
-        0x1B6 | 0x1B7 | 0x1BE | 0x1BF => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::Stop }, // MOVZX/MOVSX
+        0x1B6 | 0x1B7 | 0x1BE | 0x1BF => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::NeutralMayFault }, // MOVZX/MOVSX
 
         _ => FlagClass::Stop,
     }
@@ -2334,8 +2354,22 @@ fn flags_dead_from_addr(
                 profiler::stat_increment_always(stat::DEAD_FLAG_ELIDED);
                 return true;
             },
-            FlagClass::Overwrite { non_faulting: false } => return false,
+            FlagClass::Overwrite { non_faulting: false } => {
+                if !dead_flag_elision_across_faults() {
+                    return false;
+                }
+                profiler::stat_increment_always(stat::DEAD_FLAG_ELIDED);
+                return true;
+            },
             FlagClass::NeutralNoFault => {
+                addr = instruction_end(cpu, addr);
+                *steps += 1;
+            },
+            FlagClass::NeutralMayFault => {
+                // Walking past it only risks the flags a fault frame would carry.
+                if !dead_flag_elision_across_faults() {
+                    return false;
+                }
                 addr = instruction_end(cpu, addr);
                 *steps += 1;
             },
@@ -6446,6 +6480,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
         4 => JIT_BLOCK_CHAINING = value != 0,
         5 => JIT_DEAD_FLAG_ELISION = value != 0,
+        46 => JIT_DEAD_FLAG_ELISION_ACROSS_FAULTS = value != 0,
         6 => JIT_INDIRECT_REGIONS = value != 0,
         7 => JIT_INDIRECT_REGION_MIN_SHARE = value,
         8 => JIT_INDIRECT_REGION_MAX_PAGES = value,
@@ -6499,6 +6534,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         3 => MAX_EXTRA_BASIC_BLOCKS as u32,
         4 => JIT_BLOCK_CHAINING as u32,
         5 => JIT_DEAD_FLAG_ELISION as u32,
+        46 => JIT_DEAD_FLAG_ELISION_ACROSS_FAULTS as u32,
         6 => JIT_INDIRECT_REGIONS as u32,
         7 => JIT_INDIRECT_REGION_MIN_SHARE,
         8 => JIT_INDIRECT_REGION_MAX_PAGES,

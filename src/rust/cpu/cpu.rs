@@ -4625,7 +4625,7 @@ pub fn clear_tlb_code(page: i32) {
     // must not outlive it (see RET_CACHE in jit.rs). Bump only when an entry was
     // actually dropped — data-page evictions don't affect the memo.
     if jit::dispatch_meta_clear(page as u32) {
-        jit::ret_cache_invalidate_all_tlb();
+        jit::ret_cache_invalidate_page_tlb(page as u32);
     }
 }
 

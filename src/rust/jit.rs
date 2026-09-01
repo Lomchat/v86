@@ -334,6 +334,38 @@ pub fn ret_cache_invalidate_all_tlb() {
     ret_cache_invalidate_all();
 }
 
+/// Drop only the return predictions that live on the evicted page (config 47,
+/// ON; `dbg.jitConfig(47, 0)` restores the global bump).
+///
+/// A code-TLB eviction invalidates predictions for that page, but the epoch bump
+/// discarded all 512 of them. During a map load the guest remaps constantly —
+/// 83-256 evictions per 10s window against none in a settled scene — so the
+/// table was repeatedly emptied exactly when the code footprint is largest. The
+/// entry key IS the return address, so the affected entries are identifiable,
+/// and scanning 512 slots is far cheaper than refilling them: boot measures
+/// 140.6 MIPS against 138.6 over three runs per arm, with the eviction count
+/// itself unchanged, so only the scope moved.
+static mut JIT_NARROW_RET_INVALIDATION: bool = true;
+
+pub fn ret_cache_invalidate_page_tlb(page: u32) {
+    unsafe {
+        RET_CACHE_INVALIDATED_BY_TLB = RET_CACHE_INVALIDATED_BY_TLB.wrapping_add(1);
+        if !JIT_NARROW_RET_INVALIDATION {
+            ret_cache_invalidate_all();
+            return;
+        }
+        for entry in RET_CACHE.iter_mut() {
+            if entry.0 >> 12 == page {
+                *entry = (0, 0, -1, 0);
+            }
+        }
+        // Chain-site memos are keyed by site, not by target page, so they cannot
+        // be narrowed the same way and keep the conservative global bump.
+        let next = CHAIN_TARGET_EPOCH.wrapping_add(1);
+        CHAIN_TARGET_EPOCH = if next == 0 { 1 } else { next };
+    }
+}
+
 // Count of double-frees the release-safe guard in free_wasm_table_index absorbed.
 // Nonzero means a free-discipline bug survives somewhere — investigate, don't shrug.
 static mut WASM_TABLE_INDEX_DOUBLE_FREE_SKIPPED: u32 = 0;
@@ -6519,6 +6551,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         4 => JIT_BLOCK_CHAINING = value != 0,
         5 => JIT_DEAD_FLAG_ELISION = value != 0,
         46 => JIT_DEAD_FLAG_ELISION_ACROSS_FAULTS = value != 0,
+        47 => JIT_NARROW_RET_INVALIDATION = value != 0,
         6 => JIT_INDIRECT_REGIONS = value != 0,
         7 => JIT_INDIRECT_REGION_MIN_SHARE = value,
         8 => JIT_INDIRECT_REGION_MAX_PAGES = value,
@@ -6573,6 +6606,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         4 => JIT_BLOCK_CHAINING as u32,
         5 => JIT_DEAD_FLAG_ELISION as u32,
         46 => JIT_DEAD_FLAG_ELISION_ACROSS_FAULTS as u32,
+        47 => JIT_NARROW_RET_INVALIDATION as u32,
         6 => JIT_INDIRECT_REGIONS as u32,
         7 => JIT_INDIRECT_REGION_MIN_SHARE,
         8 => JIT_INDIRECT_REGION_MAX_PAGES,

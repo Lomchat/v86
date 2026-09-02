@@ -7046,7 +7046,7 @@ pub fn jit_hot_profile_export_build() -> u32 {
 // the reserved top indices and registered here for one entry point. From
 // then on the dispatcher, page-write invalidation and slot sweeping treat it
 // exactly like a compiled page.
-pub const EXTERNAL_MODULE_SLOTS: u32 = 256;
+pub const EXTERNAL_MODULE_SLOTS: u32 = 1024;
 
 #[no_mangle]
 pub fn jit_external_module_first_index() -> u32 { WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS }
@@ -7081,19 +7081,29 @@ pub fn jit_register_external_module(
         return 0;
     }
     let offset = (phys_address & 0xFFF) as u16;
-    // Replace whatever module covered this page: the JIT's own would keep
-    // winning the dispatch for its entries otherwise.
+    // Same external module already on this page: add the entry. Anything else
+    // is replaced — the JIT's own module would keep winning the dispatch for
+    // its entries otherwise.
+    let mut entry_points = vec![(offset, initial_state as u16)];
     if let Some(old) = ctx.pages.remove(&page) {
-        let still_used = ctx.pages.values().any(|p| p.wasm_table_index == old.wasm_table_index);
-        if !still_used && (old.wasm_table_index.to_u16() as u32) < WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS {
-            free_wasm_table_index(&mut ctx, old.wasm_table_index);
+        if old.wasm_table_index == index {
+            for e in old.entry_points {
+                if e.0 != offset {
+                    entry_points.push(e);
+                }
+            }
+        } else {
+            let still_used = ctx.pages.values().any(|p| p.wasm_table_index == old.wasm_table_index);
+            if !still_used && (old.wasm_table_index.to_u16() as u32) < WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS {
+                free_wasm_table_index(&mut ctx, old.wasm_table_index);
+            }
         }
     }
     cpu::tlb_set_has_code(page, true);
     let info = PageInfo {
         wasm_table_index: index,
         state_flags,
-        entry_points: vec![(offset, initial_state as u16)],
+        entry_points,
         hidden_wasm_table_indices: Vec::new(),
     };
     for i in 0..unsafe { cpu::valid_tlb_entries_count } {

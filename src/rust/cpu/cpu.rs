@@ -3692,10 +3692,11 @@ const JIT_RUN_UNTIL_MAX_DEPTH: u32 = 24;
 // Dispatches per bridged call are bounded independently of retired
 // instructions, so a callee that keeps stalling cannot pin the Worker.
 const JIT_RUN_UNTIL_MAX_ITERATIONS: u32 = 200_000;
-// calls, returned (0), stopped by budget/halt/park (1), by the instruction
-// cap (2), by depth (3), by the iteration cap (4), total iterations,
-// total instructions retired inside.
-static mut JIT_RUN_UNTIL_STATS: [u32; 7] = [0; 7];
+// 0 calls, 1 returned, 2 stopped by a zeroed budget (a thunk asked for an
+// urgent exit), 3 by an exhausted slice, 4 by a halted CPU or a parked EIP,
+// 5 by the instruction cap, 6 by depth, 7 by the iteration cap, 8 total
+// iterations, 9 total instructions retired inside.
+static mut JIT_RUN_UNTIL_STATS: [u32; 10] = [0; 10];
 
 #[no_mangle]
 pub fn jit_run_until_stat(i: u32) -> u32 {
@@ -3704,14 +3705,14 @@ pub fn jit_run_until_stat(i: u32) -> u32 {
 
 #[no_mangle]
 pub fn jit_run_until_stats_reset() {
-    unsafe { JIT_RUN_UNTIL_STATS = [0; 7]; }
+    unsafe { JIT_RUN_UNTIL_STATS = [0; 10]; }
 }
 
 #[no_mangle]
 pub unsafe fn jit_run_until(ret_eip: u32, max: u32) -> u32 {
     JIT_RUN_UNTIL_STATS[0] = JIT_RUN_UNTIL_STATS[0].wrapping_add(1);
     if JIT_RUN_UNTIL_DEPTH >= JIT_RUN_UNTIL_MAX_DEPTH {
-        JIT_RUN_UNTIL_STATS[3] = JIT_RUN_UNTIL_STATS[3].wrapping_add(1);
+        JIT_RUN_UNTIL_STATS[6] = JIT_RUN_UNTIL_STATS[6].wrapping_add(1);
         return 3;
     }
     JIT_RUN_UNTIL_DEPTH += 1;
@@ -3719,22 +3720,31 @@ pub unsafe fn jit_run_until(ret_eip: u32, max: u32) -> u32 {
     jit::JIT_CHAIN_STOP_EIP = ret_eip;
     let start = *instruction_counter;
     let mut iterations: u32 = 0;
+    let mut stat_slot: usize = 1;
     let result = loop {
         if *instruction_pointer as u32 == ret_eip {
             break 0;
         }
         let limit = hypercall::read_cycle_limit();
         let elapsed = (*instruction_counter).wrapping_sub(jit_cycle_start_instruction_counter);
-        if limit == 0 || elapsed >= limit || *in_hlt {
+        if limit == 0 {
+            stat_slot = 2;
             break 1;
         }
-        if hypercall::eip_at_park(*instruction_pointer as u32) {
+        if elapsed >= limit {
+            stat_slot = 3;
+            break 1;
+        }
+        if *in_hlt || hypercall::eip_at_park(*instruction_pointer as u32) {
+            stat_slot = 4;
             break 1;
         }
         if (*instruction_counter).wrapping_sub(start) >= max {
+            stat_slot = 5;
             break 2;
         }
         if iterations >= JIT_RUN_UNTIL_MAX_ITERATIONS {
+            stat_slot = 7;
             break 4;
         }
         iterations += 1;
@@ -3742,9 +3752,9 @@ pub unsafe fn jit_run_until(ret_eip: u32, max: u32) -> u32 {
     };
     jit::JIT_CHAIN_STOP_EIP = outer_stop;
     JIT_RUN_UNTIL_DEPTH -= 1;
-    JIT_RUN_UNTIL_STATS[1 + result as usize] = JIT_RUN_UNTIL_STATS[1 + result as usize].wrapping_add(1);
-    JIT_RUN_UNTIL_STATS[5] = JIT_RUN_UNTIL_STATS[5].wrapping_add(iterations);
-    JIT_RUN_UNTIL_STATS[6] = JIT_RUN_UNTIL_STATS[6].wrapping_add((*instruction_counter).wrapping_sub(start));
+    JIT_RUN_UNTIL_STATS[stat_slot] = JIT_RUN_UNTIL_STATS[stat_slot].wrapping_add(1);
+    JIT_RUN_UNTIL_STATS[8] = JIT_RUN_UNTIL_STATS[8].wrapping_add(iterations);
+    JIT_RUN_UNTIL_STATS[9] = JIT_RUN_UNTIL_STATS[9].wrapping_add((*instruction_counter).wrapping_sub(start));
     result
 }
 

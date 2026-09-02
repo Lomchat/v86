@@ -91,6 +91,7 @@ pub struct WasmBuilder {
 
     free_locals_i32: Vec<WasmLocal>,
     free_locals_i64: Vec<WasmLocalI64>,
+    free_locals_f64: Vec<WasmLocalF64>,
     local_count: u8,
     pub arg_local_initial_state: WasmLocal,
 
@@ -122,6 +123,11 @@ impl WasmLocal {
     /// Unsafe: Can result in multiple free's. Should only be used for locals that are used during
     /// the whole module (for example, registers)
     pub fn unsafe_clone(&self) -> WasmLocal { WasmLocal(self.0) }
+}
+
+pub struct WasmLocalF64(u8);
+impl WasmLocalF64 {
+    fn idx(&self) -> u8 { self.0 }
 }
 
 pub struct WasmLocalI64(u8);
@@ -161,6 +167,7 @@ impl WasmBuilder {
 
             free_locals_i32: Vec::with_capacity(8),
             free_locals_i64: Vec::with_capacity(8),
+            free_locals_f64: Vec::with_capacity(4),
             local_count: 0,
             arg_local_initial_state: WasmLocal(0),
             flag_locals: None,
@@ -194,6 +201,7 @@ impl WasmBuilder {
         self.instruction_body.clear();
         self.free_locals_i32.clear();
         self.free_locals_i64.clear();
+        self.free_locals_f64.clear();
         self.local_count = 0;
         self.flag_locals = None;
 
@@ -232,17 +240,22 @@ impl WasmBuilder {
         self.output.push(0);
 
         dbg_assert!(
-            self.local_count as usize == self.free_locals_i32.len() + self.free_locals_i64.len(),
+            self.local_count as usize
+                == self.free_locals_i32.len() + self.free_locals_i64.len() + self.free_locals_f64.len(),
             "All locals should have been freed"
         );
 
         let free_locals_i32 = &self.free_locals_i32;
         let free_locals_i64 = &self.free_locals_i64;
+        let free_locals_f64 = &self.free_locals_f64;
 
         let locals = (0..self.local_count).map(|i| {
             let local_index = WASM_MODULE_ARGUMENT_COUNT + i;
             if free_locals_i64.iter().any(|v| v.idx() == local_index) {
                 op::TYPE_I64
+            }
+            else if free_locals_f64.iter().any(|v| v.idx() == local_index) {
+                op::TYPE_F64
             }
             else {
                 dbg_assert!(free_locals_i32.iter().any(|v| v.idx() == local_index));
@@ -661,6 +674,43 @@ impl WasmBuilder {
     }
     pub fn get_local(&mut self, local: &WasmLocal) {
         self.instruction_body.push(op::OP_GETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+
+    /// f64 locals exist so the x87 inline path can hold a result across its
+    /// precision-control branch without two reinterprets in each direction. That
+    /// round trip ran on every FADD/FMUL — billions per skirmish.
+    #[must_use = "local allocated but not used"]
+    fn alloc_local_f64(&mut self) -> WasmLocalF64 {
+        match self.free_locals_f64.pop() {
+            Some(local) => local,
+            None => {
+                let new_idx = self.local_count + WASM_MODULE_ARGUMENT_COUNT;
+                self.local_count += 1;
+                WasmLocalF64(new_idx)
+            },
+        }
+    }
+    pub fn free_local_f64(&mut self, local: WasmLocalF64) {
+        dbg_assert!(
+            (WASM_MODULE_ARGUMENT_COUNT..self.local_count + WASM_MODULE_ARGUMENT_COUNT)
+                .contains(&local.0)
+        );
+        self.free_locals_f64.push(local)
+    }
+    #[must_use = "local allocated but not used"]
+    pub fn set_new_local_f64(&mut self) -> WasmLocalF64 {
+        let local = self.alloc_local_f64();
+        self.instruction_body.push(op::OP_SETLOCAL);
+        self.instruction_body.push(local.idx());
+        local
+    }
+    pub fn get_local_f64(&mut self, local: &WasmLocalF64) {
+        self.instruction_body.push(op::OP_GETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+    pub fn set_local_f64(&mut self, local: &WasmLocalF64) {
+        self.instruction_body.push(op::OP_SETLOCAL);
         self.instruction_body.push(local.idx());
     }
 

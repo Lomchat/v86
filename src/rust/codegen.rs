@@ -3971,22 +3971,18 @@ fn gen_fpu_apply_f64_binop(ctx: &mut JitContext, op: FpuFastBinOp) {
     // this guest rewrites it often enough that flushing left the JIT empty and
     // the game at 5.5 FPS. A predictable branch on a global costs nothing next to
     // the helper call it replaces.
-    ctx.builder.reinterpret_f64_as_i64();
-    let bits = ctx.builder.set_new_local_i64();
+    let value = ctx.builder.set_new_local_f64();
     ctx.builder.load_fixed_i32(std::ptr::addr_of!(crate::softfloat::PRECISION_SINGLE) as u32);
     ctx.builder.const_i32(0xFF);
     ctx.builder.and_i32();
     ctx.builder.if_void();
-    ctx.builder.get_local_i64(&bits);
-    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.get_local_f64(&value);
     ctx.builder.demote_f64_to_f32();
     ctx.builder.promote_f32_to_f64();
-    ctx.builder.reinterpret_f64_as_i64();
-    ctx.builder.set_local_i64(&bits);
+    ctx.builder.set_local_f64(&value);
     ctx.builder.block_end();
-    ctx.builder.get_local_i64(&bits);
-    ctx.builder.reinterpret_i64_as_f64();
-    ctx.builder.free_local_i64(bits);
+    ctx.builder.get_local_f64(&value);
+    ctx.builder.free_local_f64(value);
 }
 
 fn gen_fpu_load_m32_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte) {

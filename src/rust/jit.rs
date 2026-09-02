@@ -1301,6 +1301,49 @@ pub fn dispatch_meta_set(
 #[inline]
 pub fn dispatch_ext_get(page: u32) -> u64 { unsafe { DISPATCH_META_EXT[page as usize & 0xFFFFF] } }
 
+// An external module that returned without retiring an instruction at this
+// address: the next dispatch of exactly this address bypasses the external
+// table once, so the interpreter can execute (or fault on) the instruction.
+static mut EXT_STALL_EIP: u32 = 0;
+static mut EXT_STALL_ARMED: bool = false;
+static mut EXT_STALLS: u32 = 0;
+
+pub fn ext_stall_note(eip: u32) {
+    unsafe {
+        EXT_STALL_EIP = eip;
+        EXT_STALL_ARMED = true;
+        EXT_STALLS = EXT_STALLS.wrapping_add(1);
+    }
+}
+
+#[inline]
+pub fn ext_stall_take(eip: u32) -> bool {
+    unsafe {
+        if EXT_STALL_ARMED && EXT_STALL_EIP == eip {
+            EXT_STALL_ARMED = false;
+            true
+        }
+        else {
+            EXT_STALL_ARMED = false;
+            false
+        }
+    }
+}
+
+#[no_mangle]
+pub fn jit_external_stalls() -> u32 { unsafe { EXT_STALLS } }
+
+/// Called by an external module about to exit at an instruction it wants the
+/// interpreter to run: the next dispatch of that address bypasses the
+/// external table once.
+#[no_mangle]
+pub fn jit_ext_interpret_once(eip: u32) {
+    unsafe {
+        EXT_STALL_EIP = eip;
+        EXT_STALL_ARMED = true;
+    }
+}
+
 /// Publish an external module's entries for a virtual page (see DISPATCH_META_EXT).
 pub fn dispatch_ext_set(
     virt_page: Page,
@@ -7215,6 +7258,41 @@ pub fn note_external_dispatch(hit: bool) {
     unsafe {
         if hit { EXTERNAL_DISPATCHES = EXTERNAL_DISPATCHES.wrapping_add(1); }
         else { EXTERNAL_MISSES = EXTERNAL_MISSES.wrapping_add(1); }
+    }
+}
+
+// Flight recorder of the last external dispatches: entry address, the
+// address the module exited at and how many instructions it retired. Cheap
+// enough to stay on: external entries are rare compared with block entries.
+const EXT_TRACE_LEN: usize = 32;
+static mut EXT_TRACE: [[u32; 3]; EXT_TRACE_LEN] = [[0; 3]; EXT_TRACE_LEN];
+static mut EXT_TRACE_NEXT: u32 = 0;
+
+pub fn ext_trace_enter(eip: u32) {
+    unsafe {
+        let i = (EXT_TRACE_NEXT as usize) % EXT_TRACE_LEN;
+        EXT_TRACE[i] = [eip, 0, 0];
+    }
+}
+
+pub fn ext_trace_exit(eip: u32, retired: u32) {
+    unsafe {
+        let i = (EXT_TRACE_NEXT as usize) % EXT_TRACE_LEN;
+        EXT_TRACE[i][1] = eip;
+        EXT_TRACE[i][2] = retired;
+        EXT_TRACE_NEXT = EXT_TRACE_NEXT.wrapping_add(1);
+    }
+}
+
+/// Recorder read-out: `slot` counts back from the most recent dispatch
+/// (0 = latest); `field` 0 = entry, 1 = exit, 2 = retired, 3 = total count.
+#[no_mangle]
+pub fn jit_ext_trace(slot: u32, field: u32) -> u32 {
+    unsafe {
+        if field == 3 { return EXT_TRACE_NEXT; }
+        if slot as usize >= EXT_TRACE_LEN || slot >= EXT_TRACE_NEXT { return 0; }
+        let i = (EXT_TRACE_NEXT.wrapping_sub(1).wrapping_sub(slot) as usize) % EXT_TRACE_LEN;
+        EXT_TRACE[i][(field as usize).min(2)]
     }
 }
 #[no_mangle]

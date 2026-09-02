@@ -3199,7 +3199,14 @@ pub unsafe fn cycle_internal() {
         }
     }
     // External (ahead-of-time) module for this address, when the JIT has none.
-    if jit_entry.is_none() {
+    // A module that just returned here without retiring anything (a guard at
+    // its entry instruction) must not be re-entered at the same address, or the
+    // cycle loop never ends: the interpreter executes that one instruction.
+    let mut external_entry = false;
+    if jit_entry.is_none() && jit::ext_stall_take(initial_eip as u32) {
+        jit::note_external_dispatch(false);
+    }
+    else if jit_entry.is_none() {
         let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
         if meta2 != 0 {
             if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
@@ -3207,7 +3214,9 @@ pub unsafe fn cycle_internal() {
                 if st != u16::MAX {
                     jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
                     tier2_profile_exit = false;
+                    external_entry = true;
                     jit::note_external_dispatch(true);
+                    jit::ext_trace_enter(initial_eip as u32);
                 }
                 else {
                     jit::note_external_dispatch(false);
@@ -3248,6 +3257,16 @@ pub unsafe fn cycle_internal() {
 
         if tier2_profile_exit {
             jit::jit_tier2_note_sampled_exit(wasm_table_index, *instruction_pointer as u32);
+        }
+        if external_entry {
+            jit::ext_trace_exit(*instruction_pointer as u32, (*instruction_counter).wrapping_sub(initial_instruction_counter));
+        }
+        if external_entry
+            && *instruction_counter == initial_instruction_counter
+            && *instruction_pointer == initial_eip
+        {
+            jit::ext_stall_note(initial_eip as u32);
+            return;
         }
 
         // Block-chaining: a compiled module just returned control to the dispatch loop.
@@ -3406,6 +3425,16 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
                 && (start_eip as u32) >= (*instruction_pointer as u32))
         {
             break;
+        }
+
+        // An external module owns the next address: hand it back to the
+        // dispatcher instead of interpreting the rest of the straight line.
+        {
+            let next = *instruction_pointer as u32;
+            let meta = jit::dispatch_ext_get(next >> 12);
+            if meta != 0 && jit::dispatch_state_lookup(meta, next) != u16::MAX {
+                break;
+            }
         }
 
         *previous_ip = *instruction_pointer;

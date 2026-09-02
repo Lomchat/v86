@@ -1695,10 +1695,12 @@ pub unsafe fn instr16_D9_5_reg(r: i32) {
     // fld1/fldl2t/fldl2e/fldpi/fldlg2/fldln2/fldz
     match r {
         0 => fpu_push(F80::ONE),
-        1 => fpu_push(F80::LN_10 / F80::LN_2),
+        // The same correctly rounded constants the JIT pushes, not the
+        // quotient of two other constants.
+        1 => fpu_push(F80::of_f64(std::f64::consts::LOG2_10.to_bits())),
         2 => fpu_push(F80::LOG2_E),
         3 => fpu_push(F80::PI),
-        4 => fpu_push(F80::LN_2 / F80::LN_10),
+        4 => fpu_push(F80::of_f64(std::f64::consts::LOG10_2.to_bits())),
         5 => fpu_push(F80::LN_2),
         6 => fpu_push(F80::ZERO),
         7 => {

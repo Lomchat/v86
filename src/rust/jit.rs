@@ -1767,7 +1767,7 @@ pub const BRTABLE_CUTOFF: usize = 10;
 // frame. Every eviction also costs the return-prediction cache (freeing a slot
 // invalidates it globally), so the churn compounds. Sized to hold the working
 // set instead; the static tables below grow linearly and stay under 300 KB.
-pub const WASM_TABLE_SIZE: u32 = 4096;
+pub const WASM_TABLE_SIZE: u32 = 8192;
 
 /// Count of full JIT cache flushes caused by wasm-table exhaustion.
 static mut JIT_CACHE_FLUSHES: u32 = 0;
@@ -7046,7 +7046,7 @@ pub fn jit_hot_profile_export_build() -> u32 {
 // the reserved top indices and registered here for one entry point. From
 // then on the dispatcher, page-write invalidation and slot sweeping treat it
 // exactly like a compiled page.
-pub const EXTERNAL_MODULE_SLOTS: u32 = 1024;
+pub const EXTERNAL_MODULE_SLOTS: u32 = 4096;
 
 #[no_mangle]
 pub fn jit_external_module_first_index() -> u32 { WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS }

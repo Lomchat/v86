@@ -3680,6 +3680,44 @@ pub unsafe fn do_many_cycles_native() {
     }
 }
 
+// Nested dispatch for external (ahead-of-time) modules: run the guest from the
+// current EIP until it reaches `ret_eip` (the caller's return address), so a
+// translated function can call a target it does not own and carry on natively
+// when the callee returns. Stops early, like the slice loop, on an exhausted or
+// zeroed budget, a halted CPU or a parked EIP, and after `max` retired
+// instructions; the caller then leaves the guest state where it is and exits.
+// Returns 0 when EIP is `ret_eip`, otherwise a stop reason.
+static mut JIT_RUN_UNTIL_DEPTH: u32 = 0;
+const JIT_RUN_UNTIL_MAX_DEPTH: u32 = 24;
+
+#[no_mangle]
+pub unsafe fn jit_run_until(ret_eip: u32, max: u32) -> u32 {
+    if JIT_RUN_UNTIL_DEPTH >= JIT_RUN_UNTIL_MAX_DEPTH {
+        return 3;
+    }
+    JIT_RUN_UNTIL_DEPTH += 1;
+    let start = *instruction_counter;
+    let result = loop {
+        if *instruction_pointer as u32 == ret_eip {
+            break 0;
+        }
+        let limit = hypercall::read_cycle_limit();
+        let elapsed = (*instruction_counter).wrapping_sub(jit_cycle_start_instruction_counter);
+        if limit == 0 || elapsed >= limit || *in_hlt {
+            break 1;
+        }
+        if hypercall::eip_at_park(*instruction_pointer as u32) {
+            break 1;
+        }
+        if (*instruction_counter).wrapping_sub(start) >= max {
+            break 2;
+        }
+        cycle_internal();
+    };
+    JIT_RUN_UNTIL_DEPTH -= 1;
+    result
+}
+
 #[cold]
 pub unsafe fn trigger_de() {
     dbg_log!("#de");

@@ -7145,6 +7145,82 @@ fn hot_profile_page_hash(page: Page) -> Option<u32> {
 /// Compile-at-first-touch for a page the profile knows. Returns true when the
 /// page's hotness ramp is skipped; the caller then takes the ordinary
 /// cap/deferred/compile path with the recorded entry points merged in.
+static mut JIT_HOT_PROFILE_PRECOMPILED: u32 = 0;
+
+#[no_mangle]
+pub fn jit_hot_profile_precompiled() -> u32 { unsafe { JIT_HOT_PROFILE_PRECOMPILED } }
+
+/// Compile up to `budget` pages the hot profile knows and that own no module
+/// yet, without waiting for the guest to reach them: the compile bursts a new
+/// game phase would otherwise cause happen while the game is still loading.
+/// A page whose bytes do not hash as the profile expects is skipped (it may
+/// not be loaded yet) and kept for a later call. Returns how many known pages
+/// still own no module, so the caller knows when to stop calling.
+#[no_mangle]
+pub fn jit_hot_profile_precompile(budget: u32) -> u32 {
+    if unsafe { JIT_DISABLED } {
+        return 0;
+    }
+    let mut ctx = get_jit_state();
+    let candidates: Vec<(Page, u32, Vec<u16>)> = {
+        let guard = HOT_PROFILE.lock().unwrap();
+        match guard.as_ref() {
+            None => return 0,
+            Some(map) => map
+                .iter()
+                .filter(|(page, _)| !ctx.pages.contains_key(page))
+                .map(|(page, p)| (*page, p.hash, p.entries.clone()))
+                .collect(),
+        }
+    };
+    let mut remaining = candidates.len() as u32;
+    let mut compiled = 0u32;
+    let (cs_offset, state_flags) = unsafe { (cpu::get_seg_cs() as u32, cpu::get_state_flags()) };
+    for (page, hash, entries) in candidates {
+        if compiled >= budget
+            || ctx.compiling.len() >= unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize }
+        {
+            break;
+        }
+        if page_is_compiling(&ctx, page) || ctx.deferred_compile_pages.contains(&page) {
+            continue;
+        }
+        if hot_profile_page_hash(page) != Some(hash) {
+            continue;
+        }
+        let virt = page.to_address() as i32;
+        if cpu::translate_address_read_no_side_effects(virt) != Ok(page.to_address()) {
+            continue;
+        }
+        let mut seeded = false;
+        {
+            let hot = ctx.entry_points.entry(page).or_insert_with(|| {
+                cpu::tlb_set_has_code(page, true);
+                PageHotness { hotness: 0, entry_points: HashSet::new() }
+            });
+            for e in entries {
+                if tail_entry_compilable(None, page.to_address() | e as u32, cs_offset, state_flags) {
+                    hot.entry_points.insert(e);
+                    seeded = true;
+                }
+            }
+            hot.hotness = 0;
+        }
+        if !seeded {
+            continue;
+        }
+        let first = *ctx.entry_points.get(&page).unwrap().entry_points.iter().min().unwrap() as u32;
+        let phys = page.to_address() | first;
+        jit_analyze_and_generate(&mut ctx, (page.to_address() | first) as i32, phys, cs_offset, state_flags);
+        compiled += 1;
+        remaining -= 1;
+        unsafe {
+            JIT_HOT_PROFILE_PRECOMPILED = JIT_HOT_PROFILE_PRECOMPILED.wrapping_add(1);
+        }
+    }
+    remaining
+}
+
 fn hot_profile_force(ctx: &mut JitState, page: Page, phys_address: u32) -> bool {
     // In flight or queued: nothing to force, and the counter must not tick
     // once per block executed while a compile lands.
@@ -7172,6 +7248,13 @@ fn hot_profile_force(ctx: &mut JitState, page: Page, phys_address: u32) -> bool 
     if let Some(info) = ctx.pages.get(&page) {
         let off = (phys_address & 0xFFF) as u16;
         if !entries.contains(&off) || info.entry_points.iter().any(|(e, _)| *e == off) {
+            return false;
+        }
+        // A recorded entry the module cannot contain (a profile written before
+        // page-tail entries were gated) would force the page on every visit,
+        // for an analysis that then finds nothing new to compile.
+        let (cs_offset, state_flags) = unsafe { (cpu::get_seg_cs() as u32, cpu::get_state_flags()) };
+        if !tail_entry_compilable(None, phys_address, cs_offset, state_flags) {
             return false;
         }
     }

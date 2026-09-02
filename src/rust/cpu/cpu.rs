@@ -3186,7 +3186,11 @@ pub unsafe fn cycle_internal() {
     // TLB fill that publishes the page's modules: fill it now, so the first
     // block of a page with compiled code is not interpreted once for nothing.
     if jit_entry.is_none() && meta == 0 && tlb_data[(initial_eip as u32 >> 12) as usize] == 0 {
-        if get_phys_eip().is_ok() {
+        // A page fault here has already been raised: the handler runs next.
+        if get_phys_eip().is_err() {
+            return;
+        }
+        {
             let meta_after = jit::dispatch_meta_get(initial_eip as u32 >> 12);
             if meta_after != 0
                 && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta_after))

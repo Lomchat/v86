@@ -1989,6 +1989,31 @@ static mut JIT_COMPILE_MAX_US: u32 = 0;
 static mut JIT_COMPILE_DEFERRED_QUEUED: u32 = 0;
 static mut JIT_COMPILE_DEFERRED_STARTED: u32 = 0;
 static mut JIT_COMPILE_DEFERRED_DROPPED: u32 = 0;
+// Worker-thread CPU spent in analysis + wasm emission, measured around
+// jit_analyze_and_generate. JIT_COMPILE_TOTAL_US is the browser's asynchronous
+// compile latency; this is the synchronous cost the guest actually waits for.
+static mut JIT_CODEGEN_TOTAL_US: f64 = 0.0;
+static mut JIT_CODEGEN_MAX_US: f64 = 0.0;
+static mut JIT_CODEGEN_COUNT: u32 = 0;
+static mut JIT_CODEGEN_BYTES_TOTAL: u64 = 0;
+
+// ── Hot-page profile ─────────────────────────────────────────────────────
+// Pages a previous session compiled, with the entry points their modules had.
+// Such a page is compiled at its first touch instead of after JIT_THRESHOLD
+// interpreted instructions: for a cold path made of code that runs once per
+// session, that interpretation is the dominant cost. A hash of the page's
+// bytes guards against a different binary or a rewritten page.
+#[derive(Clone)]
+struct HotProfilePage {
+    hash: u32,
+    entries: Vec<u16>,
+}
+static HOT_PROFILE: Mutex<Option<HashMap<Page, HotProfilePage>>> = Mutex::new(None);
+static HOT_PROFILE_IO: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static mut JIT_HOT_PROFILE_FORCED: u32 = 0;
+static mut JIT_HOT_PROFILE_MISMATCH: u32 = 0;
+const HOT_PROFILE_MAGIC: u32 = 0x5054_4F48; // "HOTP"
+const HOT_PROFILE_VERSION: u32 = 1;
 
 /// Interpreted-execution state of one physical page that has no module yet.
 struct PageHotness {
@@ -3739,6 +3764,25 @@ fn jit_analyze_and_generate(
     cs_offset: u32,
     state_flags: CachedStateFlags,
 ) {
+    let t0 = unsafe { cpu::js::microtick() };
+    jit_analyze_and_generate_untimed(ctx, virt_entry_point, phys_entry_point, cs_offset, state_flags);
+    let us = (unsafe { cpu::js::microtick() } - t0) * 1000.0;
+    unsafe {
+        JIT_CODEGEN_TOTAL_US += us;
+        if us > JIT_CODEGEN_MAX_US {
+            JIT_CODEGEN_MAX_US = us;
+        }
+        JIT_CODEGEN_COUNT = JIT_CODEGEN_COUNT.wrapping_add(1);
+    }
+}
+
+fn jit_analyze_and_generate_untimed(
+    ctx: &mut JitState,
+    virt_entry_point: i32,
+    phys_entry_point: u32,
+    cs_offset: u32,
+    state_flags: CachedStateFlags,
+) {
     let page = Page::page_of(phys_entry_point);
 
     dbg_assert!(ctx.compiling.len() < unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize });
@@ -3985,6 +4029,10 @@ fn jit_analyze_and_generate(
         stat::COMPILE_WASM_TOTAL_BYTES,
         ctx.wasm_builder.get_output_len() as u64,
     );
+    unsafe {
+        JIT_CODEGEN_BYTES_TOTAL =
+            JIT_CODEGEN_BYTES_TOTAL.wrapping_add(ctx.wasm_builder.get_output_len() as u64);
+    }
     profiler::stat_increment_by(stat::COMPILE_PAGE, pages.len() as u64);
 
     for &p in &pages {
@@ -6095,7 +6143,8 @@ pub fn jit_increase_hotness_and_maybe_compile(
         page_hotness.hotness >= effective
     };
 
-    if !threshold_reached {
+    let forced = !threshold_reached && hot_profile_force(&mut ctx, page);
+    if !threshold_reached && !forced {
         return;
     }
 
@@ -6755,6 +6804,220 @@ pub fn jit_get_compile_total_us() -> f64 { unsafe { JIT_COMPILE_TOTAL_US as f64 
 pub fn jit_get_compile_max_us() -> u32 { unsafe { JIT_COMPILE_MAX_US } }
 
 #[no_mangle]
+pub fn jit_get_codegen_total_us() -> f64 { unsafe { JIT_CODEGEN_TOTAL_US } }
+
+#[no_mangle]
+pub fn jit_get_codegen_max_us() -> f64 { unsafe { JIT_CODEGEN_MAX_US } }
+
+#[no_mangle]
+pub fn jit_get_codegen_count() -> u32 { unsafe { JIT_CODEGEN_COUNT } }
+
+#[no_mangle]
+pub fn jit_get_codegen_bytes() -> f64 { unsafe { JIT_CODEGEN_BYTES_TOTAL as f64 } }
+
+// ── Hot-page profile: import / export / force ────────────────────────────
+
+/// FNV-1a over the page's 4 KiB of guest RAM; None for MMIO or out of range.
+fn hot_profile_page_hash(page: Page) -> Option<u32> {
+    let addr = page.to_address();
+    let end = addr.checked_add(4096)?;
+    if end > unsafe { *global_pointers::memory_size } || memory::in_mapped_range(addr) {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(memory::mem8.offset(addr as isize), 4096) };
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    Some(h)
+}
+
+/// Compile-at-first-touch for a page the profile knows. Returns true when the
+/// page's hotness ramp is skipped; the caller then takes the ordinary
+/// cap/deferred/compile path with the recorded entry points merged in.
+fn hot_profile_force(ctx: &mut JitState, page: Page) -> bool {
+    // Already covered, in flight, or queued: nothing to force, and the
+    // counter must not tick once per block executed while a compile lands.
+    if ctx.pages.contains_key(&page)
+        || page_is_compiling(ctx, page)
+        || ctx.deferred_compile_pages.contains(&page)
+    {
+        return false;
+    }
+    let mut guard = HOT_PROFILE.lock().unwrap();
+    let map = match guard.as_mut() {
+        Some(m) => m,
+        None => return false,
+    };
+    let (hash, entries) = match map.get(&page) {
+        Some(p) => (p.hash, p.entries.clone()),
+        None => return false,
+    };
+    match hot_profile_page_hash(page) {
+        Some(h) if h == hash => {},
+        _ => {
+            map.remove(&page);
+            unsafe {
+                JIT_HOT_PROFILE_MISMATCH = JIT_HOT_PROFILE_MISMATCH.wrapping_add(1);
+            }
+            return false;
+        },
+    }
+    let hot = ctx.entry_points.entry(page).or_insert_with(|| {
+        cpu::tlb_set_has_code(page, true);
+        PageHotness { hotness: 0, entry_points: HashSet::new() }
+    });
+    for e in entries {
+        if !is_near_end_of_page(page.to_address() | e as u32) {
+            hot.entry_points.insert(e);
+        }
+    }
+    hot.hotness = 0;
+    unsafe {
+        JIT_HOT_PROFILE_FORCED = JIT_HOT_PROFILE_FORCED.wrapping_add(1);
+    }
+    true
+}
+
+fn hot_profile_parse(data: &[u8]) -> Option<HashMap<Page, HotProfilePage>> {
+    let rd = |i: usize| -> Option<u32> {
+        data.get(i..i + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if rd(0)? != HOT_PROFILE_MAGIC || rd(4)? != HOT_PROFILE_VERSION {
+        return None;
+    }
+    let count = rd(8)? as usize;
+    let mut map = HashMap::with_capacity(count);
+    let mut i = 12;
+    for _ in 0..count {
+        let page = rd(i)?;
+        let hash = rd(i + 4)?;
+        let n = rd(i + 8)? as usize;
+        i += 12;
+        let mut entries = Vec::with_capacity(n);
+        for k in 0..n {
+            let b = data.get(i + 2 * k..i + 2 * k + 2)?;
+            entries.push(u16::from_le_bytes([b[0], b[1]]) & 0xFFF);
+        }
+        i += (2 * n + 3) & !3;
+        map.insert(Page::of_u32(page), HotProfilePage { hash, entries });
+    }
+    Some(map)
+}
+
+#[no_mangle]
+pub fn jit_hot_profile_clear() {
+    *HOT_PROFILE.lock().unwrap() = None;
+    unsafe {
+        JIT_HOT_PROFILE_FORCED = 0;
+        JIT_HOT_PROFILE_MISMATCH = 0;
+    }
+}
+
+/// Reserve `len` bytes for an import; JS copies the profile there, then commits.
+#[no_mangle]
+pub fn jit_hot_profile_io_alloc(len: u32) -> u32 {
+    let mut io = HOT_PROFILE_IO.lock().unwrap();
+    io.clear();
+    io.resize(len as usize, 0);
+    io.as_mut_ptr() as u32
+}
+
+#[no_mangle]
+pub fn jit_hot_profile_io_ptr() -> u32 { HOT_PROFILE_IO.lock().unwrap().as_ptr() as u32 }
+
+/// Merge the staged bytes into the live profile. Returns the page count of the
+/// merged profile, or 0 when the bytes are not a HOTP v1 image.
+#[no_mangle]
+pub fn jit_hot_profile_import_commit(len: u32) -> u32 {
+    let parsed = {
+        let io = HOT_PROFILE_IO.lock().unwrap();
+        match io.get(..len as usize).and_then(hot_profile_parse) {
+            Some(p) => p,
+            None => return 0,
+        }
+    };
+    let mut guard = HOT_PROFILE.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    for (page, p) in parsed {
+        let e = map.entry(page).or_insert_with(|| HotProfilePage { hash: p.hash, entries: Vec::new() });
+        e.hash = p.hash;
+        for off in p.entries {
+            if !e.entries.contains(&off) {
+                e.entries.push(off);
+            }
+        }
+    }
+    map.len() as u32
+}
+
+/// Serialize every page that currently owns a module (or is being compiled),
+/// merged with the imported profile, into the IO buffer. Returns its length.
+#[no_mangle]
+pub fn jit_hot_profile_export_build() -> u32 {
+    let ctx = get_jit_state();
+    let mut merged: HashMap<Page, HotProfilePage> =
+        HOT_PROFILE.lock().unwrap().clone().unwrap_or_default();
+    let mut add = |page: Page, entry_points: &Vec<(u16, u16)>| {
+        if entry_points.is_empty() {
+            return;
+        }
+        if let Some(h) = hot_profile_page_hash(page) {
+            let e = merged.entry(page).or_insert_with(|| HotProfilePage { hash: h, entries: Vec::new() });
+            e.hash = h;
+            for (off, _) in entry_points.iter() {
+                if !e.entries.contains(off) {
+                    e.entries.push(*off);
+                }
+            }
+        }
+    };
+    for (page, info) in ctx.pages.iter() {
+        add(*page, &info.entry_points);
+    }
+    for state in ctx.compiling.values() {
+        if let CompilingPageState::Compiling { pages } = state {
+            for (page, info) in pages.iter() {
+                add(*page, &info.entry_points);
+            }
+        }
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(12 + merged.len() * 64);
+    out.extend_from_slice(&HOT_PROFILE_MAGIC.to_le_bytes());
+    out.extend_from_slice(&HOT_PROFILE_VERSION.to_le_bytes());
+    out.extend_from_slice(&(merged.len() as u32).to_le_bytes());
+    let mut pages: Vec<(&Page, &HotProfilePage)> = merged.iter().collect();
+    pages.sort_by_key(|(p, _)| p.to_u32());
+    for (page, p) in pages {
+        out.extend_from_slice(&page.to_u32().to_le_bytes());
+        out.extend_from_slice(&p.hash.to_le_bytes());
+        out.extend_from_slice(&(p.entries.len() as u32).to_le_bytes());
+        for e in &p.entries {
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+    let len = out.len() as u32;
+    *HOT_PROFILE_IO.lock().unwrap() = out;
+    len
+}
+
+#[no_mangle]
+pub fn jit_hot_profile_pages() -> u32 {
+    HOT_PROFILE.lock().unwrap().as_ref().map(|m| m.len() as u32).unwrap_or(0)
+}
+
+#[no_mangle]
+pub fn jit_hot_profile_forced() -> u32 { unsafe { JIT_HOT_PROFILE_FORCED } }
+
+#[no_mangle]
+pub fn jit_hot_profile_mismatches() -> u32 { unsafe { JIT_HOT_PROFILE_MISMATCH } }
+
+#[no_mangle]
 pub fn jit_reset_compile_stats() {
     unsafe {
         JIT_COMPILE_STARTED = 0;
@@ -6766,6 +7029,12 @@ pub fn jit_reset_compile_stats() {
         JIT_COMPILE_DEFERRED_QUEUED = 0;
         JIT_COMPILE_DEFERRED_STARTED = 0;
         JIT_COMPILE_DEFERRED_DROPPED = 0;
+        JIT_CODEGEN_TOTAL_US = 0.0;
+        JIT_CODEGEN_MAX_US = 0.0;
+        JIT_CODEGEN_COUNT = 0;
+        JIT_CODEGEN_BYTES_TOTAL = 0;
+        JIT_HOT_PROFILE_FORCED = 0;
+        JIT_HOT_PROFILE_MISMATCH = 0;
     }
 }
 

@@ -1356,6 +1356,11 @@ pub fn dispatch_ext_get(page: u32) -> u64 { unsafe { DISPATCH_META_EXT[page as u
 static mut EXT_STALL_EIP: u32 = 0;
 static mut EXT_STALL_ARMED: bool = false;
 static mut EXT_STALLS: u32 = 0;
+// Set by the first external registration: until then the dispatcher's hot
+// path does not consult the external table or the stall guard at all.
+static mut EXTERNAL_ANY: bool = false;
+#[inline]
+pub fn external_any() -> bool { unsafe { EXTERNAL_ANY } }
 
 pub fn ext_stall_note(eip: u32) {
     unsafe {
@@ -7481,6 +7486,9 @@ pub fn jit_register_external_module(
     };
     publish_external(&info, page);
     ctx.external_pages.insert(page, info);
+    unsafe {
+        EXTERNAL_ANY = true;
+    }
     1
 }
 

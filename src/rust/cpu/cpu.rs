@@ -3125,11 +3125,11 @@ pub unsafe fn cycle_internal() {
     // re-entered at the same address, or the cycle loop never ends: the
     // interpreter executes that one instruction.
     let mut external_entry = false;
-    let ext_skip = jit::ext_stall_take(initial_eip as u32);
+    let ext_skip = jit::external_any() && jit::ext_stall_take(initial_eip as u32);
     if ext_skip {
         jit::note_external_dispatch(false);
     }
-    else if jit::external_first_enabled() {
+    else if jit::external_any() && jit::external_first_enabled() {
         let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
         if meta2 != 0 {
             if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
@@ -3216,7 +3216,7 @@ pub unsafe fn cycle_internal() {
 
     // External modules after the JIT's (the default): they serve the pages
     // and entries the JIT has not compiled.
-    if jit_entry.is_none() && !ext_skip && !jit::external_first_enabled() {
+    if jit_entry.is_none() && jit::external_any() && !ext_skip && !jit::external_first_enabled() {
         let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
         if meta2 != 0 {
             if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
@@ -3245,7 +3245,7 @@ pub unsafe fn cycle_internal() {
         if get_phys_eip().is_err() {
             return;
         }
-        if !ext_skip {
+        if jit::external_any() && !ext_skip {
             let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
             if meta2 != 0
                 && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2))

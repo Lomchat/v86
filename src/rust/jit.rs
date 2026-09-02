@@ -116,6 +116,19 @@ static mut JIT_EXACT_PAGE_TAIL_INSTRUCTIONS_COMPILED: u32 = 0;
 // Both physical pages become invalidation dependencies (config 38).
 static mut JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS: bool = true;
 static mut JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS_COMPILED: u32 = 0;
+// Config 50: entry points in the last MAX_INSTRUCTION_LENGTH bytes of a page
+// are recorded and compiled like any other. The decoder already proves the
+// mapping before keeping an instruction that crosses into the next page
+// (config 38), so a block starting in the page tail is safe; without that
+// guard such blocks stay interpreted, which on BFME 1 was nine tenths of all
+// interpreted blocks in play (the same loop heads, tens of thousands of times
+// per second).
+static mut JIT_PAGE_TAIL_ENTRIES: bool = true;
+
+#[inline]
+pub fn page_tail_entries_enabled() -> bool {
+    unsafe { JIT_PAGE_TAIL_ENTRIES && JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS }
+}
 // Keep relaxed-x87 results in block-scoped wasm locals and materialise them at
 // architectural boundaries instead of writing fpu_st after every arithmetic
 // instruction (config 39). Experimental until differential and game A/B pass.
@@ -3190,7 +3203,7 @@ fn jit_find_basic_blocks(
         marked_as_entry: &mut HashSet<i32>,
         to_visit_stack: &mut Vec<i32>,
     ) -> Option<u32> {
-        if is_near_end_of_page(virt_target as u32) {
+        if is_near_end_of_page(virt_target as u32) && !page_tail_entries_enabled() {
             return None;
         }
         let phys_target = match cpu::translate_address_read_no_side_effects(virt_target) {
@@ -3348,7 +3361,7 @@ fn jit_find_basic_blocks(
             continue;
         }
 
-        if is_near_end_of_page(phys_addr) {
+        if is_near_end_of_page(phys_addr) && !page_tail_entries_enabled() {
             // Empty basic block, don't insert
             profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
             continue;
@@ -3468,7 +3481,7 @@ fn jit_find_basic_blocks(
 
                     if analysis.ty == AnalysisType::STI {
                         dbg_assert!(
-                            !is_near_end_of_page(current_address),
+                            !is_near_end_of_page(current_address) || page_tail_entries_enabled(),
                             "should be handled above"
                         );
 
@@ -3479,7 +3492,7 @@ fn jit_find_basic_blocks(
                         // handle_irqs may be called)
 
                         if basic_blocks.contains_key(&current_address) {
-                            dbg_assert!(!is_near_end_of_page(current_address));
+                            dbg_assert!(!is_near_end_of_page(current_address) || page_tail_entries_enabled());
                             current_block.ty = BasicBlockType::Normal {
                                 next_block_addr: Some(current_address),
                                 jump_offset: 0,
@@ -3717,6 +3730,14 @@ fn jit_find_basic_blocks(
             }
         }
 
+        if current_block.number_of_instructions == 0 {
+            // The first instruction crossed into a page that is not
+            // physically contiguous: nothing to compile here, the
+            // interpreter keeps this block.
+            profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+            continue;
+        }
+
         dbg_assert!(current_block.addr < current_block.end_addr);
         dbg_assert!(current_block.addr <= current_block.last_instruction_addr);
         dbg_assert!(current_block.last_instruction_addr < current_block.end_addr);
@@ -3925,7 +3946,7 @@ fn jit_find_basic_blocks(
 #[cfg(debug_assertions)]
 pub fn jit_force_generate_unsafe(virt_addr: i32) {
     dbg_assert!(
-        !is_near_end_of_page(virt_addr as u32),
+        !is_near_end_of_page(virt_addr as u32) || page_tail_entries_enabled(),
         "cannot force compile near end of page"
     );
     jit_increase_hotness_and_maybe_compile(
@@ -6117,7 +6138,7 @@ fn jit_generate_basic_block(
     let stop_addr = block.end_addr;
 
     // First iteration of do-while assumes the caller confirms this condition
-    dbg_assert!(!is_near_end_of_page(start_addr));
+    dbg_assert!(!is_near_end_of_page(start_addr) || page_tail_entries_enabled());
 
     if cfg!(feature = "profiler") {
         ctx.builder.const_i32(start_addr as i32);
@@ -6314,7 +6335,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
             PageHotness { hotness: 0, entry_points: HashSet::new() }
         });
 
-        if !is_near_end_of_page(phys_address) {
+        if !is_near_end_of_page(phys_address) || page_tail_entries_enabled() {
             page_hotness.entry_points.insert(phys_address as u16 & 0xFFF);
         }
 
@@ -6863,6 +6884,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         36 => JIT_SYNC_BOUNDARY_CONTINUATION = value != 0,
         37 => JIT_DEFERRED_COMPILE_QUEUE = value != 0,
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS = value != 0,
+        50 => JIT_PAGE_TAIL_ENTRIES = value != 0,
         39 => JIT_X87_WRITEBACK = value != 0,
         40 => JIT_FPU_ORDERED_COMPARE_FIRST = value != 0,
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT = value != 0,
@@ -6919,6 +6941,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         36 => JIT_SYNC_BOUNDARY_CONTINUATION as u32,
         37 => JIT_DEFERRED_COMPILE_QUEUE as u32,
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS as u32,
+        50 => JIT_PAGE_TAIL_ENTRIES as u32,
         39 => JIT_X87_WRITEBACK as u32,
         40 => JIT_FPU_ORDERED_COMPARE_FIRST as u32,
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT as u32,
@@ -7080,7 +7103,7 @@ fn hot_profile_force(ctx: &mut JitState, page: Page, phys_address: u32) -> bool 
         PageHotness { hotness: 0, entry_points: HashSet::new() }
     });
     for e in entries {
-        if !is_near_end_of_page(page.to_address() | e as u32) {
+        if !is_near_end_of_page(page.to_address() | e as u32) || page_tail_entries_enabled() {
             hot.entry_points.insert(e);
         }
     }

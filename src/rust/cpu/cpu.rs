@@ -3118,11 +3118,43 @@ pub unsafe fn cycle_internal() {
     }
     let initial_state_flags = *state_flags;
 
+    // An external (ahead-of-time) module that owns this address takes
+    // precedence over the JIT's module for the page. A module that just
+    // returned here without retiring anything (a guard at its entry
+    // instruction, or an instruction it leaves to the interpreter) must not be
+    // re-entered at the same address, or the cycle loop never ends: the
+    // interpreter executes that one instruction.
+    let mut external_entry = false;
+    let ext_skip = jit::ext_stall_take(initial_eip as u32);
+    if ext_skip {
+        jit::note_external_dispatch(false);
+    }
+    else {
+        let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
+        if meta2 != 0 {
+            if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
+                let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
+                if st != u16::MAX {
+                    jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
+                    external_entry = true;
+                    jit::note_external_dispatch(true);
+                    jit::ext_trace_enter(initial_eip as u32);
+                }
+                else {
+                    jit::note_external_dispatch(false);
+                }
+            }
+            else {
+                jit::note_external_dispatch(false);
+            }
+        }
+    }
+
     // DOD SoA lookup (jit::DISPATCH_META — no pointer chase). The old lookup-time
     // fastmem-generation deopt is gone: a stale unit self-deopts via its prologue
     // guard right after dispatch, one bounce, same observable behavior.
     let meta = jit::dispatch_meta_get(initial_eip as u32 >> 12);
-    {
+    if jit_entry.is_none() {
         if meta != 0 {
             let unit_index = jit::dispatch_meta_table_index(meta);
             let unit_state_flags =
@@ -3190,7 +3222,21 @@ pub unsafe fn cycle_internal() {
         if get_phys_eip().is_err() {
             return;
         }
-        {
+        if !ext_skip {
+            let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
+            if meta2 != 0
+                && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2))
+            {
+                let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
+                if st != u16::MAX {
+                    jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
+                    external_entry = true;
+                    jit::note_external_dispatch(true);
+                    jit::ext_trace_enter(initial_eip as u32);
+                }
+            }
+        }
+        if jit_entry.is_none() {
             let meta_after = jit::dispatch_meta_get(initial_eip as u32 >> 12);
             if meta_after != 0
                 && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta_after))
@@ -3199,35 +3245,6 @@ pub unsafe fn cycle_internal() {
                 if st != u16::MAX {
                     jit_entry = Some((jit::dispatch_meta_table_index(meta_after), st));
                 }
-            }
-        }
-    }
-    // External (ahead-of-time) module for this address, when the JIT has none.
-    // A module that just returned here without retiring anything (a guard at
-    // its entry instruction) must not be re-entered at the same address, or the
-    // cycle loop never ends: the interpreter executes that one instruction.
-    let mut external_entry = false;
-    if jit_entry.is_none() && jit::ext_stall_take(initial_eip as u32) {
-        jit::note_external_dispatch(false);
-    }
-    else if jit_entry.is_none() {
-        let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
-        if meta2 != 0 {
-            if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
-                let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
-                if st != u16::MAX {
-                    jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
-                    tier2_profile_exit = false;
-                    external_entry = true;
-                    jit::note_external_dispatch(true);
-                    jit::ext_trace_enter(initial_eip as u32);
-                }
-                else {
-                    jit::note_external_dispatch(false);
-                }
-            }
-            else {
-                jit::note_external_dispatch(false);
             }
         }
     }

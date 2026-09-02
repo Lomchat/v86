@@ -3689,14 +3689,36 @@ pub unsafe fn do_many_cycles_native() {
 // Returns 0 when EIP is `ret_eip`, otherwise a stop reason.
 static mut JIT_RUN_UNTIL_DEPTH: u32 = 0;
 const JIT_RUN_UNTIL_MAX_DEPTH: u32 = 24;
+// Dispatches per bridged call are bounded independently of retired
+// instructions, so a callee that keeps stalling cannot pin the Worker.
+const JIT_RUN_UNTIL_MAX_ITERATIONS: u32 = 200_000;
+// calls, returned (0), stopped by budget/halt/park (1), by the instruction
+// cap (2), by depth (3), by the iteration cap (4), total iterations,
+// total instructions retired inside.
+static mut JIT_RUN_UNTIL_STATS: [u32; 7] = [0; 7];
+
+#[no_mangle]
+pub fn jit_run_until_stat(i: u32) -> u32 {
+    unsafe { if (i as usize) < JIT_RUN_UNTIL_STATS.len() { JIT_RUN_UNTIL_STATS[i as usize] } else { 0 } }
+}
+
+#[no_mangle]
+pub fn jit_run_until_stats_reset() {
+    unsafe { JIT_RUN_UNTIL_STATS = [0; 7]; }
+}
 
 #[no_mangle]
 pub unsafe fn jit_run_until(ret_eip: u32, max: u32) -> u32 {
+    JIT_RUN_UNTIL_STATS[0] = JIT_RUN_UNTIL_STATS[0].wrapping_add(1);
     if JIT_RUN_UNTIL_DEPTH >= JIT_RUN_UNTIL_MAX_DEPTH {
+        JIT_RUN_UNTIL_STATS[3] = JIT_RUN_UNTIL_STATS[3].wrapping_add(1);
         return 3;
     }
     JIT_RUN_UNTIL_DEPTH += 1;
+    let outer_stop = jit::JIT_CHAIN_STOP_EIP;
+    jit::JIT_CHAIN_STOP_EIP = ret_eip;
     let start = *instruction_counter;
+    let mut iterations: u32 = 0;
     let result = loop {
         if *instruction_pointer as u32 == ret_eip {
             break 0;
@@ -3712,9 +3734,17 @@ pub unsafe fn jit_run_until(ret_eip: u32, max: u32) -> u32 {
         if (*instruction_counter).wrapping_sub(start) >= max {
             break 2;
         }
+        if iterations >= JIT_RUN_UNTIL_MAX_ITERATIONS {
+            break 4;
+        }
+        iterations += 1;
         cycle_internal();
     };
+    jit::JIT_CHAIN_STOP_EIP = outer_stop;
     JIT_RUN_UNTIL_DEPTH -= 1;
+    JIT_RUN_UNTIL_STATS[1 + result as usize] = JIT_RUN_UNTIL_STATS[1 + result as usize].wrapping_add(1);
+    JIT_RUN_UNTIL_STATS[5] = JIT_RUN_UNTIL_STATS[5].wrapping_add(iterations);
+    JIT_RUN_UNTIL_STATS[6] = JIT_RUN_UNTIL_STATS[6].wrapping_add((*instruction_counter).wrapping_sub(start));
     result
 }
 

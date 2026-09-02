@@ -1963,6 +1963,13 @@ pub fn jit_chain_park_guard() -> u32 { unsafe { JIT_CHAIN_PARK_GUARD } }
 /// Address the generated chaining guards read for the slice budget. With the
 /// park guard on this is the slice's own budget, which an urgent exit does not
 /// zero, so a chaining edge is refused only when the budget is genuinely spent.
+// The return address a nested external-module run (cpu::jit_run_until) is
+// waiting for: no chained edge may run through it, or the callee's caller
+// would be executed as JIT code while the translated caller waits. Zero
+// when no nested run is active.
+pub static mut JIT_CHAIN_STOP_EIP: u32 = 0;
+pub fn chain_stop_eip_address() -> u32 { std::ptr::addr_of!(JIT_CHAIN_STOP_EIP) as u32 }
+
 fn chain_budget_address() -> u32 {
     if unsafe { JIT_CHAIN_PARK_GUARD } != 0 {
         std::ptr::addr_of!(cpu::jit_slice_limit) as u32
@@ -2916,6 +2923,12 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     }
 
     let virt_address = *global_pointers::instruction_pointer as u32;
+    if virt_address == JIT_CHAIN_STOP_EIP {
+        if dispatch_stats_enabled() {
+            profiler::stat_increment_always(stat::RET_CHAIN_MISS);
+        }
+        return -1;
+    }
 
     // B1b: direct-mapped memo probe. An entry is valid only if its epoch is current —
     // any table-slot free or code-TLB eviction since the fill bumps the epoch and
@@ -4657,6 +4670,12 @@ fn gen_chain_or_exit_to_known_successor(
     ctx.builder.load_fixed_u8(global_pointers::in_hlt as u32);
     ctx.builder.eqz_i32();
     ctx.builder.and_i32();
+    // The successor EIP is already stored; a nested external run must get
+    // control back at its return address instead of a chained edge.
+    ctx.builder.load_fixed_i32(chain_stop_eip_address());
+    codegen::gen_get_eip(ctx.builder);
+    ctx.builder.ne_i32();
+    ctx.builder.and_i32();
     ctx.builder.if_void();
 
     codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_CHAINED_EDGE);
@@ -4831,6 +4850,12 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx.builder.get_local(&virt_address);
     ctx.builder.eq_i32();
     ctx.builder.and_i32();
+    // A nested external run waits for its return address: never chain
+    // through it (see JIT_CHAIN_STOP_EIP).
+    ctx.builder.load_fixed_i32(chain_stop_eip_address());
+    ctx.builder.get_local(&virt_address);
+    ctx.builder.ne_i32();
+    ctx.builder.and_i32();
 
     // The historical helper checks this before every chain. Keep the same
     // scheduler boundary on the generated hit path; a failed guard enters the
@@ -4872,6 +4897,10 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx.builder.and_i32();
     ctx.builder.load_fixed_u8(global_pointers::in_hlt as u32);
     ctx.builder.eqz_i32();
+    ctx.builder.and_i32();
+    ctx.builder.load_fixed_i32(chain_stop_eip_address());
+    ctx.builder.get_local(&virt_address);
+    ctx.builder.ne_i32();
     ctx.builder.and_i32();
     let miss_scheduler_ok = ctx.builder.set_new_local();
 

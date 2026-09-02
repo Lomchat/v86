@@ -324,6 +324,31 @@ pub fn ret_cache_invalidate_all() {
     }
 }
 
+/// Where module frees come from. In a settled skirmish the slow windows average
+/// 260 frees per 10s against 54 in the fast ones, and each free invalidates every
+/// return prediction AND the inline caches in generated code, so the pages fall
+/// back to interpretation. Tier-2 promotion and the recompile divisor were both
+/// ruled out by toggling them without moving the count, so the site has to be
+/// attributed rather than guessed.
+static mut FREE_SITE_WRITTEN_WHILE_COMPILING: u32 = 0;
+static mut FREE_SITE_OVERWRITE: u32 = 0;
+static mut FREE_SITE_PAGE_INVALIDATED: u32 = 0;
+
+#[no_mangle]
+pub fn jit_free_site_written() -> u32 { unsafe { FREE_SITE_WRITTEN_WHILE_COMPILING } }
+#[no_mangle]
+pub fn jit_free_site_overwrite() -> u32 { unsafe { FREE_SITE_OVERWRITE } }
+#[no_mangle]
+pub fn jit_free_site_page_invalidated() -> u32 { unsafe { FREE_SITE_PAGE_INVALIDATED } }
+#[no_mangle]
+pub fn jit_free_sites_reset() {
+    unsafe {
+        FREE_SITE_WRITTEN_WHILE_COMPILING = 0;
+        FREE_SITE_OVERWRITE = 0;
+        FREE_SITE_PAGE_INVALIDATED = 0;
+    }
+}
+
 pub fn ret_cache_invalidate_all_slot_free() {
     unsafe { RET_CACHE_INVALIDATED_BY_SLOT = RET_CACHE_INVALIDATED_BY_SLOT.wrapping_add(1) };
     ret_cache_invalidate_all();
@@ -4072,6 +4097,10 @@ pub fn codegen_finalize_finished(
         },
         Some(CompilingPageState::CompilingWritten) => {
             profiler::stat_increment(stat::INVALIDATE_MODULE_WRITTEN_WHILE_COMPILED);
+            unsafe {
+                FREE_SITE_WRITTEN_WHILE_COMPILING =
+                    FREE_SITE_WRITTEN_WHILE_COMPILING.wrapping_add(1)
+            };
             free_wasm_table_index(&mut ctx, wasm_table_index);
             drain_deferred_compiles(&mut ctx);
             check_jit_state_invariants(&mut ctx);
@@ -4126,6 +4155,7 @@ pub fn codegen_finalize_finished(
 
         dbg_log!("unused after overwrite {}", index.to_u16());
         profiler::stat_increment(stat::INVALIDATE_MODULE_UNUSED_AFTER_OVERWRITE);
+        unsafe { FREE_SITE_OVERWRITE = FREE_SITE_OVERWRITE.wrapping_add(1) };
         free_wasm_table_index(&mut ctx, index);
     }
 
@@ -6229,6 +6259,7 @@ fn free_wasm_module(ctx: &mut JitState, wasm_table_index: WasmTableIndex) -> Vec
             .retain(|&w| w != wasm_table_index)
     }
 
+    unsafe { FREE_SITE_PAGE_INVALIDATED = FREE_SITE_PAGE_INVALIDATED.wrapping_add(1) };
     free_wasm_table_index(ctx, wasm_table_index);
     hidden_to_free
 }

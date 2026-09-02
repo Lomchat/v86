@@ -2012,6 +2012,9 @@ static HOT_PROFILE: Mutex<Option<HashMap<Page, HotProfilePage>>> = Mutex::new(No
 static HOT_PROFILE_IO: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static mut JIT_HOT_PROFILE_FORCED: u32 = 0;
 static mut JIT_HOT_PROFILE_MISMATCH: u32 = 0;
+// An external (ahead-of-time) page module replaced by a JIT compile of the
+// same page: the batch left a dispatched entry uncovered on that page.
+static mut JIT_EXTERNAL_PAGES_REPLACED: u32 = 0;
 // Config 48. 0: force whenever the page is touched, queueing behind the compile
 // cap. 1: force only while a compile slot is free, so a burst of known pages
 // (a boot touches a thousand of them) cannot pile up a deferred queue whose
@@ -4192,6 +4195,14 @@ pub fn codegen_finalize_finished(
 
     for (page, mut info) in pages {
         if let Some(old_entry) = ctx.pages.remove(&page) {
+            if (old_entry.wasm_table_index.to_u16() as u32) >= WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS {
+                unsafe {
+                    JIT_EXTERNAL_PAGES_REPLACED = JIT_EXTERNAL_PAGES_REPLACED.wrapping_add(1);
+                }
+                // Not a JIT slot: never handed to free_wasm_table_index below.
+                ctx.pages.insert(page, info);
+                continue;
+            }
             info.hidden_wasm_table_indices
                 .extend(old_entry.hidden_wasm_table_indices);
             info.hidden_wasm_table_indices
@@ -7058,6 +7069,9 @@ pub fn jit_external_module_slots() -> u32 { EXTERNAL_MODULE_SLOTS }
 /// registered under exactly the key the dispatcher will look up.
 #[no_mangle]
 pub fn jit_get_current_state_flags() -> u32 { cpu::get_state_flags().to_u32() }
+
+#[no_mangle]
+pub fn jit_external_pages_replaced() -> u32 { unsafe { JIT_EXTERNAL_PAGES_REPLACED } }
 
 /// Register `wasm_table_index` (a reserved external slot) as the module for the
 /// physical entry `phys_address` under `state_flags`. `initial_state` is the

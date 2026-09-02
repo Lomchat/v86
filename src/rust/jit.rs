@@ -1333,6 +1333,19 @@ pub fn ext_stall_take(eip: u32) -> bool {
 #[no_mangle]
 pub fn jit_external_stalls() -> u32 { unsafe { EXT_STALLS } }
 
+// External modules take precedence over the JIT's for an address both own.
+// Measured on BFME 1 (2 September 2026): 12.6 FPS against 30 with the JIT
+// first, the translation exiting at every call the batch does not cover.
+// Off by default; the JIT serves what it has compiled and the external
+// modules the rest.
+static mut EXTERNAL_FIRST: bool = false;
+#[inline]
+pub fn external_first_enabled() -> bool { unsafe { EXTERNAL_FIRST } }
+#[no_mangle]
+pub fn jit_set_external_first(on: u32) { unsafe { EXTERNAL_FIRST = on != 0; } }
+#[no_mangle]
+pub fn jit_get_external_first() -> u32 { unsafe { EXTERNAL_FIRST as u32 } }
+
 /// Called by an external module about to exit at an instruction it wants the
 /// interpreter to run: the next dispatch of that address bypasses the
 /// external table once.

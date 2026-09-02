@@ -3129,7 +3129,7 @@ pub unsafe fn cycle_internal() {
     if ext_skip {
         jit::note_external_dispatch(false);
     }
-    else {
+    else if jit::external_first_enabled() {
         let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
         if meta2 != 0 {
             if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
@@ -3210,6 +3210,29 @@ pub unsafe fn cycle_internal() {
                 if unit_state_flags.ssize_32() != s.ssize_32() {
                     profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_SS32);
                 }
+            }
+        }
+    }
+
+    // External modules after the JIT's (the default): they serve the pages
+    // and entries the JIT has not compiled.
+    if jit_entry.is_none() && !ext_skip && !jit::external_first_enabled() {
+        let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
+        if meta2 != 0 {
+            if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
+                let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
+                if st != u16::MAX {
+                    jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
+                    external_entry = true;
+                    jit::note_external_dispatch(true);
+                    jit::ext_trace_enter(initial_eip as u32);
+                }
+                else {
+                    jit::note_external_dispatch(false);
+                }
+            }
+            else {
+                jit::note_external_dispatch(false);
             }
         }
     }

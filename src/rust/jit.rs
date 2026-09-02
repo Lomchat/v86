@@ -1045,6 +1045,11 @@ static mut FASTMEM_WRITE_EXCLUDE_HI_PAGE: u32 = 0;
 // TLB-fill) and cpu::clear_tlb_code (eviction/invlpg/dirty) — no new choke points.
 pub const DISPATCH_SLAB_COUNT: usize = 4096; // 4096 × 8 KB = 32 MB pool
 static mut DISPATCH_META: [u64; 1 << 20] = [0; 1 << 20];
+// Second dispatch table for external (ahead-of-time) modules, consulted only
+// when the JIT's table has no entry for the address. Same packing, same slab
+// pool, so a page can carry a JIT module and an external module at once and
+// neither evicts the other.
+static mut DISPATCH_META_EXT: [u64; 1 << 20] = [0; 1 << 20];
 static mut DISPATCH_SLABS: [u16; DISPATCH_SLAB_COUNT * 0x1000] =
     [0; DISPATCH_SLAB_COUNT * 0x1000];
 // Free stack of slab indices; filled 1..DISPATCH_SLAB_COUNT by rust_init.
@@ -1290,6 +1295,63 @@ pub fn dispatch_meta_set(
         DISPATCH_META[page] = (state_flags.to_u32() as u64) << 32
             | (wasm_table_index.to_u16() as u64) << 16
             | slab as u64;
+    }
+}
+
+#[inline]
+pub fn dispatch_ext_get(page: u32) -> u64 { unsafe { DISPATCH_META_EXT[page as usize & 0xFFFFF] } }
+
+/// Publish an external module's entries for a virtual page (see DISPATCH_META_EXT).
+pub fn dispatch_ext_set(
+    virt_page: Page,
+    wasm_table_index: WasmTableIndex,
+    entries: &Vec<(u16, u16)>,
+    state_flags: CachedStateFlags,
+) {
+    unsafe {
+        let page = virt_page.to_u32() as usize & 0xFFFFF;
+        let existing = DISPATCH_META_EXT[page];
+        let slab = if existing != 0 {
+            (existing as u16) as usize
+        }
+        else {
+            if DISPATCH_SLAB_FREE_TOP == 0 {
+                DISPATCH_SLAB_OVERFLOWS = DISPATCH_SLAB_OVERFLOWS.saturating_add(1);
+                return;
+            }
+            DISPATCH_SLAB_FREE_TOP -= 1;
+            let s = DISPATCH_SLAB_FREE[DISPATCH_SLAB_FREE_TOP] as usize;
+            let in_use = (DISPATCH_SLAB_COUNT - 1 - DISPATCH_SLAB_FREE_TOP) as u32;
+            if in_use > DISPATCH_SLAB_HIGH_WATER {
+                DISPATCH_SLAB_HIGH_WATER = in_use;
+            }
+            s
+        };
+        dbg_assert!(slab != 0 && slab < DISPATCH_SLAB_COUNT);
+        let table = &mut DISPATCH_SLABS[slab * 0x1000..slab * 0x1000 + 0x1000];
+        table.fill(u16::MAX);
+        for &(addr, state) in entries {
+            table[addr as usize] = state;
+        }
+        DISPATCH_META_EXT[page] = (state_flags.to_u32() as u64) << 32
+            | (wasm_table_index.to_u16() as u64) << 16
+            | slab as u64;
+    }
+}
+
+pub fn dispatch_ext_clear(page: u32) -> bool {
+    unsafe {
+        let page = page as usize & 0xFFFFF;
+        let meta = DISPATCH_META_EXT[page];
+        if meta == 0 {
+            return false;
+        }
+        let slab = (meta as u16) as usize;
+        dbg_assert!(slab != 0 && slab < DISPATCH_SLAB_COUNT);
+        DISPATCH_SLAB_FREE[DISPATCH_SLAB_FREE_TOP] = slab as u16;
+        DISPATCH_SLAB_FREE_TOP += 1;
+        DISPATCH_META_EXT[page] = 0;
+        true
     }
 }
 
@@ -2058,6 +2120,9 @@ struct JitState {
     // Profile-selected unions of already-hot Tier-1 modules. Keyed by every
     // source page so whichever source entry triggers recompilation sees the plan.
     tier2_regions: HashMap<Page, Tier2Region>,
+    // External (ahead-of-time) modules by physical page, alongside — not
+    // instead of — whatever the JIT compiles for the same page.
+    external_pages: HashMap<Page, PageInfo>,
 }
 
 fn check_jit_state_invariants(ctx: &mut JitState) {
@@ -2132,6 +2197,7 @@ impl JitState {
             tier2_pages: HashSet::new(),
             tier2_page_last_seen: HashMap::new(),
             tier2_regions: HashMap::new(),
+            external_pages: HashMap::new(),
         }
     }
 }
@@ -4195,14 +4261,6 @@ pub fn codegen_finalize_finished(
 
     for (page, mut info) in pages {
         if let Some(old_entry) = ctx.pages.remove(&page) {
-            if (old_entry.wasm_table_index.to_u16() as u32) >= WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS {
-                unsafe {
-                    JIT_EXTERNAL_PAGES_REPLACED = JIT_EXTERNAL_PAGES_REPLACED.wrapping_add(1);
-                }
-                // Not a JIT slot: never handed to free_wasm_table_index below.
-                ctx.pages.insert(page, info);
-                continue;
-            }
             info.hidden_wasm_table_indices
                 .extend(old_entry.hidden_wasm_table_indices);
             info.hidden_wasm_table_indices
@@ -4242,7 +4300,15 @@ pub fn update_tlb_code(virt_page: Page, phys_page: Page) {
             state_flags,
             hidden_wasm_table_indices: _,
         }) => set_tlb_code(virt_page, *wasm_table_index, entry_points, *state_flags),
-        None => cpu::clear_tlb_code(phys_page.to_u32() as i32),
+        None => {
+            if dispatch_meta_clear(virt_page.to_u32()) {
+                ret_cache_invalidate_page_tlb(virt_page.to_u32());
+            }
+        },
+    };
+    match ctx.external_pages.get(&phys_page) {
+        Some(info) => dispatch_ext_set(virt_page, info.wasm_table_index, &info.entry_points, info.state_flags),
+        None => { dispatch_ext_clear(virt_page.to_u32()); },
     };
 }
 
@@ -6389,6 +6455,13 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
         free_wasm_module_forest(ctx, roots);
     }
 
+    if ctx.external_pages.remove(&page).is_some() {
+        did_have_code = true;
+        unsafe {
+            JIT_EXTERNAL_PAGES_REPLACED = JIT_EXTERNAL_PAGES_REPLACED.wrapping_add(1);
+        }
+    }
+
     match ctx.entry_points.remove(&page) {
         None => {},
         Some(_) => {
@@ -6515,7 +6588,7 @@ fn jit_clear_cache(ctx: &mut JitState) {
 pub fn jit_page_has_code(page: Page) -> bool { jit_page_has_code_ctx(&mut get_jit_state(), page) }
 
 fn jit_page_has_code_ctx(ctx: &mut JitState, page: Page) -> bool {
-    ctx.pages.contains_key(&page) || ctx.entry_points.contains_key(&page)
+    ctx.pages.contains_key(&page) || ctx.entry_points.contains_key(&page) || ctx.external_pages.contains_key(&page)
 }
 
 #[no_mangle]
@@ -7091,25 +7164,14 @@ pub fn jit_register_external_module(
     let state_flags = CachedStateFlags::of_u32(raw_state_flags);
     let page = Page::page_of(phys_address);
     let mut ctx = get_jit_state();
-    if page_is_compiling(&ctx, page) {
-        return 0;
-    }
     let offset = (phys_address & 0xFFF) as u16;
-    // Same external module already on this page: add the entry. Anything else
-    // is replaced — the JIT's own module would keep winning the dispatch for
-    // its entries otherwise.
     let mut entry_points = vec![(offset, initial_state as u16)];
-    if let Some(old) = ctx.pages.remove(&page) {
+    if let Some(old) = ctx.external_pages.remove(&page) {
         if old.wasm_table_index == index {
             for e in old.entry_points {
                 if e.0 != offset {
                     entry_points.push(e);
                 }
-            }
-        } else {
-            let still_used = ctx.pages.values().any(|p| p.wasm_table_index == old.wasm_table_index);
-            if !still_used && (old.wasm_table_index.to_u16() as u32) < WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS {
-                free_wasm_table_index(&mut ctx, old.wasm_table_index);
             }
         }
     }
@@ -7120,6 +7182,13 @@ pub fn jit_register_external_module(
         entry_points,
         hidden_wasm_table_indices: Vec::new(),
     };
+    publish_external(&info, page);
+    ctx.external_pages.insert(page, info);
+    1
+}
+
+/// Publish an external page module to every virtual page currently mapping it.
+fn publish_external(info: &PageInfo, phys_page: Page) {
     for i in 0..unsafe { cpu::valid_tlb_entries_count } {
         let virt_page = unsafe { cpu::valid_tlb_entries[i as usize] };
         let entry = unsafe { cpu::tlb_data[virt_page as usize] };
@@ -7127,17 +7196,15 @@ pub fn jit_register_external_module(
             let tlb_physical_page = Page::of_u32(
                 (entry as u32 >> 12 ^ virt_page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
             );
-            if tlb_physical_page == page {
-                set_tlb_code(Page::of_u32(virt_page as u32), index, &info.entry_points, state_flags);
+            if tlb_physical_page == phys_page {
+                dispatch_ext_set(Page::of_u32(virt_page as u32), info.wasm_table_index, &info.entry_points, info.state_flags);
             }
         }
     }
-    ctx.pages.insert(page, info);
-    ctx.entry_points
-        .entry(page)
-        .or_insert_with(|| PageHotness { hotness: 0, entry_points: HashSet::new() });
-    1
 }
+
+#[no_mangle]
+pub fn jit_external_pages() -> u32 { get_jit_state().external_pages.len() as u32 }
 
 #[no_mangle]
 pub fn jit_hot_profile_pages() -> u32 {

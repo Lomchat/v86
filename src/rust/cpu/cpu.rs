@@ -3182,6 +3182,20 @@ pub unsafe fn cycle_internal() {
         }
     }
 
+    // External (ahead-of-time) module for this address, when the JIT has none.
+    if jit_entry.is_none() {
+        let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
+        if meta2 != 0
+            && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2))
+        {
+            let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
+            if st != u16::MAX {
+                jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
+                tier2_profile_exit = false;
+            }
+        }
+    }
+
     if let Some((wasm_table_index, initial_state)) = jit_entry {
         if jit::CHECK_JIT_STATE_INVARIANTS {
             match get_phys_eip() {
@@ -4627,6 +4641,7 @@ pub fn clear_tlb_code(page: i32) {
     if jit::dispatch_meta_clear(page as u32) {
         jit::ret_cache_invalidate_page_tlb(page as u32);
     }
+    jit::dispatch_ext_clear(page as u32);
 }
 
 pub unsafe fn invlpg(addr: i32) {

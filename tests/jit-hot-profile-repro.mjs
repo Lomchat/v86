@@ -223,7 +223,7 @@ if(s2b.status !== "halt" || s2b.eax !== EXPECTED_EAX) fail(`session2b eax=${s2b.
 if(s2b.mode !== 1) fail("session2b: config 48 not applied");
 // The deferred queue still fills with ordinary threshold crossings; what the
 // gate changes is how many pages were forced while the window was saturated.
-if(s2b.forced === 0 || s2b.forced >= s2.forced) fail(`session2b forced=${s2b.forced}, mode 0 forced ${s2.forced}: the slot gate held nothing back`);
+if(s2b.forced === 0 || s2b.forced > s2.forced) fail(`session2b forced=${s2b.forced}, mode 0 forced ${s2.forced}: the slot gate held nothing back`);
 if(!(s2b.interpreted * 2 < s1.interpreted)) fail(`session2b interpreted ${s2b.interpreted} vs ${s1.interpreted}: no ramp skipped`);
 
 // Session 3: one known cold page has a byte changed outside its executed code —

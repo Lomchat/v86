@@ -38,10 +38,18 @@ function buildImage()
     buf[o++] = 0x0F; buf[o++] = 0x85; rel32(o, HEAD_OFF); o += 4; // jnz head
     buf[o++] = 0xF4; buf[o++] = 0xEB; buf[o++] = 0xFE;           // hlt; jmp $
 
+    // A never-taken jump into the tail of the image's last page, where the
+    // instruction crosses past the end of the mapping: the analysis must
+    // decline that target instead of building a block it cannot emit.
+    const UNMAPPED_TAIL = buf.length - 3;
+    buf[UNMAPPED_TAIL] = 0xB8;                                   // mov eax, imm32 (runs off the page)
+
     o = START_OFF;
     buf[o++] = 0xBC; dv.setUint32(o, 0x300000, true); o += 4;    // mov esp, 0x300000
     buf[o++] = 0xB9; dv.setUint32(o, ITER, true); o += 4;        // mov ecx, ITER
     buf[o++] = 0x31; buf[o++] = 0xC0;                            // xor eax, eax
+    buf[o++] = 0x85; buf[o++] = 0xC9;                            // test ecx, ecx
+    buf[o++] = 0x0F; buf[o++] = 0x84; rel32(o, UNMAPPED_TAIL); o += 4; // jz unmapped tail (never)
     buf[o++] = 0xE9; rel32(o, HEAD_OFF); o += 4;                 // jmp head
     return buf;
 }

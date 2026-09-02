@@ -3193,6 +3193,35 @@ fn jit_find_basic_blocks(
     cpu: CpuContext,
     tier2_region: Option<&Tier2Region>,
 ) -> Vec<BasicBlock> {
+    /// A target in the page tail becomes a block only if its first
+    /// instruction either fits in the page or crosses into a physically
+    /// contiguous mapped page, the same proof the decode loop applies; the
+    /// emitter has no fallback for an edge to a block that was never built.
+    fn tail_target_decodable(
+        virt_target: i32,
+        phys_target: u32,
+        template: &CpuContext,
+        pages: &HashSet<Page>,
+        max_pages: u32,
+    ) -> bool {
+        if !is_near_end_of_page(phys_target) {
+            return true;
+        }
+        let mut probe = CpuContext { eip: phys_target, ..template.clone() };
+        let analysis = analysis::analyze_step(&mut probe);
+        let end = probe.eip;
+        if Page::page_of(end) == Page::page_of(phys_target) {
+            return true;
+        }
+        if !matches!(analysis.ty, AnalysisType::Normal) {
+            return false;
+        }
+        let virt_after = (virt_target as u32).wrapping_add(end.wrapping_sub(phys_target));
+        let next_page = Page::page_of(end);
+        (pages.contains(&next_page) || (pages.len() as u32) < max_pages)
+            && cpu::translate_address_read_no_side_effects(virt_after as i32) == Ok(end)
+    }
+
     fn follow_jump(
         virt_target: i32,
         ctx: &mut JitState,
@@ -3202,6 +3231,7 @@ fn jit_find_basic_blocks(
         tier2_region: Option<&Tier2Region>,
         marked_as_entry: &mut HashSet<i32>,
         to_visit_stack: &mut Vec<i32>,
+        template: &CpuContext,
     ) -> Option<u32> {
         if is_near_end_of_page(virt_target as u32) && !page_tail_entries_enabled() {
             return None;
@@ -3213,6 +3243,10 @@ fn jit_find_basic_blocks(
             },
             Ok(t) => t,
         };
+        if !tail_target_decodable(virt_target, phys_target, template, pages, max_pages) {
+            profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+            return None;
+        }
 
         let phys_page = Page::page_of(phys_target);
 
@@ -3333,6 +3367,7 @@ fn jit_find_basic_blocks(
         1
     };
 
+    let cpu_template = cpu.clone();
     for virt_addr in entry_points {
         let ok = follow_jump(
             virt_addr,
@@ -3343,6 +3378,7 @@ fn jit_find_basic_blocks(
             tier2_region,
             &mut marked_as_entry,
             &mut to_visit_stack,
+            &cpu_template,
         );
         dbg_assert!(ok.is_some());
         dbg_assert!(marked_as_entry.contains(&virt_addr));
@@ -3454,6 +3490,7 @@ fn jit_find_basic_blocks(
                         tier2_region,
                         &mut marked_as_entry,
                         &mut to_visit_stack,
+                        &cpu_template,
                     ),
                     jump_offset: 0x1000,
                     jump_offset_is_32: true,
@@ -3539,6 +3576,7 @@ fn jit_find_basic_blocks(
                             tier2_region,
                             &mut marked_as_entry,
                             &mut to_visit_stack,
+                            &cpu_template,
                         ),
                         condition,
                         jump_offset: offset,
@@ -3579,6 +3617,7 @@ fn jit_find_basic_blocks(
                             tier2_region,
                             &mut marked_as_entry,
                             &mut to_visit_stack,
+                            &cpu_template,
                         ),
                         jump_offset: offset,
                         jump_offset_is_32: is_32,
@@ -3663,6 +3702,7 @@ fn jit_find_basic_blocks(
                                     tier2_region,
                                     &mut marked_as_entry,
                                     &mut to_visit_stack,
+                                    &cpu_template,
                                 )
                                 .is_some()
                                 {
@@ -3731,10 +3771,17 @@ fn jit_find_basic_blocks(
         }
 
         if current_block.number_of_instructions == 0 {
-            // The first instruction crossed into a page that is not
-            // physically contiguous: nothing to compile here, the
-            // interpreter keeps this block.
+            // The first instruction could not be kept (it crosses into a page
+            // that is not contiguous, or the module's page budget is spent):
+            // the block stays as an exit at its own address, so an edge that
+            // reaches it hands the address to the dispatcher, and it is never
+            // an entry, which would loop without progress.
             profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+            current_block.ty = BasicBlockType::Exit;
+            current_block.end_addr = current_block.addr;
+            current_block.last_instruction_addr = current_block.addr;
+            marked_as_entry.remove(&current_block.virt_addr);
+            basic_blocks.insert(current_block.addr, current_block);
             continue;
         }
 
@@ -5042,7 +5089,11 @@ fn jit_generate_module(
         match block {
             Work::WasmStructure(WasmStructure::BasicBlock(addr)) => {
                 let block = basic_blocks.get(&addr).unwrap();
-                jit_generate_basic_block(ctx, block, basic_blocks);
+                // An empty block is an exit at its own address: nothing to emit
+                // before the exit arm below sets EIP.
+                if block.number_of_instructions > 0 {
+                    jit_generate_basic_block(ctx, block, basic_blocks);
+                }
 
                 if let Some(leaf_addr) = block.inline_leaf {
                     let leaf = basic_blocks.get(&leaf_addr).unwrap();

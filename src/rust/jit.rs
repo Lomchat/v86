@@ -7206,6 +7206,43 @@ fn publish_external(info: &PageInfo, phys_page: Page) {
 #[no_mangle]
 pub fn jit_external_pages() -> u32 { get_jit_state().external_pages.len() as u32 }
 
+// Dispatches into external modules, and lookups that found the page's
+// external table but no entry for the offset (or another CPU state).
+static mut EXTERNAL_DISPATCHES: u32 = 0;
+static mut EXTERNAL_MISSES: u32 = 0;
+#[inline]
+pub fn note_external_dispatch(hit: bool) {
+    unsafe {
+        if hit { EXTERNAL_DISPATCHES = EXTERNAL_DISPATCHES.wrapping_add(1); }
+        else { EXTERNAL_MISSES = EXTERNAL_MISSES.wrapping_add(1); }
+    }
+}
+#[no_mangle]
+pub fn jit_external_dispatches() -> u32 { unsafe { EXTERNAL_DISPATCHES } }
+#[no_mangle]
+pub fn jit_external_misses() -> u32 { unsafe { EXTERNAL_MISSES } }
+
+/// Diagnostic: what the dispatcher would find for `virt_address` right now.
+/// Bits: 31 = JIT table has the page, 30 = external table has the page,
+/// 29 = external state flags match the CPU's, 15..0 = the external state
+/// for that offset (0xFFFF = none).
+#[no_mangle]
+pub fn jit_debug_dispatch(virt_address: u32) -> u32 {
+    let page = virt_address >> 12;
+    let meta = dispatch_meta_get(page);
+    let meta2 = dispatch_ext_get(page);
+    let mut out = 0u32;
+    if meta != 0 { out |= 1 << 31; }
+    if meta2 != 0 {
+        out |= 1 << 30;
+        if cpu::get_state_flags().to_u32() == dispatch_meta_state_flags(meta2) { out |= 1 << 29; }
+        out |= dispatch_state_lookup(meta2, virt_address) as u32;
+    } else {
+        out |= 0xFFFF;
+    }
+    out
+}
+
 #[no_mangle]
 pub fn jit_hot_profile_pages() -> u32 {
     HOT_PROFILE.lock().unwrap().as_ref().map(|m| m.len() as u32).unwrap_or(0)

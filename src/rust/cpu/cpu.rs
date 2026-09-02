@@ -3182,16 +3182,39 @@ pub unsafe fn cycle_internal() {
         }
     }
 
+    // A page dispatched for the first time has no TLB entry yet, and it is the
+    // TLB fill that publishes the page's modules: fill it now, so the first
+    // block of a page with compiled code is not interpreted once for nothing.
+    if jit_entry.is_none() && meta == 0 && tlb_data[(initial_eip as u32 >> 12) as usize] == 0 {
+        if get_phys_eip().is_ok() {
+            let meta_after = jit::dispatch_meta_get(initial_eip as u32 >> 12);
+            if meta_after != 0
+                && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta_after))
+            {
+                let st = jit::dispatch_state_lookup(meta_after, initial_eip as u32);
+                if st != u16::MAX {
+                    jit_entry = Some((jit::dispatch_meta_table_index(meta_after), st));
+                }
+            }
+        }
+    }
     // External (ahead-of-time) module for this address, when the JIT has none.
     if jit_entry.is_none() {
         let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
-        if meta2 != 0
-            && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2))
-        {
-            let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
-            if st != u16::MAX {
-                jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
-                tier2_profile_exit = false;
+        if meta2 != 0 {
+            if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
+                let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
+                if st != u16::MAX {
+                    jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
+                    tier2_profile_exit = false;
+                    jit::note_external_dispatch(true);
+                }
+                else {
+                    jit::note_external_dispatch(false);
+                }
+            }
+            else {
+                jit::note_external_dispatch(false);
             }
         }
     }

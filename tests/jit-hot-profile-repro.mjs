@@ -115,7 +115,7 @@ function roundTrip(bytes)
 
 /** Runs the fixture to halt; `profile` (bytes) is installed before it starts,
  *  `patch(image)` may alter the image the guest executes. */
-function run(label, { profile = null, patch = null } = {})
+function run(label, { profile = null, patch = null, mode = 0 } = {})
 {
     return new Promise(resolve => {
         const emulator = new V86({ autostart: false, memory_size: MEM_SIZE, log_level: 0 });
@@ -138,6 +138,8 @@ function run(label, { profile = null, patch = null } = {})
                 profilePages: ex["jit_hot_profile_pages"]?.() >>> 0,
                 forced: ex["jit_hot_profile_forced"]?.() >>> 0,
                 mismatches: ex["jit_hot_profile_mismatches"]?.() >>> 0,
+                deferredQueued: ex["jit_get_compile_deferred_queued"]?.() >>> 0,
+                mode: cpu.get_jit_config?.(48) >>> 0,
                 exported: exportProfile(cpu),
             });
         };
@@ -149,6 +151,9 @@ function run(label, { profile = null, patch = null } = {})
             cpu.set_jit_config(26, THRESHOLD);
             cpu.set_jit_config(25, 8);
             cpu.set_jit_config(37, 1);
+            // Mode 0 forces every known page on first touch (queueing behind
+            // the compile cap); mode 1 only while a compile slot is free.
+            cpu.set_jit_config(48, mode);
             cpu.jit_clear_cache?.();
             cpu.wm.exports["jit_hot_profile_clear"]();
             cpu.wm.exports["profiler_interpreted_steps_reset"]?.();
@@ -199,7 +204,7 @@ const cold1 = profilePages(s1.exported).filter(isCold);
 console.log(`session1 profile: ${cold1.length} of ${COLD_PAGES} cold pages`);
 if(cold1.length < COLD_PAGES * 0.9) fail(`session1 profile covers only ${cold1.length} cold pages`);
 
-// Session 2: profile installed — every known page compiles at first touch.
+// Session 2: profile installed, mode 0 — every known page compiles at first touch.
 const s2 = await run("session2", { profile: s1.exported });
 show(s2);
 if(s2.status !== "halt" || s2.eax !== EXPECTED_EAX) fail(`session2 eax=${s2.eax} (${s2.status})`);
@@ -207,6 +212,19 @@ if(s2.profilePages < cold1.length) fail(`session2 profile pages=${s2.profilePage
 if(s2.forced < cold1.length) fail(`session2 forced only ${s2.forced} of ${cold1.length} known pages`);
 if(s2.mismatches !== 0) fail(`session2 rejected ${s2.mismatches} pages of an identical image`);
 if(!(s2.interpreted * 2 < s1.interpreted)) fail(`session2 interpreted ${s2.interpreted} vs ${s1.interpreted}: no ramp skipped`);
+if(s2.deferredQueued === 0) fail("session2 (mode 0) never queued a page behind the compile cap: fixture too small to test mode 1");
+
+// Session 2b: same profile, mode 1 — a known page is only forced while a
+// compile slot is free, so the burst cannot pile up a deferred queue, and the
+// pages it skips take the ordinary ramp and still compile.
+const s2b = await run("session2b", { profile: s1.exported, mode: 1 });
+show(s2b);
+if(s2b.status !== "halt" || s2b.eax !== EXPECTED_EAX) fail(`session2b eax=${s2b.eax} (${s2b.status})`);
+if(s2b.mode !== 1) fail("session2b: config 48 not applied");
+// The deferred queue still fills with ordinary threshold crossings; what the
+// gate changes is how many pages were forced while the window was saturated.
+if(s2b.forced === 0 || s2b.forced >= s2.forced) fail(`session2b forced=${s2b.forced}, mode 0 forced ${s2.forced}: the slot gate held nothing back`);
+if(!(s2b.interpreted * 2 < s1.interpreted)) fail(`session2b interpreted ${s2b.interpreted} vs ${s1.interpreted}: no ramp skipped`);
 
 // Session 3: one known cold page has a byte changed outside its executed code —
 // its hash no longer matches, so it must fall back to the ordinary ramp.

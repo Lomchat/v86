@@ -2012,6 +2012,12 @@ static HOT_PROFILE: Mutex<Option<HashMap<Page, HotProfilePage>>> = Mutex::new(No
 static HOT_PROFILE_IO: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static mut JIT_HOT_PROFILE_FORCED: u32 = 0;
 static mut JIT_HOT_PROFILE_MISMATCH: u32 = 0;
+// Config 48. 0: force whenever the page is touched, queueing behind the compile
+// cap. 1: force only while a compile slot is free, so a burst of known pages
+// (a boot touches a thousand of them) cannot pile up a deferred queue whose
+// latency exceeds the interpreted ramp it was meant to skip; the rest keep the
+// ordinary ramp and compile normally if they stay hot.
+static mut JIT_HOT_PROFILE_MODE: u32 = 1;
 const HOT_PROFILE_MAGIC: u32 = 0x5054_4F48; // "HOTP"
 const HOT_PROFILE_VERSION: u32 = 1;
 
@@ -6143,7 +6149,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
         page_hotness.hotness >= effective
     };
 
-    let forced = !threshold_reached && hot_profile_force(&mut ctx, page);
+    let forced = !threshold_reached && hot_profile_force(&mut ctx, page, phys_address);
     if !threshold_reached && !forced {
         return;
     }
@@ -6632,6 +6638,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         5 => JIT_DEAD_FLAG_ELISION = value != 0,
         46 => JIT_DEAD_FLAG_ELISION_ACROSS_FAULTS = value != 0,
         47 => JIT_NARROW_RET_INVALIDATION = value != 0,
+        48 => JIT_HOT_PROFILE_MODE = value,
         6 => JIT_INDIRECT_REGIONS = value != 0,
         7 => JIT_INDIRECT_REGION_MIN_SHARE = value,
         8 => JIT_INDIRECT_REGION_MAX_PAGES = value,
@@ -6687,6 +6694,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         5 => JIT_DEAD_FLAG_ELISION as u32,
         46 => JIT_DEAD_FLAG_ELISION_ACROSS_FAULTS as u32,
         47 => JIT_NARROW_RET_INVALIDATION as u32,
+        48 => JIT_HOT_PROFILE_MODE,
         6 => JIT_INDIRECT_REGIONS as u32,
         7 => JIT_INDIRECT_REGION_MIN_SHARE,
         8 => JIT_INDIRECT_REGION_MAX_PAGES,
@@ -6836,12 +6844,14 @@ fn hot_profile_page_hash(page: Page) -> Option<u32> {
 /// Compile-at-first-touch for a page the profile knows. Returns true when the
 /// page's hotness ramp is skipped; the caller then takes the ordinary
 /// cap/deferred/compile path with the recorded entry points merged in.
-fn hot_profile_force(ctx: &mut JitState, page: Page) -> bool {
-    // Already covered, in flight, or queued: nothing to force, and the
-    // counter must not tick once per block executed while a compile lands.
-    if ctx.pages.contains_key(&page)
-        || page_is_compiling(ctx, page)
-        || ctx.deferred_compile_pages.contains(&page)
+fn hot_profile_force(ctx: &mut JitState, page: Page, phys_address: u32) -> bool {
+    // In flight or queued: nothing to force, and the counter must not tick
+    // once per block executed while a compile lands.
+    if page_is_compiling(ctx, page) || ctx.deferred_compile_pages.contains(&page) {
+        return false;
+    }
+    if unsafe { JIT_HOT_PROFILE_MODE } == 1
+        && ctx.compiling.len() >= unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize }
     {
         return false;
     }
@@ -6854,6 +6864,16 @@ fn hot_profile_force(ctx: &mut JitState, page: Page) -> bool {
         Some(p) => (p.hash, p.entries.clone()),
         None => return false,
     };
+    // A page that already owns a module only earns a forced recompile when
+    // the block being interpreted starts at a recorded entry the module does
+    // not cover — the secondary page of a multi-page module has exactly that
+    // shape, and would otherwise wait out threshold / JIT_RECOMPILE_DIVISOR.
+    if let Some(info) = ctx.pages.get(&page) {
+        let off = (phys_address & 0xFFF) as u16;
+        if !entries.contains(&off) || info.entry_points.iter().any(|(e, _)| *e == off) {
+            return false;
+        }
+    }
     match hot_profile_page_hash(page) {
         Some(h) if h == hash => {},
         _ => {
@@ -6960,27 +6980,36 @@ pub fn jit_hot_profile_export_build() -> u32 {
     let ctx = get_jit_state();
     let mut merged: HashMap<Page, HotProfilePage> =
         HOT_PROFILE.lock().unwrap().clone().unwrap_or_default();
-    let mut add = |page: Page, entry_points: &Vec<(u16, u16)>| {
-        if entry_points.is_empty() {
-            return;
-        }
+    let mut add = |page: Page, entry_points: &mut dyn Iterator<Item = u16>| {
         if let Some(h) = hot_profile_page_hash(page) {
             let e = merged.entry(page).or_insert_with(|| HotProfilePage { hash: h, entries: Vec::new() });
             e.hash = h;
-            for (off, _) in entry_points.iter() {
-                if !e.entries.contains(off) {
-                    e.entries.push(*off);
+            for off in entry_points {
+                if !e.entries.contains(&off) {
+                    e.entries.push(off);
                 }
             }
         }
     };
+    // A page's recorded entries are the union of what its module covers and
+    // every block start the interpreter saw on it: the secondary page of a
+    // multi-page module has an empty module list but real entries of its own,
+    // and those are what the next session's forced recompile needs.
+    let mut hot_entries = |page: Page| -> Vec<u16> {
+        ctx.entry_points
+            .get(&page)
+            .map(|h| h.entry_points.iter().copied().collect())
+            .unwrap_or_default()
+    };
     for (page, info) in ctx.pages.iter() {
-        add(*page, &info.entry_points);
+        let mut it = info.entry_points.iter().map(|(e, _)| *e).chain(hot_entries(*page));
+        add(*page, &mut it);
     }
     for state in ctx.compiling.values() {
         if let CompilingPageState::Compiling { pages } = state {
             for (page, info) in pages.iter() {
-                add(*page, &info.entry_points);
+                let mut it = info.entry_points.iter().map(|(e, _)| *e).chain(hot_entries(*page));
+                add(*page, &mut it);
             }
         }
     }

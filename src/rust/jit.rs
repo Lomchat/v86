@@ -1333,6 +1333,53 @@ pub fn ext_stall_take(eip: u32) -> bool {
 #[no_mangle]
 pub fn jit_external_stalls() -> u32 { unsafe { EXT_STALLS } }
 
+// Addresses interpreted because the page's module has no entry for them:
+// a direct-mapped histogram that ages out cold addresses, read sorted.
+const MISS_ENTRY_SLOTS: usize = 4096;
+static mut MISS_ENTRY_EIP: [u32; MISS_ENTRY_SLOTS] = [0; MISS_ENTRY_SLOTS];
+static mut MISS_ENTRY_COUNT: [u32; MISS_ENTRY_SLOTS] = [0; MISS_ENTRY_SLOTS];
+
+#[inline]
+pub fn miss_entry_note(eip: u32) {
+    unsafe {
+        let i = ((eip >> 1) ^ (eip >> 13)) as usize & (MISS_ENTRY_SLOTS - 1);
+        if MISS_ENTRY_EIP[i] == eip {
+            MISS_ENTRY_COUNT[i] = MISS_ENTRY_COUNT[i].saturating_add(1);
+        }
+        else if MISS_ENTRY_COUNT[i] < 4 {
+            MISS_ENTRY_EIP[i] = eip;
+            MISS_ENTRY_COUNT[i] = 1;
+        }
+        else {
+            MISS_ENTRY_COUNT[i] -= 1;
+        }
+    }
+}
+
+#[no_mangle]
+pub fn jit_miss_entry_reset() {
+    unsafe {
+        MISS_ENTRY_EIP = [0; MISS_ENTRY_SLOTS];
+        MISS_ENTRY_COUNT = [0; MISS_ENTRY_SLOTS];
+    }
+}
+
+/// `rank`-th hottest missing entry (0 = hottest); field 0 = address, 1 = count.
+#[no_mangle]
+pub fn jit_miss_entry_top(rank: u32, field: u32) -> u32 {
+    unsafe {
+        let mut v: Vec<(u32, u32)> = (0..MISS_ENTRY_SLOTS)
+            .filter(|&i| MISS_ENTRY_COUNT[i] != 0)
+            .map(|i| (MISS_ENTRY_COUNT[i], MISS_ENTRY_EIP[i]))
+            .collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        match v.get(rank as usize) {
+            Some(&(count, eip)) => if field == 0 { eip } else { count },
+            None => 0,
+        }
+    }
+}
+
 // External modules take precedence over the JIT's for an address both own.
 // Measured on BFME 1 (2 September 2026): 12.6 FPS against 30 with the JIT
 // first, the translation exiting at every call the batch does not cover.

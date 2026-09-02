@@ -3386,6 +3386,7 @@ pub unsafe fn cycle_internal() {
         else if initial_state_flags
             == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta))
         {
+            jit::miss_entry_note(initial_eip as u32);
             stat::INTERP_BLOCK_MISSING_ENTRY
         }
         else {

@@ -3961,6 +3961,32 @@ fn gen_fpu_apply_f64_binop(ctx: &mut JitContext, op: FpuFastBinOp) {
         FpuFastBinOp::Div => ctx.builder.div_f64(),
         FpuFastBinOp::DivR => ctx.builder.div_f64(),
     }
+    // Precision control PC=00 rounds every result to single. Skipping the inline
+    // path for it sent every FADD/FMUL through the F80 helper instead — 6.1
+    // billion calls in one BFME 1 skirmish, because the game runs its whole
+    // simulation at PC=single.
+    //
+    // The mode is read at RUNTIME, not baked in: specialising on it at compile
+    // time needs a cache flush whenever the guest rewrites the control word, and
+    // this guest rewrites it often enough that flushing left the JIT empty and
+    // the game at 5.5 FPS. A predictable branch on a global costs nothing next to
+    // the helper call it replaces.
+    ctx.builder.reinterpret_f64_as_i64();
+    let bits = ctx.builder.set_new_local_i64();
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(crate::softfloat::PRECISION_SINGLE) as u32);
+    ctx.builder.const_i32(0xFF);
+    ctx.builder.and_i32();
+    ctx.builder.if_void();
+    ctx.builder.get_local_i64(&bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.demote_f64_to_f32();
+    ctx.builder.promote_f32_to_f64();
+    ctx.builder.reinterpret_f64_as_i64();
+    ctx.builder.set_local_i64(&bits);
+    ctx.builder.block_end();
+    ctx.builder.get_local_i64(&bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.free_local_i64(bits);
 }
 
 fn gen_fpu_load_m32_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -4072,7 +4098,7 @@ fn gen_fpu_relaxed_binop_mem(
     src: FpuMemSrc,
 ) {
     // PC=single -> slow F80 helper (inline f64 path below skips precision-control).
-    if !crate::softfloat::is_fpu_relaxed() || crate::softfloat::is_precision_single() {
+    if !crate::softfloat::is_fpu_relaxed() {
         ctx.builder.const_i32(target_sti as i32);
         gen_fpu_load_mem_binop_slow(ctx, src, modrm_byte);
         ctx.builder.call_fn3_i32_i64_i32(slow_helper);
@@ -4119,7 +4145,7 @@ pub fn gen_fpu_relaxed_binop_sti(
     op: FpuFastBinOp,
     slow_helper: &str,
 ) {
-    if !crate::softfloat::is_fpu_relaxed() || crate::softfloat::is_precision_single() {
+    if !crate::softfloat::is_fpu_relaxed() {
         ctx.builder.const_i32(target_sti as i32);
         gen_fpu_get_sti(ctx, sti);
         ctx.builder.call_fn3_i32_i64_i32(slow_helper);

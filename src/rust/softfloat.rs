@@ -5,7 +5,7 @@ static mut ROUNDING_MODE: u8 = 0; // 0=NearEven, 1=Trunc, 2=Floor, 3=Ceil
 
 // x87 precision-control: PC=00 (24-bit single) rounds every arithmetic result to f32.
 // F80 is f64-backed so P64/P80 already match (53-bit); only P32 needs the extra round.
-static mut PRECISION_SINGLE: bool = false;
+pub static mut PRECISION_SINGLE: bool = false;
 
 #[inline]
 fn apply_precision(f: f64) -> f64 {
@@ -416,10 +416,15 @@ impl F80 {
     }
     pub fn set_precision(precision: Precision) {
         unsafe {
-            PRECISION_SINGLE = match precision {
+            let next = match precision {
                 Precision::P32 => true,
                 Precision::P64 | Precision::P80 => false,
             };
+            // No cache flush: the inline x87 path reads this flag at runtime, so
+            // generated blocks stay correct across a control-word change. Flushing
+            // here emptied the JIT — this guest rewrites the word often — and cost
+            // 27.6 FPS down to 5.5.
+            PRECISION_SINGLE = next;
         }
     }
 

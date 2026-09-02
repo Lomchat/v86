@@ -166,8 +166,22 @@ pub unsafe fn fpu_load_status_word() -> u16 {
     dbg_assert!(*fpu_stack_ptr < 8);
     return *fpu_status_word & !(7 << 11) | (*fpu_stack_ptr as u16) << 11;
 }
+/// Helper entries for the two hottest x87 binops. The relaxed hit/fallback ratio
+/// only counts blocks that reached the inline site, so an opcode form that never
+/// gets an inline path is invisible to it — these count the calls themselves.
+pub static mut FPU_HELPER_ADD_CALLS: u32 = 0;
+pub static mut FPU_HELPER_MUL_CALLS: u32 = 0;
+
+#[no_mangle]
+pub fn fpu_get_helper_add_calls() -> u32 { unsafe { FPU_HELPER_ADD_CALLS } }
+#[no_mangle]
+pub fn fpu_get_helper_mul_calls() -> u32 { unsafe { FPU_HELPER_MUL_CALLS } }
+#[no_mangle]
+pub fn fpu_get_precision_single() -> u32 { crate::softfloat::is_precision_single() as u32 }
+
 #[no_mangle]
 pub unsafe fn fpu_fadd(target_index: i32, val: F80) {
+    FPU_HELPER_ADD_CALLS = FPU_HELPER_ADD_CALLS.wrapping_add(1);
     F80::clear_exception_flags();
     let st0 = fpu_get_st0();
     fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0 + val);
@@ -488,6 +502,7 @@ pub unsafe fn fpu_fldm80(addr: i32) {
 
 #[no_mangle]
 pub unsafe fn fpu_fmul(target_index: i32, val: F80) {
+    FPU_HELPER_MUL_CALLS = FPU_HELPER_MUL_CALLS.wrapping_add(1);
     let st0 = fpu_get_st0();
     fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0 * val);
 }

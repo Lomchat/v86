@@ -129,6 +129,42 @@ static mut JIT_PAGE_TAIL_ENTRIES: bool = true;
 pub fn page_tail_entries_enabled() -> bool {
     unsafe { JIT_PAGE_TAIL_ENTRIES && JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS }
 }
+
+/// Whether an entry point in the page tail can become a compiled block: its
+/// first instruction fits in the page, or is an ordinary instruction that
+/// crosses into the contiguous mapping of the next virtual page (unknown
+/// without a virtual address, so a profile-supplied entry must fit). An entry
+/// recorded without this proof would never be part of the module and would
+/// make every hotness cycle recompile the page for nothing.
+pub fn tail_entry_compilable(
+    virt_address: Option<i32>,
+    phys_address: u32,
+    cs_offset: u32,
+    state_flags: CachedStateFlags,
+) -> bool {
+    if !is_near_end_of_page(phys_address) {
+        return true;
+    }
+    if !page_tail_entries_enabled() {
+        return false;
+    }
+    let mut probe = CpuContext { eip: phys_address, prefixes: 0, cs_offset, state_flags };
+    let analysis = analysis::analyze_step(&mut probe);
+    let end = probe.eip;
+    if Page::page_of(end) == Page::page_of(phys_address) {
+        return true;
+    }
+    if !matches!(analysis.ty, AnalysisType::Normal) {
+        return false;
+    }
+    match virt_address {
+        None => false,
+        Some(virt) => {
+            let virt_after = (virt as u32).wrapping_add(end.wrapping_sub(phys_address));
+            cpu::translate_address_read_no_side_effects(virt_after as i32) == Ok(end)
+        },
+    }
+}
 // Keep relaxed-x87 results in block-scoped wasm locals and materialise them at
 // architectural boundaries instead of writing fpu_st after every arithmetic
 // instruction (config 39). Experimental until differential and game A/B pass.
@@ -6386,7 +6422,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
             PageHotness { hotness: 0, entry_points: HashSet::new() }
         });
 
-        if !is_near_end_of_page(phys_address) || page_tail_entries_enabled() {
+        if tail_entry_compilable(Some(virt_address), phys_address, cs_offset, state_flags) {
             page_hotness.entry_points.insert(phys_address as u16 & 0xFFF);
         }
 
@@ -7153,8 +7189,9 @@ fn hot_profile_force(ctx: &mut JitState, page: Page, phys_address: u32) -> bool 
         cpu::tlb_set_has_code(page, true);
         PageHotness { hotness: 0, entry_points: HashSet::new() }
     });
+    let (cs_offset, state_flags) = unsafe { (cpu::get_seg_cs() as u32, cpu::get_state_flags()) };
     for e in entries {
-        if !is_near_end_of_page(page.to_address() | e as u32) || page_tail_entries_enabled() {
+        if tail_entry_compilable(None, page.to_address() | e as u32, cs_offset, state_flags) {
             hot.entry_points.insert(e);
         }
     }

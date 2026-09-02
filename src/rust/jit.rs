@@ -2110,7 +2110,11 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
 impl JitState {
     pub fn create_and_initialise() -> JitState {
         // don't assign 0 (XXX: Check)
-        let wasm_table_indices = (1..=(WASM_TABLE_SIZE - 1) as u16).map(|x| WasmTableIndex(x));
+        // The top EXTERNAL_MODULE_SLOTS indices are never handed to the JIT: they
+        // hold modules produced outside it (ahead-of-time translations) that
+        // JS places in the table and registers with jit_register_external_module.
+        let wasm_table_indices =
+            (1..=(WASM_TABLE_SIZE - 1 - EXTERNAL_MODULE_SLOTS) as u16).map(|x| WasmTableIndex(x));
 
         JitState {
             wasm_builder: WasmBuilder::new(),
@@ -7033,6 +7037,82 @@ pub fn jit_hot_profile_export_build() -> u32 {
     let len = out.len() as u32;
     *HOT_PROFILE_IO.lock().unwrap() = out;
     len
+}
+
+// ── External (ahead-of-time) modules ─────────────────────────────────────
+// A module compiled outside the JIT, in the same ABI as a JIT module
+// (`f(initial_state)`, registers at the fixed global offsets, exit by
+// materialising EIP and returning), is placed in the table by JS at one of
+// the reserved top indices and registered here for one entry point. From
+// then on the dispatcher, page-write invalidation and slot sweeping treat it
+// exactly like a compiled page.
+pub const EXTERNAL_MODULE_SLOTS: u32 = 256;
+
+#[no_mangle]
+pub fn jit_external_module_first_index() -> u32 { WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS }
+
+#[no_mangle]
+pub fn jit_external_module_slots() -> u32 { EXTERNAL_MODULE_SLOTS }
+
+/// The dispatcher's current state flags, so an external module can be
+/// registered under exactly the key the dispatcher will look up.
+#[no_mangle]
+pub fn jit_get_current_state_flags() -> u32 { cpu::get_state_flags().to_u32() }
+
+/// Register `wasm_table_index` (a reserved external slot) as the module for the
+/// physical entry `phys_address` under `state_flags`. `initial_state` is the
+/// br_table case the module expects for that entry. Returns 1 on success, 0
+/// when the index is outside the reserved range or the page is being compiled.
+#[no_mangle]
+pub fn jit_register_external_module(
+    wasm_table_index: u32,
+    phys_address: u32,
+    raw_state_flags: u32,
+    initial_state: u32,
+) -> u32 {
+    if wasm_table_index < WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS || wasm_table_index >= WASM_TABLE_SIZE {
+        return 0;
+    }
+    let index = WasmTableIndex(wasm_table_index as u16);
+    let state_flags = CachedStateFlags::of_u32(raw_state_flags);
+    let page = Page::page_of(phys_address);
+    let mut ctx = get_jit_state();
+    if page_is_compiling(&ctx, page) {
+        return 0;
+    }
+    let offset = (phys_address & 0xFFF) as u16;
+    // Replace whatever module covered this page: the JIT's own would keep
+    // winning the dispatch for its entries otherwise.
+    if let Some(old) = ctx.pages.remove(&page) {
+        let still_used = ctx.pages.values().any(|p| p.wasm_table_index == old.wasm_table_index);
+        if !still_used && (old.wasm_table_index.to_u16() as u32) < WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS {
+            free_wasm_table_index(&mut ctx, old.wasm_table_index);
+        }
+    }
+    cpu::tlb_set_has_code(page, true);
+    let info = PageInfo {
+        wasm_table_index: index,
+        state_flags,
+        entry_points: vec![(offset, initial_state as u16)],
+        hidden_wasm_table_indices: Vec::new(),
+    };
+    for i in 0..unsafe { cpu::valid_tlb_entries_count } {
+        let virt_page = unsafe { cpu::valid_tlb_entries[i as usize] };
+        let entry = unsafe { cpu::tlb_data[virt_page as usize] };
+        if 0 != entry {
+            let tlb_physical_page = Page::of_u32(
+                (entry as u32 >> 12 ^ virt_page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
+            );
+            if tlb_physical_page == page {
+                set_tlb_code(Page::of_u32(virt_page as u32), index, &info.entry_points, state_flags);
+            }
+        }
+    }
+    ctx.pages.insert(page, info);
+    ctx.entry_points
+        .entry(page)
+        .or_insert_with(|| PageHotness { hotness: 0, entry_points: HashSet::new() });
+    1
 }
 
 #[no_mangle]

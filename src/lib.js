@@ -42,13 +42,23 @@ export var view = function(constructor, memory, offset, length)
                 {
                     return x.bind(b);
                 }
-                dbg_assert(/^\d+$/.test(property) || property === "buffer" || property === "length" ||
-                    property === "BYTES_PER_ELEMENT" || property === "byteOffset");
+                // JS evaluates call arguments before entering the callee, so
+                // dbg_assert's own !DEBUG early-out cannot stop this regex from
+                // running. On this proxy that put a regex test on EVERY guest
+                // memory access — 2.6% of worker CPU in a skirmish profile.
+                if(typeof DEBUG !== "undefined" && DEBUG)
+                {
+                    dbg_assert(/^\d+$/.test(property) || property === "buffer" || property === "length" ||
+                        property === "BYTES_PER_ELEMENT" || property === "byteOffset");
+                }
                 return x;
             },
             set: function(target, property, value, receiver)
             {
-                dbg_assert(/^\d+$/.test(property));
+                if(typeof DEBUG !== "undefined" && DEBUG)
+                {
+                    dbg_assert(/^\d+$/.test(property));
+                }
                 resolve()[property] = value;
                 return true;
             },

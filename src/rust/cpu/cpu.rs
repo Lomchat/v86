@@ -5068,6 +5068,13 @@ pub fn io_port_write32(port: i32, value: i32) {
     }
 }
 
+// A translated module performing a stub's `out 0xB077, eax` itself: the same
+// path the interpreter takes for that instruction (router, then the host).
+#[no_mangle]
+pub fn jit_hypercall_out(value: i32) {
+    io_port_write32(0xB077i32, value)
+}
+
 #[no_mangle]
 #[cfg(debug_assertions)]
 pub unsafe fn check_page_switch(block_addr: u32, next_block_addr: u32) {

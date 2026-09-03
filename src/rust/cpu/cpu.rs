@@ -3712,7 +3712,20 @@ static mut JIT_RUN_UNTIL_STATS: [u32; 12] = [0; 12];
 // Bridged callees by entry address, so a batch can learn which targets to
 // absorb natively: a small direct-mapped table of (eip, calls), the slot's
 // owner replaced when a different address collides.
-const JIT_RUN_UNTIL_TARGETS: usize = 4096;
+const JIT_RUN_UNTIL_TARGETS: usize = 65536;
+// The same, keyed by the target's page: readable even when the address table
+// thrashes under a diverse population of callees.
+const JIT_RUN_UNTIL_PAGES: usize = 4096;
+static mut JIT_RUN_UNTIL_PAGE_KEY: [u32; JIT_RUN_UNTIL_PAGES] = [0; JIT_RUN_UNTIL_PAGES];
+static mut JIT_RUN_UNTIL_PAGE_CALLS: [u32; JIT_RUN_UNTIL_PAGES] = [0; JIT_RUN_UNTIL_PAGES];
+
+#[no_mangle]
+pub fn jit_run_until_target_page(slot: u32, field: u32) -> u32 {
+    unsafe {
+        if slot as usize >= JIT_RUN_UNTIL_PAGES { return 0; }
+        if field == 0 { JIT_RUN_UNTIL_PAGE_KEY[slot as usize] } else { JIT_RUN_UNTIL_PAGE_CALLS[slot as usize] }
+    }
+}
 static mut JIT_RUN_UNTIL_TARGET_EIP: [u32; JIT_RUN_UNTIL_TARGETS] = [0; JIT_RUN_UNTIL_TARGETS];
 static mut JIT_RUN_UNTIL_TARGET_CALLS: [u32; JIT_RUN_UNTIL_TARGETS] = [0; JIT_RUN_UNTIL_TARGETS];
 
@@ -3735,6 +3748,8 @@ pub fn jit_run_until_stats_reset() {
         JIT_RUN_UNTIL_STATS = [0; 12];
         JIT_RUN_UNTIL_TARGET_EIP = [0; JIT_RUN_UNTIL_TARGETS];
         JIT_RUN_UNTIL_TARGET_CALLS = [0; JIT_RUN_UNTIL_TARGETS];
+        JIT_RUN_UNTIL_PAGE_KEY = [0; JIT_RUN_UNTIL_PAGES];
+        JIT_RUN_UNTIL_PAGE_CALLS = [0; JIT_RUN_UNTIL_PAGES];
     }
 }
 
@@ -3749,6 +3764,14 @@ pub unsafe fn jit_run_until(ret_eip: u32, stop_esp: u32, max: u32) -> u32 {
             JIT_RUN_UNTIL_TARGET_CALLS[slot] = 0;
         }
         JIT_RUN_UNTIL_TARGET_CALLS[slot] = JIT_RUN_UNTIL_TARGET_CALLS[slot].wrapping_add(1);
+        // Page key: the page number plus one, so an empty slot reads 0.
+        let pkey = (target >> 12).wrapping_add(1);
+        let pslot = ((target >> 12) ^ (target >> 24)) as usize & (JIT_RUN_UNTIL_PAGES - 1);
+        if JIT_RUN_UNTIL_PAGE_KEY[pslot] != pkey {
+            JIT_RUN_UNTIL_PAGE_KEY[pslot] = pkey;
+            JIT_RUN_UNTIL_PAGE_CALLS[pslot] = 0;
+        }
+        JIT_RUN_UNTIL_PAGE_CALLS[pslot] = JIT_RUN_UNTIL_PAGE_CALLS[pslot].wrapping_add(1);
     }
     if JIT_RUN_UNTIL_DEPTH >= JIT_RUN_UNTIL_MAX_DEPTH {
         JIT_RUN_UNTIL_STATS[6] = JIT_RUN_UNTIL_STATS[6].wrapping_add(1);

@@ -3686,7 +3686,9 @@ pub unsafe fn do_many_cycles_native() {
 // when the callee returns. Stops early, like the slice loop, on an exhausted or
 // zeroed budget, a halted CPU or a parked EIP, and after `max` retired
 // instructions; the caller then leaves the guest state where it is and exits.
-// Returns 0 when EIP is `ret_eip`, otherwise a stop reason.
+// Returns 0 when EIP is `ret_eip` with ESP above `stop_esp` (the return
+// slot the caller pushed): a nested activation of the same code reaching the
+// same address sits deeper on the stack and must not end the outer call.
 static mut JIT_RUN_UNTIL_DEPTH: u32 = 0;
 const JIT_RUN_UNTIL_MAX_DEPTH: u32 = 24;
 // Dispatches per bridged call are bounded independently of retired
@@ -3695,8 +3697,10 @@ const JIT_RUN_UNTIL_MAX_ITERATIONS: u32 = 200_000;
 // 0 calls, 1 returned, 2 stopped by a zeroed budget (a thunk asked for an
 // urgent exit), 3 by an exhausted slice, 4 by a halted CPU or a parked EIP,
 // 5 by the instruction cap, 6 by depth, 7 by the iteration cap, 8 total
-// iterations, 9 total instructions retired inside.
-static mut JIT_RUN_UNTIL_STATS: [u32; 10] = [0; 10];
+// iterations, 9 total instructions retired inside, 10 barrier hits by a
+// nested activation (ignored, the loop carried on), 11 stopped because a
+// thunk switched threads inside the loop (the FS base moved to another TEB).
+static mut JIT_RUN_UNTIL_STATS: [u32; 12] = [0; 12];
 
 #[no_mangle]
 pub fn jit_run_until_stat(i: u32) -> u32 {
@@ -3705,11 +3709,11 @@ pub fn jit_run_until_stat(i: u32) -> u32 {
 
 #[no_mangle]
 pub fn jit_run_until_stats_reset() {
-    unsafe { JIT_RUN_UNTIL_STATS = [0; 10]; }
+    unsafe { JIT_RUN_UNTIL_STATS = [0; 12]; }
 }
 
 #[no_mangle]
-pub unsafe fn jit_run_until(ret_eip: u32, max: u32) -> u32 {
+pub unsafe fn jit_run_until(ret_eip: u32, stop_esp: u32, max: u32) -> u32 {
     JIT_RUN_UNTIL_STATS[0] = JIT_RUN_UNTIL_STATS[0].wrapping_add(1);
     if JIT_RUN_UNTIL_DEPTH >= JIT_RUN_UNTIL_MAX_DEPTH {
         JIT_RUN_UNTIL_STATS[6] = JIT_RUN_UNTIL_STATS[6].wrapping_add(1);
@@ -3719,11 +3723,22 @@ pub unsafe fn jit_run_until(ret_eip: u32, max: u32) -> u32 {
     let outer_stop = jit::JIT_CHAIN_STOP_EIP;
     jit::JIT_CHAIN_STOP_EIP = ret_eip;
     let start = *instruction_counter;
+    let fs_base = *segment_offsets.offset(FS as isize);
     let mut iterations: u32 = 0;
     let mut stat_slot: usize = 1;
     let result = loop {
+        // A thunk reached from the loop may switch threads synchronously; the
+        // register file then belongs to another thread and the caller's frame
+        // cannot be resumed from here.
+        if *segment_offsets.offset(FS as isize) != fs_base {
+            stat_slot = 11;
+            break 5;
+        }
         if *instruction_pointer as u32 == ret_eip {
-            break 0;
+            if read_reg32(ESP) as u32 > stop_esp {
+                break 0;
+            }
+            JIT_RUN_UNTIL_STATS[10] = JIT_RUN_UNTIL_STATS[10].wrapping_add(1);
         }
         let limit = hypercall::read_cycle_limit();
         let elapsed = (*instruction_counter).wrapping_sub(jit_cycle_start_instruction_counter);

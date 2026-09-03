@@ -3694,6 +3694,14 @@ const JIT_RUN_UNTIL_MAX_DEPTH: u32 = 24;
 // Dispatches per bridged call are bounded independently of retired
 // instructions, so a callee that keeps stalling cannot pin the Worker.
 const JIT_RUN_UNTIL_MAX_ITERATIONS: u32 = 200_000;
+// Instructions a bridged callee may still retire once the slice budget is
+// zero before the nested loop gives up on it.
+static mut JIT_RUN_UNTIL_ZERO_BUDGET_GRACE: u32 = 512;
+
+#[no_mangle]
+pub fn jit_set_run_until_zero_budget_grace(n: u32) { unsafe { JIT_RUN_UNTIL_ZERO_BUDGET_GRACE = n; } }
+#[no_mangle]
+pub fn jit_get_run_until_zero_budget_grace() -> u32 { unsafe { JIT_RUN_UNTIL_ZERO_BUDGET_GRACE } }
 // 0 calls, 1 returned, 2 stopped by a zeroed budget (a thunk asked for an
 // urgent exit), 3 by an exhausted slice, 4 by a halted CPU or a parked EIP,
 // 5 by the instruction cap, 6 by depth, 7 by the iteration cap, 8 total
@@ -3769,11 +3777,18 @@ pub unsafe fn jit_run_until(ret_eip: u32, stop_esp: u32, max: u32) -> u32 {
         }
         let limit = hypercall::read_cycle_limit();
         let elapsed = (*instruction_counter).wrapping_sub(jit_cycle_start_instruction_counter);
+        // An urgent exit zeroes the budget for the rest of the slice; a bridged
+        // callee that starts then would be abandoned before its first
+        // instruction, the caller's frame with it. A short grace lets a small
+        // callee (a Win32 stub, a leaf) return natively; the slice still ends
+        // within that many instructions.
         if limit == 0 {
-            stat_slot = 2;
-            break 1;
+            if (*instruction_counter).wrapping_sub(start) >= JIT_RUN_UNTIL_ZERO_BUDGET_GRACE {
+                stat_slot = 2;
+                break 1;
+            }
         }
-        if elapsed >= limit {
+        else if elapsed >= limit {
             stat_slot = 3;
             break 1;
         }

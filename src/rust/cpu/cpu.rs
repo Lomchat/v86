@@ -3704,7 +3704,7 @@ static mut JIT_RUN_UNTIL_STATS: [u32; 12] = [0; 12];
 // Bridged callees by entry address, so a batch can learn which targets to
 // absorb natively: a small direct-mapped table of (eip, calls), the slot's
 // owner replaced when a different address collides.
-const JIT_RUN_UNTIL_TARGETS: usize = 256;
+const JIT_RUN_UNTIL_TARGETS: usize = 4096;
 static mut JIT_RUN_UNTIL_TARGET_EIP: [u32; JIT_RUN_UNTIL_TARGETS] = [0; JIT_RUN_UNTIL_TARGETS];
 static mut JIT_RUN_UNTIL_TARGET_CALLS: [u32; JIT_RUN_UNTIL_TARGETS] = [0; JIT_RUN_UNTIL_TARGETS];
 

@@ -3701,6 +3701,20 @@ const JIT_RUN_UNTIL_MAX_ITERATIONS: u32 = 200_000;
 // nested activation (ignored, the loop carried on), 11 stopped because a
 // thunk switched threads inside the loop (the FS base moved to another TEB).
 static mut JIT_RUN_UNTIL_STATS: [u32; 12] = [0; 12];
+// Bridged callees by entry address, so a batch can learn which targets to
+// absorb natively: a small direct-mapped table of (eip, calls), the slot's
+// owner replaced when a different address collides.
+const JIT_RUN_UNTIL_TARGETS: usize = 256;
+static mut JIT_RUN_UNTIL_TARGET_EIP: [u32; JIT_RUN_UNTIL_TARGETS] = [0; JIT_RUN_UNTIL_TARGETS];
+static mut JIT_RUN_UNTIL_TARGET_CALLS: [u32; JIT_RUN_UNTIL_TARGETS] = [0; JIT_RUN_UNTIL_TARGETS];
+
+#[no_mangle]
+pub fn jit_run_until_target(slot: u32, field: u32) -> u32 {
+    unsafe {
+        if slot as usize >= JIT_RUN_UNTIL_TARGETS { return 0; }
+        if field == 0 { JIT_RUN_UNTIL_TARGET_EIP[slot as usize] } else { JIT_RUN_UNTIL_TARGET_CALLS[slot as usize] }
+    }
+}
 
 #[no_mangle]
 pub fn jit_run_until_stat(i: u32) -> u32 {
@@ -3709,12 +3723,25 @@ pub fn jit_run_until_stat(i: u32) -> u32 {
 
 #[no_mangle]
 pub fn jit_run_until_stats_reset() {
-    unsafe { JIT_RUN_UNTIL_STATS = [0; 12]; }
+    unsafe {
+        JIT_RUN_UNTIL_STATS = [0; 12];
+        JIT_RUN_UNTIL_TARGET_EIP = [0; JIT_RUN_UNTIL_TARGETS];
+        JIT_RUN_UNTIL_TARGET_CALLS = [0; JIT_RUN_UNTIL_TARGETS];
+    }
 }
 
 #[no_mangle]
 pub unsafe fn jit_run_until(ret_eip: u32, stop_esp: u32, max: u32) -> u32 {
     JIT_RUN_UNTIL_STATS[0] = JIT_RUN_UNTIL_STATS[0].wrapping_add(1);
+    {
+        let target = *instruction_pointer as u32;
+        let slot = ((target >> 2) ^ (target >> 12)) as usize & (JIT_RUN_UNTIL_TARGETS - 1);
+        if JIT_RUN_UNTIL_TARGET_EIP[slot] != target {
+            JIT_RUN_UNTIL_TARGET_EIP[slot] = target;
+            JIT_RUN_UNTIL_TARGET_CALLS[slot] = 0;
+        }
+        JIT_RUN_UNTIL_TARGET_CALLS[slot] = JIT_RUN_UNTIL_TARGET_CALLS[slot].wrapping_add(1);
+    }
     if JIT_RUN_UNTIL_DEPTH >= JIT_RUN_UNTIL_MAX_DEPTH {
         JIT_RUN_UNTIL_STATS[6] = JIT_RUN_UNTIL_STATS[6].wrapping_add(1);
         return 3;

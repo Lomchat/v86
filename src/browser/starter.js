@@ -65,7 +65,9 @@ export function V86(options)
         "run_hardware_timers": function(a, t) { return cpu.run_hardware_timers(a, t); },
         "cpu_event_halt": () => { this.emulator_bus.send("cpu-event-halt"); },
         "abort": function() { dbg_assert(false); },
-        "microtick": v86.microtick,
+        // A host may supply a cheaper clock (Orthros reads a shared-memory clock
+        // written by a helper thread); it must return milliseconds like performance.now().
+        "microtick": options["microtick"] || v86.microtick,
         "get_rand_int": function() { return get_rand_int(); },
         "stop_idling": function() { return cpu.stop_idling(); },
 

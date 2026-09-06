@@ -34,6 +34,9 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         160 => handle_msvcr71_strncpy(),
         161 => handle_msvcr71_strnicmp(),
         162 => handle_msvcr71_strcmp(),
+        163 => handle_msvcr71_memmove(),
+        164 => handle_msvcr71_strncmp(),
+        165 => handle_msvcr71_strrchr(),
         _ => false,
     }
 }
@@ -1101,6 +1104,92 @@ unsafe fn handle_msvcr71_memcmp() -> bool {
             write_reg32(EAX, if a < b { -1 } else { 1 });
             return true;
         }
+    }
+    write_reg32(EAX, 0);
+    true
+}
+
+/// MSVCR71.dll 7.10.3052.4 @ RVA 0x2ebb (memcpy) and 0x298e (memmove): one
+/// overlap-safe body behind both exports, so both map here. Both ranges are
+/// validated before the first write, so a declined call runs the relocated
+/// original from a clean state.
+unsafe fn handle_msvcr71_memmove() -> bool {
+    let esp = read_reg32(ESP);
+    let dst = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
+    let src = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v, Err(_) => return false };
+    let len = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
+    if len == 0 { write_reg32(EAX, dst); return true; }
+    if len > 0x1000_0000 { return false; }
+    if readable_or_pagefault(src, len as i32).is_err() || writable_or_pagefault(dst, len as i32).is_err() { return false; }
+    let (d, s) = (dst as u32, src as u32);
+    if d > s && d < s.wrapping_add(len) {
+        let mut i = len;
+        while i > 0 {
+            i -= 1;
+            let byte = match hc_safe_read8(src.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
+            if safe_write8(dst.wrapping_add(i as i32), byte).is_err() { return false; }
+        }
+    } else {
+        let mut i = 0u32;
+        while i + 4 <= len {
+            let word = match safe_read32s(src.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
+            if safe_write32(dst.wrapping_add(i as i32), word).is_err() { return false; }
+            i += 4;
+        }
+        while i < len {
+            let byte = match hc_safe_read8(src.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
+            if safe_write8(dst.wrapping_add(i as i32), byte).is_err() { return false; }
+            i += 1;
+        }
+    }
+    write_reg32(EAX, dst);
+    true
+}
+
+/// MSVCR71.dll 7.10.3052.4 @ RVA 0x2955: at most `count` bytes, stopping at
+/// the first NUL of either string; -1/0/1 on unsigned bytes like the native
+/// sbb sequence.
+unsafe fn handle_msvcr71_strncmp() -> bool {
+    let esp = read_reg32(ESP);
+    let left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
+    let right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v, Err(_) => return false };
+    let count = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
+    let mut i = 0u32;
+    while i < count {
+        let a = match hc_safe_read8(left.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
+        let b = match hc_safe_read8(right.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
+        if a != b {
+            write_reg32(EAX, if a < b { -1 } else { 1 });
+            return true;
+        }
+        if a == 0 { break; }
+        i += 1;
+    }
+    write_reg32(EAX, 0);
+    true
+}
+
+/// MSVCR71.dll 7.10.3052.4 @ RVA 0x3868: the last occurrence of the byte,
+/// the terminator included (a zero byte finds it), else NULL.
+unsafe fn handle_msvcr71_strrchr() -> bool {
+    let esp = read_reg32(ESP);
+    let string = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let wanted = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v & 0xff, Err(_) => return false };
+    let mut length = 0u32;
+    loop {
+        let byte = match hc_safe_read8(string.wrapping_add(length as i32)) { Ok(v) => v, Err(_) => return false };
+        if byte == 0 { break; }
+        length += 1;
+        if length > 0x1000_0000 { return false; }
+    }
+    let mut i = length as i64;
+    while i >= 0 {
+        let byte = match hc_safe_read8(string.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
+        if byte == wanted {
+            write_reg32(EAX, string.wrapping_add(i as i32));
+            return true;
+        }
+        i -= 1;
     }
     write_reg32(EAX, 0);
     true

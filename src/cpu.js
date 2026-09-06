@@ -1802,6 +1802,90 @@ CPU.prototype.load_bios = function()
         }.bind(this));
 };
 
+/**
+ * Append a wasm custom "name" section naming the module's defined functions
+ * jit_<page>[_n], so a CPU profile attributes time to guest pages instead of
+ * wasm-function[N]. The import and function sections are walked only far
+ * enough to count function imports and defined functions; any parse surprise
+ * yields a plain copy instead.
+ * @param {!Uint8Array} code
+ * @param {number} start
+ * @return {!Uint8Array}
+ */
+function jit_module_with_names(code, start)
+{
+    const n = code.length;
+    let pos = 8;
+    let func_imports = 0;
+    let defined = 0;
+    const leb = () => {
+        let result = 0, shift = 0, byte;
+        do {
+            if(pos >= n) throw new Error("eof");
+            byte = code[pos++];
+            result |= (byte & 0x7F) << shift;
+            shift += 7;
+        } while(byte & 0x80);
+        return result >>> 0;
+    };
+    const limits = () => { const flags = code[pos++]; leb(); if(flags & 1) leb(); };
+    try
+    {
+        while(pos < n)
+        {
+            const id = code[pos++];
+            const size = leb();
+            const end = pos + size;
+            if(id === 2)
+            {
+                const count = leb();
+                for(let i = 0; i < count; i++)
+                {
+                    pos += leb();
+                    pos += leb();
+                    const kind = code[pos++];
+                    if(kind === 0) { func_imports++; leb(); }
+                    else if(kind === 1) { pos++; limits(); }
+                    else if(kind === 2) { limits(); }
+                    else if(kind === 3) { pos += 2; }
+                    else throw new Error("kind");
+                }
+            }
+            else if(id === 3)
+            {
+                defined = leb();
+            }
+            pos = end;
+        }
+    }
+    catch(e)
+    {
+        return code.slice();
+    }
+    if(defined === 0) return code.slice();
+    const enc = (arr, v) => { do { let b = v & 0x7F; v >>>= 7; if(v) b |= 0x80; arr.push(b); } while(v); };
+    const str = (arr, s) => { enc(arr, s.length); for(let i = 0; i < s.length; i++) arr.push(s.charCodeAt(i) & 0xFF); };
+    const map = [];
+    enc(map, defined);
+    for(let i = 0; i < defined; i++)
+    {
+        enc(map, func_imports + i);
+        str(map, "jit_" + start.toString(16) + (i ? "_" + i : ""));
+    }
+    const content = [];
+    str(content, "name");
+    content.push(1);
+    enc(content, map.length);
+    for(let i = 0; i < map.length; i++) content.push(map[i]);
+    const section = [0];
+    enc(section, content.length);
+    const result = new Uint8Array(n + section.length + content.length);
+    result.set(code, 0);
+    result.set(section, n);
+    result.set(content, n + section.length);
+    return result;
+}
+
 CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, ptr, len)
 {
     ptr >>>= 0;
@@ -1873,7 +1957,12 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
     // snapshots BufferSource bytes during the call, but keep an explicit copy
     // whenever more than one compile may be pending so that this guarantee is
     // local and testable rather than browser-engine dependent.
-    const compile_code = this.get_jit_config(25) > 1 ? code.slice() : code;
+    // A name section makes the module's function appear in a CPU profile as
+    // jit_<page> instead of wasm-function[N], so time can be attributed per
+    // guest page; the concatenation is itself a copy.
+    const compile_code = globalThis["__jitNames"] === false
+        ? (this.get_jit_config(25) > 1 ? code.slice() : code)
+        : jit_module_with_names(code, start >>> 0);
     const compile_elapsed_us = () => Math.min(
         0xFFFFFFFF,
         Math.max(0, Math.round((performance.now() - compile_started) * 1000))

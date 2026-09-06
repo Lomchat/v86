@@ -1841,8 +1841,9 @@ function jit_module_with_names(code, start)
                 const count = leb();
                 for(let i = 0; i < count; i++)
                 {
-                    pos += leb();
-                    pos += leb();
+                    // `pos += leb()` would read pos before leb() advances it.
+                    const module_len = leb(); pos += module_len;
+                    const field_len = leb(); pos += field_len;
                     const kind = code[pos++];
                     if(kind === 0) { func_imports++; leb(); }
                     else if(kind === 1) { pos++; limits(); }

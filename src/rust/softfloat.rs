@@ -33,6 +33,17 @@ pub extern "C" fn set_relaxed_fpu(enabled: u32) {
     unsafe { FPU_RELAXED = enabled != 0; }
 }
 
+// The f64 transcendentals behind fsin/fcos/fptan/fpatan, exported so that
+// ahead-of-time translations compute them with this exact libm.
+#[no_mangle]
+pub extern "C" fn x87_sin_f64(x: f64) -> f64 { x.sin() }
+#[no_mangle]
+pub extern "C" fn x87_cos_f64(x: f64) -> f64 { x.cos() }
+#[no_mangle]
+pub extern "C" fn x87_tan_f64(x: f64) -> f64 { x.tan() }
+#[no_mangle]
+pub extern "C" fn x87_atan2_f64(y: f64, x: f64) -> f64 { y.atan2(x) }
+
 #[no_mangle]
 pub extern "C" fn get_relaxed_fpu() -> u32 {
     unsafe { FPU_RELAXED as u32 }
@@ -118,7 +129,11 @@ impl F80 {
         sign_exponent: 0xFFFF,
     };
 
-    pub fn sign(&self) -> bool { (self.sign_exponent >> 15) == 1 }
+    pub fn sign(&self) -> bool {
+        // A relaxed slot keeps the f64 sign in bit 63 of its mantissa.
+        if self.sign_exponent == RELAXED_TAG { return (self.mantissa >> 63) == 1; }
+        (self.sign_exponent >> 15) == 1
+    }
     pub fn exponent(&self) -> i16 { (self.sign_exponent as i16 & 0x7FFF) - 0x3FFF }
 
     pub fn to_f64(&self) -> u64 {

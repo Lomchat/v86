@@ -7552,6 +7552,52 @@ pub fn note_external_dispatch(hit: bool) {
     }
 }
 
+// Addresses dispatched on a page that has an external module but no state
+// for them (the JIT or the interpreter runs them instead): a direct-mapped
+// histogram that ages out cold addresses, read sorted. Names the entries a
+// batch lacks.
+const EXT_MISS_SLOTS: usize = 4096;
+static mut EXT_MISS_EIP: [u32; EXT_MISS_SLOTS] = [0; EXT_MISS_SLOTS];
+static mut EXT_MISS_COUNT: [u32; EXT_MISS_SLOTS] = [0; EXT_MISS_SLOTS];
+#[inline]
+pub fn note_external_miss(eip: u32) {
+    unsafe {
+        let i = ((eip >> 1) ^ (eip >> 13)) as usize & (EXT_MISS_SLOTS - 1);
+        if EXT_MISS_EIP[i] == eip {
+            EXT_MISS_COUNT[i] = EXT_MISS_COUNT[i].saturating_add(1);
+        }
+        else if EXT_MISS_COUNT[i] < 4 {
+            EXT_MISS_EIP[i] = eip;
+            EXT_MISS_COUNT[i] = 1;
+        }
+        else {
+            EXT_MISS_COUNT[i] -= 1;
+        }
+    }
+}
+#[no_mangle]
+pub fn jit_ext_miss_reset() {
+    unsafe {
+        EXT_MISS_EIP = [0; EXT_MISS_SLOTS];
+        EXT_MISS_COUNT = [0; EXT_MISS_SLOTS];
+    }
+}
+/// `rank`-th hottest missed external address (0 = hottest); field 0 = address, 1 = count.
+#[no_mangle]
+pub fn jit_ext_miss_top(rank: u32, field: u32) -> u32 {
+    unsafe {
+        let mut v: Vec<(u32, u32)> = (0..EXT_MISS_SLOTS)
+            .filter(|&i| EXT_MISS_COUNT[i] != 0)
+            .map(|i| (EXT_MISS_COUNT[i], EXT_MISS_EIP[i]))
+            .collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        match v.get(rank as usize) {
+            Some(&(count, eip)) => if field == 0 { eip } else { count },
+            None => 0,
+        }
+    }
+}
+
 // Flight recorder of the last external dispatches: entry address, the
 // address the module exited at and how many instructions it retired. Cheap
 // enough to stay on: external entries are rare compared with block entries.

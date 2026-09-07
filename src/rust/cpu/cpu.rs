@@ -3142,6 +3142,7 @@ pub unsafe fn cycle_internal() {
                 }
                 else {
                     jit::note_external_dispatch(false);
+                    jit::note_external_miss(initial_eip as u32);
                 }
             }
             else {
@@ -3229,6 +3230,7 @@ pub unsafe fn cycle_internal() {
                 }
                 else {
                     jit::note_external_dispatch(false);
+                    jit::note_external_miss(initial_eip as u32);
                 }
             }
             else {

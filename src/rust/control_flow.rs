@@ -27,9 +27,26 @@ fn rev_graph_edges(nodes: &Graph) -> Graph {
     rev_nodes
 }
 
+// Successor addresses recorded on a block that never became a block (a
+// target whose discovery declined: page tail, unmapped or non-contiguous
+// next page). The code generator already treats such an edge as an exit;
+// the graph must not follow it, or scc() unwraps a missing node.
+static mut DANGLING_EDGES: u32 = 0;
+#[no_mangle]
+pub fn jit_dangling_edges() -> u32 { unsafe { DANGLING_EDGES } }
+
 pub fn make_graph(basic_blocks: &Vec<BasicBlock>) -> Graph {
     let mut nodes = Graph::new();
     let mut entry_edges = Set::new();
+    let known: Set = basic_blocks.iter().map(|b| b.addr).collect();
+    let edge = |edges: &mut Set, target: u32| {
+        if known.contains(&target) {
+            edges.insert(target);
+        }
+        else {
+            unsafe { DANGLING_EDGES = DANGLING_EDGES.wrapping_add(1) };
+        }
+    };
 
     for b in basic_blocks.iter() {
         let mut edges = Set::new();
@@ -41,17 +58,17 @@ pub fn make_graph(basic_blocks: &Vec<BasicBlock>) -> Graph {
                 ..
             } => {
                 if let Some(next_block_addr) = next_block_addr {
-                    edges.insert(next_block_addr);
+                    edge(&mut edges, next_block_addr);
                 }
                 if let Some(next_block_branch_taken_addr) = next_block_branch_taken_addr {
-                    edges.insert(next_block_branch_taken_addr);
+                    edge(&mut edges, next_block_branch_taken_addr);
                 }
             },
             &BasicBlockType::Normal {
                 next_block_addr: Some(next_block_addr),
                 ..
             } => {
-                edges.insert(next_block_addr);
+                edge(&mut edges, next_block_addr);
             },
             &BasicBlockType::Normal {
                 next_block_addr: None,
@@ -195,8 +212,12 @@ fn scc(edges: &Graph, rev_edges: &Graph) -> Vec<Vec<u32>> {
             return;
         }
         visited.insert(node);
-        for &next in edges.get(&node).unwrap() {
-            visit(next, edges, rev_edges, visited, l);
+        // make_graph only records edges to known nodes; an unknown node here
+        // would be a builder bug, and a missing entry must not panic the JIT.
+        if let Some(next_edges) = edges.get(&node) {
+            for &next in next_edges {
+                visit(next, edges, rev_edges, visited, l);
+            }
         }
         l.push(node);
     }

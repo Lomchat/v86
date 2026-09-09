@@ -934,6 +934,12 @@ static mut JIT_DEAD_FLAG_ELISION: bool = false;
 /// is real rather than theoretical; the payoff is the other 89%.
 static mut JIT_DEAD_FLAG_ELISION_ACROSS_FAULTS: bool = false;
 static mut JIT_FASTMEM_READS: bool = false;
+// Config 51. The read fast path accepts an address on the identity-RAM envelope alone
+// (gen_fastmem_read consults no page state), so a mapping change never alters what a
+// compiled unit does: advancing the generation only deoptimises every speculating unit
+// and recompiles it identically. OFF keeps the per-source bump counters (diagnostics)
+// without the deopt/recompile storm; ON restores the historical behaviour for an A/B.
+static mut JIT_FASTMEM_GENERATION_ADVANCE: bool = false;
 static mut JIT_X87_LOCALS: bool = false;
 static mut JIT_PUSH_RUN_COALESCING: bool = false;
 // Fastmem WRITES behind a per-page writability map (idx 19).
@@ -1847,11 +1853,14 @@ pub fn fastmem_note_speculated_load_compiled() {
 #[no_mangle]
 pub fn fastmem_bump_generation(source: u32) {
     unsafe {
+        let idx = (source as usize).min(FASTMEM_BUMP_SOURCE_COUNT - 1);
+        FASTMEM_BUMPS_BY_SOURCE[idx] = FASTMEM_BUMPS_BY_SOURCE[idx].saturating_add(1);
+        if !JIT_FASTMEM_GENERATION_ADVANCE {
+            return;
+        }
         // 0 is the non-fastmem Code sentinel.
         *global_pointers::fastmem_generation =
             (*global_pointers::fastmem_generation).wrapping_add(1);
-        let idx = (source as usize).min(FASTMEM_BUMP_SOURCE_COUNT - 1);
-        FASTMEM_BUMPS_BY_SOURCE[idx] = FASTMEM_BUMPS_BY_SOURCE[idx].saturating_add(1);
 
         // Thrash auto-latch: only relevant while speculation is live.
         if JIT_FASTMEM_READS && !FASTMEM_THRASH_LATCHED {
@@ -7006,6 +7015,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         37 => JIT_DEFERRED_COMPILE_QUEUE = value != 0,
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS = value != 0,
         50 => JIT_PAGE_TAIL_ENTRIES = value != 0,
+        51 => JIT_FASTMEM_GENERATION_ADVANCE = value != 0,
         39 => JIT_X87_WRITEBACK = value != 0,
         40 => JIT_FPU_ORDERED_COMPARE_FIRST = value != 0,
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT = value != 0,
@@ -7063,6 +7073,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         37 => JIT_DEFERRED_COMPILE_QUEUE as u32,
         38 => JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS as u32,
         50 => JIT_PAGE_TAIL_ENTRIES as u32,
+        51 => JIT_FASTMEM_GENERATION_ADVANCE as u32,
         39 => JIT_X87_WRITEBACK as u32,
         40 => JIT_FPU_ORDERED_COMPARE_FIRST as u32,
         41 => JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT as u32,

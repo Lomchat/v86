@@ -2114,6 +2114,17 @@ pub fn jit_get_cache_flushes() -> u32 { unsafe { JIT_CACHE_FLUSHES } }
 #[no_mangle]
 pub fn jit_reset_cache_flushes() { unsafe { JIT_CACHE_FLUSHES = 0 } }
 
+// Modules declined because a block's Some(successor) is not itself a block in the
+// module — see jit_analyze_and_generate_untimed. make_graph already drops such a
+// dangling edge from the graph, but the block's terminator still carries the
+// Some(addr) and the emitter's dispatcher-index / label lookup would unwrap None
+// (a Rust panic → WASM `unreachable` that kills the Worker). Declining leaves the
+// page on the interpreter, which is always correct.
+static mut JIT_ORPHAN_SUCCESSOR_DECLINES: u32 = 0;
+
+#[no_mangle]
+pub fn jit_orphan_successor_declines() -> u32 { unsafe { JIT_ORPHAN_SUCCESSOR_DECLINES } }
+
 #[no_mangle]
 pub fn jit_get_wasm_table_size() -> u32 { WASM_TABLE_SIZE }
 
@@ -4152,6 +4163,38 @@ fn jit_analyze_and_generate_untimed(
     }
     let basic_blocks =
         jit_find_basic_blocks(ctx, entry_points, cpu.clone(), tier2_region.as_ref());
+
+    // A block whose Normal/ConditionalJump terminator carries Some(successor) that is
+    // not itself a block in this module would make jit_generate_module's index_for_addr /
+    // label_for_addr lookup unwrap None — a Rust panic surfacing as a WASM `unreachable`
+    // that kills the Worker (measured: an intermittent Witch-king battle-start freeze;
+    // make_graph already drops the edge from the graph but the terminator still holds the
+    // Some(addr), and an external JMP uses None, so Some(missing) is genuinely a gap). An
+    // in-module successor is always either the consecutive block or a labelled branch
+    // target, so this catches exactly the panic case. Decline: leave the page on the
+    // interpreter until a later attempt whose module composition includes the successor.
+    // Never miscompiles.
+    {
+        let known: HashSet<u32> = basic_blocks.iter().map(|b| b.addr).collect();
+        let has_orphan_successor = basic_blocks.iter().any(|b| {
+            let (a, c) = match b.ty {
+                BasicBlockType::Normal { next_block_addr, .. } => (next_block_addr, None),
+                BasicBlockType::ConditionalJump {
+                    next_block_addr,
+                    next_block_branch_taken_addr,
+                    ..
+                } => (next_block_addr, next_block_branch_taken_addr),
+                _ => (None, None),
+            };
+            [a, c].iter().flatten().any(|addr| !known.contains(addr))
+        });
+        if has_orphan_successor {
+            unsafe {
+                JIT_ORPHAN_SUCCESSOR_DECLINES = JIT_ORPHAN_SUCCESSOR_DECLINES.wrapping_add(1)
+            };
+            return;
+        }
+    }
 
     let mut pages = HashSet::new();
 

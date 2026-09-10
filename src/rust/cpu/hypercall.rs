@@ -106,7 +106,8 @@ const HC_FLS_SLOT_COUNT: usize = 129;
 // GUEST RAM at hc_slab_ctl_ptr and is accessed via SLAB_REL_* below; the legacy 0x1400-based
 // page layout is documented in the header block above and mirrored on the JS side.
 const OFF_HC_SLAB_CTL_PTR: usize = 0x1444; // guest addr of slab control block (0 = legacy page)
-const OFF_HC_EVENT_TABLE: usize = 0x1448;
+// 0x1448..0x1C48 is the retired in-page event table; the event mirror now lives in guest RAM
+// behind OFF_HC_EVENT_MIRROR_PTR so it can cover the whole kernel handle window.
 
 // Relative offsets WITHIN the slab control block (page fields rebased to 0). Used when the
 // control block lives in guest RAM (hc_slab_ctl_ptr != 0).
@@ -132,13 +133,18 @@ unsafe fn slab_wr(ctl: u32, rel: u32, value: u32) {
 const OFF_HC_EVENT_STARVATION_COUNTER: usize = 0x1C48;
 const OFF_HC_EVENT_STARVATION_LIMIT: usize = 0x1C4C;
 const OFF_HC_MUTEX_MIRROR_PTR: usize = 0x1C50;
+// Guest-RAM event mirror (EVENT_TABLE_SLOTS × u8), one byte per kernel handle slot. A fixed
+// in-page table stopped at 2048 slots while a game allocates >10 000 kernel objects: every
+// later event was invisible here, so each release/signal of it declined to JS.
+const OFF_HC_EVENT_MIRROR_PTR: usize = 0x1C58;
 /// Guest address of the EAGL token-dispatch config block (0 = handler 132
 /// disabled). Written by JS (hle-lib libs/eagl) once the d3d9 WBUF ring +
 /// setter shadow tables exist. Layout: see handle_eagl_token_dispatch.
 pub(crate) const OFF_HC_EAGL_TOKEN_CFG_PTR: usize = 0x1C54;
 
 const KERNEL_HANDLE_BASE: u32 = 0x30000;
-const EVENT_TABLE_SLOTS: u32 = 2048;
+// The whole KERNEL handle window (0x30000..0x3FFFF, stride 4) — mirrors and handles agree.
+const EVENT_TABLE_SLOTS: u32 = 16384;
 const EVT_VALID: u8 = 0x01;
 const EVT_SIGNALED: u8 = 0x02;
 const EVT_MANUAL: u8 = 0x04;
@@ -712,7 +718,7 @@ unsafe fn handle_leave_critical_section() -> bool {
             Some(v) => v,
             None => return false,
         };
-        let flags = *hp_ptr().add(OFF_HC_EVENT_TABLE + slot as usize);
+        let flags = read_event_mirror(slot);
         if flags & EVT_VALID == 0 || flags & EVT_HAS_WAITERS != 0 {
             // Invalid/stale handles need JS normalization; live waiters need
             // SetEvent plus scheduler ownership transfer.
@@ -2099,16 +2105,12 @@ unsafe fn handle_set_event() -> bool {
         Err(_) => return false,
     };
 
-    if handle < KERNEL_HANDLE_BASE {
-        return false;
-    }
-    let slot = (handle - KERNEL_HANDLE_BASE) >> 2;
-    if slot >= EVENT_TABLE_SLOTS {
-        return false;
-    }
+    let slot = match kernel_handle_slot(handle) {
+        Some(s) => s,
+        None => return false,
+    };
 
-    let table_ptr = hp_mut().add(OFF_HC_EVENT_TABLE + slot as usize);
-    let flags = *table_ptr;
+    let flags = read_event_mirror(slot);
     if flags & EVT_VALID == 0 {
         return false;
     }
@@ -2129,7 +2131,7 @@ unsafe fn handle_set_event() -> bool {
     if flags & EVT_MANUAL != 0 {
         new_flags |= EVT_PENDING_WAKE;
     }
-    *table_ptr = new_flags;
+    write_event_mirror(slot, new_flags);
 
     write_reg32(EAX, 1);
     true
@@ -2168,6 +2170,30 @@ unsafe fn write_mutex_mirror(slot: u32, value: u32) {
         return;
     }
     memory::write32_no_mmap_or_dirty_check(base + slot * 4, value as i32);
+}
+
+#[inline]
+unsafe fn event_mirror_base() -> u32 {
+    *(hp_ptr().add(OFF_HC_EVENT_MIRROR_PTR) as *const u32)
+}
+
+/// 0 (not EVT_VALID) until JS has allocated the table, so every fast path declines to JS.
+#[inline]
+unsafe fn read_event_mirror(slot: u32) -> u8 {
+    let base = event_mirror_base();
+    if base == 0 {
+        return 0;
+    }
+    memory::read8(base + slot) as u8
+}
+
+#[inline]
+unsafe fn write_event_mirror(slot: u32, value: u8) {
+    let base = event_mirror_base();
+    if base == 0 {
+        return;
+    }
+    memory::write8_no_mmap_or_dirty_check(base + slot, value as i32);
 }
 
 /// ReleaseMutex(hMutex) — uncontended, no waiters. Mirrors sync-objects release.
@@ -2238,13 +2264,13 @@ unsafe fn handle_wait_for_single_object() -> bool {
         return false;
     }
 
-    let evt = *hp_ptr().add(OFF_HC_EVENT_TABLE + slot as usize);
+    let evt = read_event_mirror(slot);
     if evt & EVT_VALID != 0 {
         if evt & EVT_MANUAL != 0 || evt & EVT_PENDING_WAKE != 0 {
             return false;
         }
         if evt & EVT_SIGNALED != 0 {
-            *hp_mut().add(OFF_HC_EVENT_TABLE + slot as usize) = evt & !EVT_SIGNALED;
+            write_event_mirror(slot, evt & !EVT_SIGNALED);
             write_reg32(EAX, 0);
             return true;
         }

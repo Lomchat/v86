@@ -7594,6 +7594,26 @@ fn publish_external(info: &PageInfo, phys_page: Page) {
 #[no_mangle]
 pub fn jit_external_pages() -> u32 { get_jit_state().external_pages.len() as u32 }
 
+/// Forget every external module: the guest process they were translated for
+/// is gone (process relay, game switch). Dispatch entries already derived for
+/// mapped pages are cleared here; other pages re-derive from the empty map on
+/// their next TLB fill. The wasm table slots stay owned by the host.
+#[no_mangle]
+pub fn jit_clear_external_modules() -> u32 {
+    let mut ctx = get_jit_state();
+    let count = ctx.external_pages.len() as u32;
+    ctx.external_pages.clear();
+    for i in 0..unsafe { cpu::valid_tlb_entries_count } {
+        let virt_page = unsafe { cpu::valid_tlb_entries[i as usize] };
+        dispatch_ext_clear(virt_page as u32);
+    }
+    unsafe {
+        EXTERNAL_ANY = false;
+        EXT_STALL_ARMED = false;
+    }
+    count
+}
+
 // Dispatches into external modules, and lookups that found the page's
 // external table but no entry for the offset (or another CPU state).
 static mut EXTERNAL_DISPATCHES: u32 = 0;

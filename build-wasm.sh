@@ -47,7 +47,7 @@ cargo rustc --release \
     --target wasm32-unknown-unknown \
     -- \
     -C linker=$LINKER_WRAPPER \
-    -C "link-args=--import-table --global-base=4096" \
+    -C "link-args=--import-table --allow-undefined --global-base=2097152" \
     -C "link-args=build/zstddeclib.o" \
     -C target-feature=+bulk-memory \
     -C target-feature=+multivalue \

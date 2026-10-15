@@ -8,6 +8,7 @@ var process = { hrtime: function() {} };
 var registerProcessor = function(name, processor) {};
 
 const sampleRate = 0;
+globalThis.DISABLE_JIT_DEAD_FLAG_ELISION;
 
 var WabtModule = {
     readWasm: function(buf, opt) {},

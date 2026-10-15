@@ -148,7 +148,12 @@ pub fn tail_entry_compilable(
     if !page_tail_entries_enabled() {
         return false;
     }
-    let mut probe = CpuContext { eip: phys_address, prefixes: 0, cs_offset, state_flags };
+    let mut probe = CpuContext {
+        eip: phys_address,
+        prefixes: 0,
+        cs_offset,
+        state_flags,
+    };
     let analysis = analysis::analyze_step(&mut probe);
     let end = probe.eip;
     if Page::page_of(end) == Page::page_of(phys_address) {
@@ -403,6 +408,7 @@ pub fn ret_cache_invalidate_all_slot_free() {
     ret_cache_invalidate_all();
 }
 
+#[allow(dead_code)]
 pub fn ret_cache_invalidate_all_tlb() {
     unsafe { RET_CACHE_INVALIDATED_BY_TLB = RET_CACHE_INVALIDATED_BY_TLB.wrapping_add(1) };
     ret_cache_invalidate_all();
@@ -428,9 +434,11 @@ pub fn ret_cache_invalidate_page_tlb(page: u32) {
             ret_cache_invalidate_all();
             return;
         }
-        for entry in RET_CACHE.iter_mut() {
-            if entry.0 >> 12 == page {
-                *entry = (0, 0, -1, 0);
+        let ret_cache = std::ptr::addr_of_mut!(RET_CACHE).cast::<(u32, u32, i32, u64)>();
+        for i in 0..RET_CACHE_SIZE {
+            let entry = ret_cache.add(i);
+            if (*entry).0 >> 12 == page {
+                entry.write((0, 0, -1, 0));
             }
         }
         // Chain-site memos are keyed by site, not by target page, so they cannot
@@ -524,8 +532,7 @@ static mut TIER2_EXIT_TARGETS: [[u32; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as
     [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
 static mut TIER2_EXIT_COUNTS: [[u32; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize] =
     [[0; TIER2_PROFILE_TARGETS]; WASM_TABLE_SIZE as usize];
-static mut TIER2_PROFILE_SAMPLES: [u32; WASM_TABLE_SIZE as usize] =
-    [0; WASM_TABLE_SIZE as usize];
+static mut TIER2_PROFILE_SAMPLES: [u32; WASM_TABLE_SIZE as usize] = [0; WASM_TABLE_SIZE as usize];
 static mut TIER2_PROFILED_EXITS: u32 = 0;
 static mut TIER2_REGION_PROMOTIONS: u32 = 0;
 static mut TIER2_REGION_SEEDS: u32 = 0;
@@ -572,13 +579,9 @@ pub fn jit_get_tier2_region_seeds() -> u32 { unsafe { TIER2_REGION_SEEDS } }
 #[no_mangle]
 pub fn jit_get_tier2_region_candidates() -> u32 { unsafe { TIER2_REGION_CANDIDATES } }
 #[no_mangle]
-pub fn jit_get_tier2_region_rejected_target() -> u32 {
-    unsafe { TIER2_REGION_REJECTED_TARGET }
-}
+pub fn jit_get_tier2_region_rejected_target() -> u32 { unsafe { TIER2_REGION_REJECTED_TARGET } }
 #[no_mangle]
-pub fn jit_get_tier2_region_rejected_budget() -> u32 {
-    unsafe { TIER2_REGION_REJECTED_BUDGET }
-}
+pub fn jit_get_tier2_region_rejected_budget() -> u32 { unsafe { TIER2_REGION_REJECTED_BUDGET } }
 
 #[no_mangle]
 pub fn jit_reset_tier2_state() {
@@ -610,25 +613,15 @@ pub fn jit_reset_tier2_state() {
 }
 
 #[no_mangle]
-pub fn jit_get_tier2_page_count() -> u32 {
-    get_jit_state().tier2_pages.len() as u32
-}
+pub fn jit_get_tier2_page_count() -> u32 { get_jit_state().tier2_pages.len() as u32 }
 #[no_mangle]
-pub fn jit_get_tier2_promotions() -> u32 {
-    unsafe { TIER2_PROMOTIONS }
-}
+pub fn jit_get_tier2_promotions() -> u32 { unsafe { TIER2_PROMOTIONS } }
 #[no_mangle]
-pub fn jit_get_tier2_blocked_by_cap() -> u32 {
-    unsafe { TIER2_BLOCKED_BY_CAP }
-}
+pub fn jit_get_tier2_blocked_by_cap() -> u32 { unsafe { TIER2_BLOCKED_BY_CAP } }
 #[no_mangle]
-pub fn jit_get_tier2_maintenance_samples() -> u32 {
-    unsafe { TIER2_MAINTENANCE_SAMPLES }
-}
+pub fn jit_get_tier2_maintenance_samples() -> u32 { unsafe { TIER2_MAINTENANCE_SAMPLES } }
 #[no_mangle]
-pub fn jit_get_tier2_page_evictions() -> u32 {
-    unsafe { TIER2_PAGE_EVICTIONS }
-}
+pub fn jit_get_tier2_page_evictions() -> u32 { unsafe { TIER2_PAGE_EVICTIONS } }
 
 #[inline(always)]
 pub fn jit_tier2_tracking_active() -> bool {
@@ -687,9 +680,7 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
         return 0;
     }
     let adaptive_sample = unsafe {
-        JIT_TIER2_ADAPTIVE
-            && TIER2_PAGE_COUNT >= TIER2_PAGE_SET_CAP
-            && TIER2_MAINTENANCE_DUE
+        JIT_TIER2_ADAPTIVE && TIER2_PAGE_COUNT >= TIER2_PAGE_SET_CAP && TIER2_MAINTENANCE_DUE
     };
     let weight = if adaptive_sample {
         unsafe {
@@ -703,8 +694,7 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
     }
     else if threshold >= TIER2_SAMPLE_WEIGHT {
         let sample = unsafe {
-            (*global_pointers::instruction_counter as u32)
-                .wrapping_mul(0x9E37_79B9)
+            (*global_pointers::instruction_counter as u32).wrapping_mul(0x9E37_79B9)
                 ^ (wasm_table_index as u32).wrapping_mul(0x85EB_CA6B)
         };
         if sample >> (32 - TIER2_SAMPLE_SHIFT) != 0 {
@@ -793,10 +783,7 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
         let total: u64 = candidates.iter().map(|&(_, count)| count as u64).sum();
 
         for (target, hits) in candidates {
-            if total == 0
-                || hits as u64 * 100 < total * 5
-                || region_target_excluded(target)
-            {
+            if total == 0 || hits as u64 * 100 < total * 5 || region_target_excluded(target) {
                 continue;
             }
             unsafe { TIER2_REGION_CANDIDATES = TIER2_REGION_CANDIDATES.wrapping_add(1) };
@@ -804,8 +791,7 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
                 Ok(phys) => phys,
                 Err(()) => {
                     unsafe {
-                        TIER2_REGION_REJECTED_TARGET =
-                            TIER2_REGION_REJECTED_TARGET.wrapping_add(1)
+                        TIER2_REGION_REJECTED_TARGET = TIER2_REGION_REJECTED_TARGET.wrapping_add(1)
                     };
                     continue;
                 },
@@ -818,11 +804,13 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> u32 {
                         && info
                             .entry_points
                             .iter()
-                            .any(|&(offset, _)| offset == phys as u16 & 0xFFF) => info,
+                            .any(|&(offset, _)| offset == phys as u16 & 0xFFF) =>
+                {
+                    info
+                },
                 _ => {
                     unsafe {
-                        TIER2_REGION_REJECTED_TARGET =
-                            TIER2_REGION_REJECTED_TARGET.wrapping_add(1)
+                        TIER2_REGION_REJECTED_TARGET = TIER2_REGION_REJECTED_TARGET.wrapping_add(1)
                     };
                     continue;
                 },
@@ -1105,8 +1093,7 @@ static mut DISPATCH_META: [u64; 1 << 20] = [0; 1 << 20];
 // pool, so a page can carry a JIT module and an external module at once and
 // neither evicts the other.
 static mut DISPATCH_META_EXT: [u64; 1 << 20] = [0; 1 << 20];
-static mut DISPATCH_SLABS: [u16; DISPATCH_SLAB_COUNT * 0x1000] =
-    [0; DISPATCH_SLAB_COUNT * 0x1000];
+static mut DISPATCH_SLABS: [u16; DISPATCH_SLAB_COUNT * 0x1000] = [0; DISPATCH_SLAB_COUNT * 0x1000];
 // Free stack of slab indices; filled 1..DISPATCH_SLAB_COUNT by rust_init.
 static mut DISPATCH_SLAB_FREE: [u16; DISPATCH_SLAB_COUNT] = [0; DISPATCH_SLAB_COUNT];
 static mut DISPATCH_SLAB_FREE_TOP: usize = 0;
@@ -1269,8 +1256,7 @@ fn allocate_chain_site_memo() -> Option<(u32, u32)> {
         let slot = CHAIN_SITE_MEMO_NEXT;
         CHAIN_SITE_MEMO_NEXT += 1;
         CHAIN_SITE_MEMOS[slot] = 0;
-        CHAIN_SITE_MEMO_HIGH_WATER =
-            CHAIN_SITE_MEMO_HIGH_WATER.max(CHAIN_SITE_MEMO_NEXT as u32);
+        CHAIN_SITE_MEMO_HIGH_WATER = CHAIN_SITE_MEMO_HIGH_WATER.max(CHAIN_SITE_MEMO_NEXT as u32);
         let address = std::ptr::addr_of!(CHAIN_SITE_MEMOS) as u32 + (slot as u32 * 8);
         Some((slot as u32, address))
     }
@@ -1434,7 +1420,14 @@ pub fn jit_miss_entry_top(rank: u32, field: u32) -> u32 {
             .collect();
         v.sort_unstable_by(|a, b| b.cmp(a));
         match v.get(rank as usize) {
-            Some(&(count, eip)) => if field == 0 { eip } else { count },
+            Some(&(count, eip)) => {
+                if field == 0 {
+                    eip
+                }
+                else {
+                    count
+                }
+            },
             None => 0,
         }
     }
@@ -1449,7 +1442,11 @@ static mut EXTERNAL_FIRST: bool = false;
 #[inline]
 pub fn external_first_enabled() -> bool { unsafe { EXTERNAL_FIRST } }
 #[no_mangle]
-pub fn jit_set_external_first(on: u32) { unsafe { EXTERNAL_FIRST = on != 0; } }
+pub fn jit_set_external_first(on: u32) {
+    unsafe {
+        EXTERNAL_FIRST = on != 0;
+    }
+}
 #[no_mangle]
 pub fn jit_get_external_first() -> u32 { unsafe { EXTERNAL_FIRST as u32 } }
 
@@ -1593,9 +1590,7 @@ pub fn fastmem_get_guard_base() -> u32 { FASTMEM_GUARD_BASE }
 pub fn fastmem_get_guard_size() -> u32 { FASTMEM_GUARD_SIZE }
 
 #[inline]
-pub fn fastmem_current_generation() -> u64 {
-    unsafe { *global_pointers::fastmem_generation }
-}
+pub fn fastmem_current_generation() -> u64 { unsafe { *global_pointers::fastmem_generation } }
 
 #[inline]
 pub fn fastmem_compile_generation(state_flags: CachedStateFlags) -> Option<u64> {
@@ -1641,9 +1636,7 @@ pub fn fastmem_writes_compile_enabled(state_flags: CachedStateFlags) -> bool {
 
 // Wasm-memory address of the write map, baked as a load base in the store fast path.
 #[inline]
-pub fn fastmem_write_map_base() -> u32 {
-    unsafe { &FASTMEM_WRITE_MAP[0] as *const u8 as u32 }
-}
+pub fn fastmem_write_map_base() -> u32 { unsafe { &FASTMEM_WRITE_MAP[0] as *const u8 as u32 } }
 
 #[inline]
 pub fn fastmem_note_speculated_store_compiled() {
@@ -1719,7 +1712,11 @@ pub fn fastmem_write_map_set_exclude(lo_page: u32, hi_page: u32) {
 #[no_mangle]
 pub fn fastmem_write_map_reset() {
     unsafe {
-        core::ptr::write_bytes(&raw mut FASTMEM_WRITE_MAP as *mut u8, 0, FASTMEM_WRITE_MAP_LEN);
+        core::ptr::write_bytes(
+            &raw mut FASTMEM_WRITE_MAP as *mut u8,
+            0,
+            FASTMEM_WRITE_MAP_LEN,
+        );
         FASTMEM_WRITE_MAP_MAX_PAGE = 0;
         FASTMEM_SPECULATED_STORES_COMPILED = 0;
     }
@@ -1799,23 +1796,19 @@ pub fn fastmem_get_speculated_stores_compiled() -> u32 {
 
 /// Highest VA page ever marked base-writable — upper bound for the audit scan.
 #[no_mangle]
-pub fn fastmem_write_map_max_page() -> u32 {
-    unsafe { FASTMEM_WRITE_MAP_MAX_PAGE }
-}
+pub fn fastmem_write_map_max_page() -> u32 { unsafe { FASTMEM_WRITE_MAP_MAX_PAGE } }
 
 #[inline]
 pub fn x87_locals_note_cache_load_site_compiled() {
     unsafe {
-        X87_LOCAL_CACHE_LOAD_SITES_COMPILED =
-            X87_LOCAL_CACHE_LOAD_SITES_COMPILED.saturating_add(1);
+        X87_LOCAL_CACHE_LOAD_SITES_COMPILED = X87_LOCAL_CACHE_LOAD_SITES_COMPILED.saturating_add(1);
     }
 }
 
 #[inline]
 pub fn x87_locals_note_cache_store_compiled() {
     unsafe {
-        X87_LOCAL_CACHE_STORES_COMPILED =
-            X87_LOCAL_CACHE_STORES_COMPILED.saturating_add(1);
+        X87_LOCAL_CACHE_STORES_COMPILED = X87_LOCAL_CACHE_STORES_COMPILED.saturating_add(1);
     }
 }
 
@@ -1837,16 +1830,14 @@ pub fn push_run_note_site_compiled() {
 #[inline]
 pub fn push_run_note_reuse_branch_compiled() {
     unsafe {
-        PUSH_RUN_REUSE_BRANCHES_COMPILED =
-            PUSH_RUN_REUSE_BRANCHES_COMPILED.saturating_add(1);
+        PUSH_RUN_REUSE_BRANCHES_COMPILED = PUSH_RUN_REUSE_BRANCHES_COMPILED.saturating_add(1);
     }
 }
 
 #[inline]
 pub fn fastmem_note_speculated_load_compiled() {
     unsafe {
-        FASTMEM_SPECULATED_LOADS_COMPILED =
-            FASTMEM_SPECULATED_LOADS_COMPILED.saturating_add(1);
+        FASTMEM_SPECULATED_LOADS_COMPILED = FASTMEM_SPECULATED_LOADS_COMPILED.saturating_add(1);
     }
 }
 
@@ -1919,12 +1910,14 @@ pub fn x87_locals_get_cache_invalidates_compiled() -> u32 {
 pub fn push_run_get_sites_compiled() -> u32 { unsafe { PUSH_RUN_SITES_COMPILED } }
 
 #[no_mangle]
-pub fn push_run_get_reuse_branches_compiled() -> u32 {
-    unsafe { PUSH_RUN_REUSE_BRANCHES_COMPILED }
-}
+pub fn push_run_get_reuse_branches_compiled() -> u32 { unsafe { PUSH_RUN_REUSE_BRANCHES_COMPILED } }
 
 #[no_mangle]
-pub fn set_dispatch_stats(enabled: u32) { unsafe { DISPATCH_STATS = enabled != 0; } }
+pub fn set_dispatch_stats(enabled: u32) {
+    unsafe {
+        DISPATCH_STATS = enabled != 0;
+    }
+}
 
 #[no_mangle]
 pub fn get_dispatch_stats() -> u32 { unsafe { DISPATCH_STATS as u32 } }
@@ -2558,9 +2551,7 @@ pub struct Push32WriteCache {
     pub valid: WasmLocal,
 }
 
-pub fn rep_movs_reduced_spill_enabled() -> bool {
-    unsafe { JIT_REP_MOVS_REDUCED_SPILL }
-}
+pub fn rep_movs_reduced_spill_enabled() -> bool { unsafe { JIT_REP_MOVS_REDUCED_SPILL } }
 
 impl<'a> JitContext<'a> {
     pub fn reg(&self, i: u32) -> WasmLocal {
@@ -2626,9 +2617,7 @@ fn decode_jit_opcode(addr: u32) -> (u32, u32) {
     }
 }
 
-fn group_alu_is_full_overwrite(group: u8) -> bool {
-    matches!(group, 0 | 1 | 4 | 5 | 6 | 7)
-}
+fn group_alu_is_full_overwrite(group: u8) -> bool { matches!(group, 0 | 1 | 4 | 5 | 6 | 7) }
 
 fn classify_flag_class(addr: u32) -> FlagClass {
     let (opcode, operand_addr) = decode_jit_opcode(addr);
@@ -2640,18 +2629,28 @@ fn classify_flag_class(addr: u32) -> FlagClass {
     match opcode {
         // --- Full flag overwriters: ADD/OR/AND/SUB/XOR/CMP r/m<->reg, TEST r/m,reg ---
         // Register-only forms can't fault before overwriting flags; memory forms can.
-        0x00..=0x03 | 0x08..=0x0B | 0x20..=0x23 | 0x28..=0x2B | 0x30..=0x33
-        | 0x38..=0x3B | 0x84 | 0x85 => FlagClass::Overwrite { non_faulting: reg_only },
+        0x00..=0x03
+        | 0x08..=0x0B
+        | 0x20..=0x23
+        | 0x28..=0x2B
+        | 0x30..=0x33
+        | 0x38..=0x3B
+        | 0x84
+        | 0x85 => FlagClass::Overwrite {
+            non_faulting: reg_only,
+        },
 
         // Accumulator-immediate ALU/TEST (no ModRM, no memory) — always non-faulting.
-        0x04 | 0x05 | 0x0C | 0x0D | 0x24 | 0x25 | 0x2C | 0x2D | 0x34 | 0x35
-        | 0x3C | 0x3D | 0xA8 | 0xA9 => FlagClass::Overwrite { non_faulting: true },
+        0x04 | 0x05 | 0x0C | 0x0D | 0x24 | 0x25 | 0x2C | 0x2D | 0x34 | 0x35 | 0x3C | 0x3D
+        | 0xA8 | 0xA9 => FlagClass::Overwrite { non_faulting: true },
 
         // Group 1 ALU immediates: /0 ADD /1 OR /4 AND /5 SUB /6 XOR /7 CMP overwrite;
         // /2 ADC /3 SBB read CF → Stop.
         0x80 | 0x81 | 0x82 | 0x83 => {
             if group_alu_is_full_overwrite((modrm >> 3) & 7) {
-                FlagClass::Overwrite { non_faulting: reg_only }
+                FlagClass::Overwrite {
+                    non_faulting: reg_only,
+                }
             }
             else {
                 FlagClass::Stop
@@ -2662,7 +2661,9 @@ fn classify_flag_class(addr: u32) -> FlagClass {
         // (NEG/MUL/IMUL/DIV/IDIV) set them in special ways → Stop for everything but /0.
         0xF6 | 0xF7 => {
             if (modrm >> 3) & 7 == 0 {
-                FlagClass::Overwrite { non_faulting: reg_only }
+                FlagClass::Overwrite {
+                    non_faulting: reg_only,
+                }
             }
             else {
                 FlagClass::Stop
@@ -2670,12 +2671,33 @@ fn classify_flag_class(addr: u32) -> FlagClass {
         },
 
         // --- Flag-neutral, non-faulting (register-only forms only; memory forms can #PF) ---
-        0x88 | 0x89 | 0x8A | 0x8B => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::NeutralMayFault }, // MOV r/m<->reg
-        0x8D => FlagClass::NeutralNoFault,                                                               // LEA (no deref, no flags)
-        0xB0..=0xBF => FlagClass::NeutralNoFault,                                                        // MOV reg, imm
-        0xC6 | 0xC7 => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::NeutralMayFault },               // MOV r/m, imm
-        0x90 => FlagClass::NeutralNoFault,                                                               // NOP
-        0x1B6 | 0x1B7 | 0x1BE | 0x1BF => if reg_only { FlagClass::NeutralNoFault } else { FlagClass::NeutralMayFault }, // MOVZX/MOVSX
+        0x88 | 0x89 | 0x8A | 0x8B => {
+            if reg_only {
+                FlagClass::NeutralNoFault
+            }
+            else {
+                FlagClass::NeutralMayFault
+            }
+        }, // MOV r/m<->reg
+        0x8D => FlagClass::NeutralNoFault, // LEA (no deref, no flags)
+        0xB0..=0xBF => FlagClass::NeutralNoFault, // MOV reg, imm
+        0xC6 | 0xC7 => {
+            if reg_only {
+                FlagClass::NeutralNoFault
+            }
+            else {
+                FlagClass::NeutralMayFault
+            }
+        }, // MOV r/m, imm
+        0x90 => FlagClass::NeutralNoFault, // NOP
+        0x1B6 | 0x1B7 | 0x1BE | 0x1BF => {
+            if reg_only {
+                FlagClass::NeutralNoFault
+            }
+            else {
+                FlagClass::NeutralMayFault
+            }
+        }, // MOVZX/MOVSX
 
         _ => FlagClass::Stop,
     }
@@ -2727,7 +2749,9 @@ fn flags_dead_from_addr(
                 profiler::stat_increment_always(stat::DEAD_FLAG_ELIDED);
                 return true;
             },
-            FlagClass::Overwrite { non_faulting: false } => {
+            FlagClass::Overwrite {
+                non_faulting: false,
+            } => {
                 if !dead_flag_elision_across_faults() {
                     return false;
                 }
@@ -2756,7 +2780,10 @@ fn flags_dead_from_addr(
     }
 
     match &block.ty {
-        BasicBlockType::Normal { next_block_addr: Some(next), .. } => match basic_blocks.get(next) {
+        BasicBlockType::Normal {
+            next_block_addr: Some(next),
+            ..
+        } => match basic_blocks.get(next) {
             Some(next_block) => {
                 flags_dead_from_addr(cpu, origin_addr, *next, next_block, basic_blocks, steps)
             },
@@ -2797,7 +2824,10 @@ fn should_elide_current_flags(
     }
     // The current instruction must itself fully overwrite the flags — only then is there a flag
     // computation to skip (the elision-aware emitters fire on these opcodes).
-    if !matches!(classify_flag_class(current_addr), FlagClass::Overwrite { .. }) {
+    if !matches!(
+        classify_flag_class(current_addr),
+        FlagClass::Overwrite { .. }
+    ) {
         return false;
     }
     profiler::stat_increment_always(stat::DEAD_FLAG_ELISION_CANDIDATE);
@@ -2909,16 +2939,10 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     // The park signal, not the urgent-exit signal: a parked thread's return
     // address is the spin loop, so refusing that one target is the whole
     // invariant. Everything else stays bounded by the slice's real budget.
-    let limit = if park_guard {
-        cpu::jit_slice_limit
-    }
-    else {
-        hypercall::read_cycle_limit()
-    };
+    let limit = if park_guard { cpu::jit_slice_limit } else { hypercall::read_cycle_limit() };
     let elapsed = (*global_pointers::instruction_counter)
         .wrapping_sub(cpu::jit_cycle_start_instruction_counter);
-    let parked = park_guard
-        && hypercall::eip_at_park(*global_pointers::instruction_pointer as u32);
+    let parked = park_guard && hypercall::eip_at_park(*global_pointers::instruction_pointer as u32);
 
     if limit == 0 || elapsed >= limit || *global_pointers::in_hlt || parked {
         if dispatch_stats_enabled() {
@@ -2962,8 +2986,7 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     {
         if dispatch_stats_enabled() {
             profiler::stat_increment_always(stat::RET_CHAIN_HIT);
-            DYNAMIC_CHAIN_RESOLVE_MEMO_HITS =
-                DYNAMIC_CHAIN_RESOLVE_MEMO_HITS.saturating_add(1);
+            DYNAMIC_CHAIN_RESOLVE_MEMO_HITS = DYNAMIC_CHAIN_RESOLVE_MEMO_HITS.saturating_add(1);
         }
         return cached.2;
     }
@@ -2982,12 +3005,10 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
         if unit_state != u16::MAX {
             if dispatch_stats_enabled() {
                 profiler::stat_increment_always(stat::RET_CHAIN_HIT);
-                DYNAMIC_CHAIN_RESOLVE_META_HITS =
-                    DYNAMIC_CHAIN_RESOLVE_META_HITS.saturating_add(1);
+                DYNAMIC_CHAIN_RESOLVE_META_HITS = DYNAMIC_CHAIN_RESOLVE_META_HITS.saturating_add(1);
             }
 
-            let table_slot =
-                dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
+            let table_slot = dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
             let packed = table_slot << 16 | unit_state as i32;
             RET_CACHE[cache_idx] = (virt_address, raw_state_flags, packed, RET_CACHE_EPOCH);
             return packed;
@@ -3022,10 +3043,9 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining_site(
 ) -> i32 {
     let slot = memo_slot as usize;
     let diag = JIT_DYNAMIC_CHAIN_SITE_PIC_DIAG && slot < DYNAMIC_CHAIN_SITE_PIC_COUNT;
-    let track_second = (diag
-        || JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY
-        || JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY)
-        && slot < DYNAMIC_CHAIN_SITE_PIC_COUNT;
+    let track_second =
+        (diag || JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY || JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY)
+            && slot < DYNAMIC_CHAIN_SITE_PIC_COUNT;
     let virt_address = *global_pointers::instruction_pointer as u32;
     let epoch = RET_CACHE_EPOCH as u32;
     let mut previous_target = 0;
@@ -3222,8 +3242,7 @@ pub fn jit_dynamic_chain_site_pic_diag_resolver_hits() -> u64 {
 fn allocate_dynamic_chain_site_pic() -> Option<u32> {
     unsafe {
         if DYNAMIC_CHAIN_SITE_PIC_NEXT >= DYNAMIC_CHAIN_SITE_PIC_COUNT {
-            DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS =
-                DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS.saturating_add(1);
+            DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS = DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS.saturating_add(1);
             return None;
         }
         let slot = DYNAMIC_CHAIN_SITE_PIC_NEXT;
@@ -3247,9 +3266,7 @@ fn allocate_dynamic_chain_site_pic() -> Option<u32> {
 }
 
 #[no_mangle]
-pub fn jit_dynamic_chain_site_pic_compiled() -> u32 {
-    unsafe { DYNAMIC_CHAIN_SITE_PIC_COMPILED }
-}
+pub fn jit_dynamic_chain_site_pic_compiled() -> u32 { unsafe { DYNAMIC_CHAIN_SITE_PIC_COMPILED } }
 
 #[no_mangle]
 pub fn jit_dynamic_chain_site_pic_high_water() -> u32 {
@@ -3257,9 +3274,7 @@ pub fn jit_dynamic_chain_site_pic_high_water() -> u32 {
 }
 
 #[no_mangle]
-pub fn jit_dynamic_chain_site_pic_overflows() -> u32 {
-    unsafe { DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS }
-}
+pub fn jit_dynamic_chain_site_pic_overflows() -> u32 { unsafe { DYNAMIC_CHAIN_SITE_PIC_OVERFLOWS } }
 
 fn jit_find_basic_blocks(
     ctx: &mut JitState,
@@ -3281,7 +3296,10 @@ fn jit_find_basic_blocks(
         if !is_near_end_of_page(phys_target) {
             return true;
         }
-        let mut probe = CpuContext { eip: phys_target, ..template.clone() };
+        let mut probe = CpuContext {
+            eip: phys_target,
+            ..template.clone()
+        };
         let analysis = analysis::analyze_step(&mut probe);
         let end = probe.eip;
         if Page::page_of(end) == Page::page_of(phys_target) {
@@ -3359,8 +3377,11 @@ fn jit_find_basic_blocks(
 
         if !pages.contains(&phys_page) {
             // page seen for the first time, handle entry points
-            if let Some(PageHotness { hotness, entry_points, .. }) =
-                ctx.entry_points.get_mut(&phys_page)
+            if let Some(PageHotness {
+                hotness,
+                entry_points,
+                ..
+            }) = ctx.entry_points.get_mut(&phys_page)
             {
                 let existing_entry_points = match ctx.pages.get(&phys_page) {
                     Some(PageInfo { entry_points, .. }) => {
@@ -3430,14 +3451,22 @@ fn jit_find_basic_blocks(
     // below the global-MAX_PAGES=48 setting that OOM'd V8.
     let max_pages = if let Some(region) = tier2_region {
         region.pages.len() as u32
-    } else if cpu.state_flags.is_32() {
+    }
+    else if cpu.state_flags.is_32() {
         let base = if unsafe { JIT_INDIRECT_REGIONS } {
             unsafe { MAX_PAGES.max(JIT_INDIRECT_REGION_MAX_PAGES) }
-        } else {
+        }
+        else {
             unsafe { MAX_PAGES }
         };
-        if tier2 { base.max(unsafe { TIER2_MAX_PAGES }) } else { base }
-    } else {
+        if tier2 {
+            base.max(unsafe { TIER2_MAX_PAGES })
+        }
+        else {
+            base
+        }
+    }
+    else {
         1
     };
 
@@ -3511,11 +3540,10 @@ fn jit_find_basic_blocks(
                 Page::page_of(current_address) != Page::page_of(addr_before_instruction);
             let mut crossed_page_virt_target = None;
             if crossed_page {
-                let virt_instruction = (to_visit as u32 & !0xFFF)
-                    | (addr_before_instruction & 0xFFF);
-                let virt_after = virt_instruction.wrapping_add(
-                    current_address.wrapping_sub(addr_before_instruction),
-                );
+                let virt_instruction =
+                    (to_visit as u32 & !0xFFF) | (addr_before_instruction & 0xFFF);
+                let virt_after = virt_instruction
+                    .wrapping_add(current_address.wrapping_sub(addr_before_instruction));
                 let next_phys_page = Page::page_of(current_address);
                 let mapping_is_contiguous = unsafe { JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS }
                     && matches!(analysis.ty, AnalysisType::Normal)
@@ -3529,9 +3557,7 @@ fn jit_find_basic_blocks(
                 crossed_page_virt_target = Some(virt_after as i32);
             }
 
-            dbg_assert!(
-                !crossed_page || unsafe { JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS }
-            );
+            dbg_assert!(!crossed_page || unsafe { JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS });
             let current_virt_addr = to_visit & !0xFFF | current_address as i32 & 0xFFF;
 
             if analysis.ty == AnalysisType::STI && is_near_end_of_page(current_address) {
@@ -3603,7 +3629,10 @@ fn jit_find_basic_blocks(
                         // handle_irqs may be called)
 
                         if basic_blocks.contains_key(&current_address) {
-                            dbg_assert!(!is_near_end_of_page(current_address) || page_tail_entries_enabled());
+                            dbg_assert!(
+                                !is_near_end_of_page(current_address)
+                                    || page_tail_entries_enabled()
+                            );
                             current_block.ty = BasicBlockType::Normal {
                                 next_block_addr: Some(current_address),
                                 jump_offset: 0,
@@ -3751,19 +3780,19 @@ fn jit_find_basic_blocks(
                                 // its page (hot indirect targets are, via the
                                 // module-exit hotness path). Conservative: an
                                 // unregistered target just doesn't grow the region.
-                                let registered = cpu::translate_address_read_no_side_effects(
-                                    target as i32,
-                                )
-                                .ok()
-                                .map_or(false, |phys| {
-                                    ctx.entry_points
-                                        .get(&Page::page_of(phys))
-                                        .map_or(false, |page_hotness| {
-                                            page_hotness
-                                                .entry_points
-                                                .contains(&(phys as u16 & 0xFFF))
-                                        })
-                                });
+                                let registered =
+                                    cpu::translate_address_read_no_side_effects(target as i32)
+                                        .ok()
+                                        .map_or(false, |phys| {
+                                            ctx.entry_points.get(&Page::page_of(phys)).map_or(
+                                                false,
+                                                |page_hotness| {
+                                                    page_hotness
+                                                        .entry_points
+                                                        .contains(&(phys as u16 & 0xFFF))
+                                                },
+                                            )
+                                        });
                                 if !registered {
                                     continue;
                                 }
@@ -3810,9 +3839,8 @@ fn jit_find_basic_blocks(
                 },
             }
 
-            if !unsafe {
-                JIT_EXACT_PAGE_TAIL || JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS
-            } && is_near_end_of_page(current_address)
+            if !unsafe { JIT_EXACT_PAGE_TAIL || JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS }
+                && is_near_end_of_page(current_address)
             {
                 profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
                 break;
@@ -3892,14 +3920,19 @@ fn jit_find_basic_blocks(
                 continue;
             }
             let target = match block.ty {
-                BasicBlockType::Normal { next_block_addr: Some(target), .. }
-                    if target != block.end_addr => target,
+                BasicBlockType::Normal {
+                    next_block_addr: Some(target),
+                    ..
+                } if target != block.end_addr => target,
                 _ => continue,
             };
             if !basic_blocks.contains_key(&block.end_addr) {
                 continue;
             }
-            let Some(callee) = basic_blocks.get(&target) else { continue };
+            let Some(callee) = basic_blocks.get(&target)
+            else {
+                continue;
+            };
             if callee.number_of_instructions > unsafe { LEAF_CALL_FUSION_MAX_INSTR }
                 || callee.has_sti
                 || callee.ty != BasicBlockType::AbsoluteEip
@@ -3932,12 +3965,15 @@ fn jit_find_basic_blocks(
     // dispatch. A page dirtied under this module frees the whole module (multi-page
     // sweep in free_wasm_module), annotations included — no new SMC surface.
     if ret_speculation_enabled() {
-        let fall_through_virt =
-            |b: &BasicBlock| b.virt_addr & !0xFFF | b.end_addr as i32 & 0xFFF;
+        let fall_through_virt = |b: &BasicBlock| b.virt_addr & !0xFFF | b.end_addr as i32 & 0xFFF;
 
         let mut call_sites: Vec<(u32, i32, u32)> = Vec::new();
         for block in basic_blocks.values() {
-            if let BasicBlockType::Normal { next_block_addr: Some(target), .. } = block.ty {
+            if let BasicBlockType::Normal {
+                next_block_addr: Some(target),
+                ..
+            } = block.ty
+            {
                 if target != block.end_addr
                     && marked_as_entry.contains(&fall_through_virt(block))
                     && basic_blocks.contains_key(&block.end_addr)
@@ -3952,7 +3988,12 @@ fn jit_find_basic_blocks(
             let mut visited: HashSet<u32> = HashSet::new();
             let mut stack = vec![callee];
             let mut instr_budget = unsafe {
-                if tier2 { JIT_TIER2_RET_SPEC_MAX_INSTR } else { JIT_RET_SPEC_MAX_INSTR }
+                if tier2 {
+                    JIT_TIER2_RET_SPEC_MAX_INSTR
+                }
+                else {
+                    JIT_RET_SPEC_MAX_INSTR
+                }
             };
             let mut rets: Vec<u32> = Vec::new();
             let mut ok = true;
@@ -3989,7 +4030,10 @@ fn jit_find_basic_blocks(
                             break;
                         }
                     },
-                    BasicBlockType::Normal { next_block_addr: Some(t), .. } => {
+                    BasicBlockType::Normal {
+                        next_block_addr: Some(t),
+                        ..
+                    } => {
                         // A nested call returns INTO the callee, not to our site —
                         // its RETs must not be annotated with our return address.
                         if *t != b.end_addr && marked_as_entry.contains(&fall_through_virt(b)) {
@@ -3998,7 +4042,10 @@ fn jit_find_basic_blocks(
                         }
                         stack.push(*t);
                     },
-                    BasicBlockType::Normal { next_block_addr: None, .. }
+                    BasicBlockType::Normal {
+                        next_block_addr: None,
+                        ..
+                    }
                     | BasicBlockType::Exit => {
                         ok = false;
                         break;
@@ -4007,17 +4054,15 @@ fn jit_find_basic_blocks(
                         next_block_addr,
                         next_block_branch_taken_addr,
                         ..
-                    } => {
-                        match (next_block_addr, next_block_branch_taken_addr) {
-                            (Some(n), Some(t)) => {
-                                stack.push(*n);
-                                stack.push(*t);
-                            },
-                            _ => {
-                                ok = false;
-                                break;
-                            },
-                        }
+                    } => match (next_block_addr, next_block_branch_taken_addr) {
+                        (Some(n), Some(t)) => {
+                            stack.push(*n);
+                            stack.push(*t);
+                        },
+                        _ => {
+                            ok = false;
+                            break;
+                        },
                     },
                 }
             }
@@ -4089,7 +4134,13 @@ fn jit_analyze_and_generate(
     state_flags: CachedStateFlags,
 ) {
     let t0 = unsafe { cpu::js::microtick() };
-    jit_analyze_and_generate_untimed(ctx, virt_entry_point, phys_entry_point, cs_offset, state_flags);
+    jit_analyze_and_generate_untimed(
+        ctx,
+        virt_entry_point,
+        phys_entry_point,
+        cs_offset,
+        state_flags,
+    );
     let us = (unsafe { cpu::js::microtick() } - t0) * 1000.0;
     unsafe {
         JIT_CODEGEN_TOTAL_US += us;
@@ -4161,8 +4212,7 @@ fn jit_analyze_and_generate_untimed(
     if let Some(region) = &tier2_region {
         entry_points.extend(region.seeds.iter().copied());
     }
-    let basic_blocks =
-        jit_find_basic_blocks(ctx, entry_points, cpu.clone(), tier2_region.as_ref());
+    let basic_blocks = jit_find_basic_blocks(ctx, entry_points, cpu.clone(), tier2_region.as_ref());
 
     // A block whose Normal/ConditionalJump terminator carries Some(successor) that is
     // not itself a block in this module would make jit_generate_module's index_for_addr /
@@ -4178,7 +4228,9 @@ fn jit_analyze_and_generate_untimed(
         let known: HashSet<u32> = basic_blocks.iter().map(|b| b.addr).collect();
         let has_orphan_successor = basic_blocks.iter().any(|b| {
             let (a, c) = match b.ty {
-                BasicBlockType::Normal { next_block_addr, .. } => (next_block_addr, None),
+                BasicBlockType::Normal {
+                    next_block_addr, ..
+                } => (next_block_addr, None),
                 BasicBlockType::ConditionalJump {
                     next_block_addr,
                     next_block_branch_taken_addr,
@@ -4393,9 +4445,10 @@ fn jit_analyze_and_generate_untimed(
 
     for &p in &pages {
         ctx.deferred_compile_pages.remove(&p);
-        ctx.entry_points
-            .entry(p)
-            .or_insert_with(|| PageHotness { hotness: 0, entry_points: HashSet::new() });
+        ctx.entry_points.entry(p).or_insert_with(|| PageHotness {
+            hotness: 0,
+            entry_points: HashSet::new(),
+        });
     }
 
     cpu::tlb_set_has_code_multiple(&pages, true);
@@ -4439,7 +4492,10 @@ fn drain_deferred_compiles(ctx: &mut JitState) {
 
     let max_pending = unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize };
     while ctx.compiling.len() < max_pending {
-        let Some(candidate) = ctx.deferred_compiles.pop_front() else { break };
+        let Some(candidate) = ctx.deferred_compiles.pop_front()
+        else {
+            break;
+        };
 
         // Dirty-page invalidation and cache clears lazily cancel a candidate by
         // removing it from this set; its small FIFO record can then be skipped.
@@ -4584,8 +4640,15 @@ pub fn update_tlb_code(virt_page: Page, phys_page: Page) {
         },
     };
     match ctx.external_pages.get(&phys_page) {
-        Some(info) => dispatch_ext_set(virt_page, info.wasm_table_index, &info.entry_points, info.state_flags),
-        None => { dispatch_ext_clear(virt_page.to_u32()); },
+        Some(info) => dispatch_ext_set(
+            virt_page,
+            info.wasm_table_index,
+            &info.entry_points,
+            info.state_flags,
+        ),
+        None => {
+            dispatch_ext_clear(virt_page.to_u32());
+        },
     };
 }
 
@@ -4643,7 +4706,8 @@ fn gen_chain_or_exit_to_known_successor(
         ctx.builder.const_i32(-1);
         ctx.builder.eq_i32();
         ctx.builder.if_i32();
-        ctx.builder.load_fixed_i32(std::ptr::addr_of!(EXACT_DISPATCH_PUBLISH_EPOCH) as u32);
+        ctx.builder
+            .load_fixed_i32(std::ptr::addr_of!(EXACT_DISPATCH_PUBLISH_EPOCH) as u32);
         ctx.builder.get_local_i64(&memo);
         ctx.builder.const_i64(32);
         ctx.builder.shr_u_i64();
@@ -4665,7 +4729,8 @@ fn gen_chain_or_exit_to_known_successor(
         ctx.builder.get_local_i64(&memo);
         ctx.builder.const_i64(0);
         ctx.builder.ne_i64();
-        ctx.builder.load_fixed_i32(std::ptr::addr_of!(CHAIN_TARGET_EPOCH) as u32);
+        ctx.builder
+            .load_fixed_i32(std::ptr::addr_of!(CHAIN_TARGET_EPOCH) as u32);
         ctx.builder.get_local_i64(&memo);
         ctx.builder.const_i64(32);
         ctx.builder.shr_u_i64();
@@ -4709,12 +4774,12 @@ fn gen_chain_or_exit_to_known_successor(
     ctx.builder.get_local(&cycle_limit);
     ctx.builder.const_i32(0);
     ctx.builder.ne_i32();
-    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder
+        .load_fixed_i32(global_pointers::instruction_counter as u32);
     ctx.builder.get_local(&ctx.instruction_counter);
     ctx.builder.add_i32();
-    ctx.builder.load_fixed_i32(
-        std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32,
-    );
+    ctx.builder
+        .load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32);
     ctx.builder.sub_i32();
     ctx.builder.get_local(&cycle_limit);
     ctx.builder.ltu_i32();
@@ -4799,8 +4864,7 @@ fn gen_find_cache_entry_in_page_inline(
     // Comparing meta>>16 checks state_flags and table_index together while
     // intentionally ignoring the low slab index. A zero/unpublished meta cannot
     // match because wasm table slot zero is never assigned to generated code.
-    let expected = ((state_flags.to_u32() as u64) << 16)
-        | wasm_table_index.to_u16() as u64;
+    let expected = ((state_flags.to_u32() as u64) << 16) | wasm_table_index.to_u16() as u64;
     ctx.builder.get_local_i64(&meta);
     ctx.builder.const_i64(16);
     ctx.builder.shr_u_i64();
@@ -4856,14 +4920,12 @@ fn gen_find_cache_entry_in_page_inline(
 /// per-site target avoids the generated-module -> base-wasm resolver call while
 /// a miss retains the complete legacy lookup and refreshes the cache. This runs
 /// after guest registers/instruction count have already been flushed.
-fn gen_dynamic_chain_site_pic_lookup(
-    ctx: &mut JitContext,
-    state_flags: CachedStateFlags,
-) {
+fn gen_dynamic_chain_site_pic_lookup(ctx: &mut JitContext, state_flags: CachedStateFlags) {
     let Some(slot) = allocate_dynamic_chain_site_pic()
     else {
         ctx.builder.const_i32(state_flags.to_u32() as i32);
-        ctx.builder.call_fn1_ret("jit_find_cache_entry_for_dynamic_chaining");
+        ctx.builder
+            .call_fn1_ret("jit_find_cache_entry_for_dynamic_chaining");
         return;
     };
     let slot_offset = slot * 4;
@@ -4895,7 +4957,8 @@ fn gen_dynamic_chain_site_pic_lookup(
     // A memo is usable only while its dispatch epoch is current and its last
     // target equals this site's runtime target.
     ctx.builder.load_fixed_i32(epoch_address);
-    ctx.builder.load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder
+        .load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
     ctx.builder.wrap_i64_to_i32();
     ctx.builder.eq_i32();
     ctx.builder.load_fixed_i32(target_address);
@@ -4917,10 +4980,10 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx.builder.const_i32(0);
     ctx.builder.ne_i32();
     ctx.builder.and_i32();
-    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
-    ctx.builder.load_fixed_i32(
-        std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32,
-    );
+    ctx.builder
+        .load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder
+        .load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32);
     ctx.builder.sub_i32();
     ctx.builder.get_local(&cycle_limit);
     ctx.builder.ltu_i32();
@@ -4939,10 +5002,10 @@ fn gen_dynamic_chain_site_pic_lookup(
     let miss_cycle_limit = ctx.builder.tee_new_local();
     ctx.builder.const_i32(0);
     ctx.builder.ne_i32();
-    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
-    ctx.builder.load_fixed_i32(
-        std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32,
-    );
+    ctx.builder
+        .load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder
+        .load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32);
     ctx.builder.sub_i32();
     ctx.builder.get_local(&miss_cycle_limit);
     ctx.builder.ltu_i32();
@@ -4970,11 +5033,11 @@ fn gen_dynamic_chain_site_pic_lookup(
     // The primary-hit instruction stream above is identical whether this
     // option is enabled or not. Only its already-cold miss arm consults the
     // second target, so monomorphic sites pay no extra branch or memory load.
-    ctx.builder.load_fixed_u8(
-        std::ptr::addr_of!(JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY) as u32,
-    );
+    ctx.builder
+        .load_fixed_u8(std::ptr::addr_of!(JIT_DYNAMIC_CHAIN_SITE_PIC_SECOND_WAY) as u32);
     ctx.builder.load_fixed_i32(second_epoch_address);
-    ctx.builder.load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder
+        .load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
     ctx.builder.wrap_i64_to_i32();
     ctx.builder.eq_i32();
     ctx.builder.and_i32();
@@ -4988,11 +5051,11 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx.builder.load_fixed_i32(second_packed_address);
     ctx.builder.else_();
 
-    ctx.builder.load_fixed_u8(
-        std::ptr::addr_of!(JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY) as u32,
-    );
+    ctx.builder
+        .load_fixed_u8(std::ptr::addr_of!(JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY) as u32);
     ctx.builder.load_fixed_i32(third_epoch_address);
-    ctx.builder.load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder
+        .load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
     ctx.builder.wrap_i64_to_i32();
     ctx.builder.eq_i32();
     ctx.builder.and_i32();
@@ -5006,11 +5069,11 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx.builder.load_fixed_i32(third_packed_address);
     ctx.builder.else_();
 
-    ctx.builder.load_fixed_u8(
-        std::ptr::addr_of!(JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY) as u32,
-    );
+    ctx.builder
+        .load_fixed_u8(std::ptr::addr_of!(JIT_DYNAMIC_CHAIN_SITE_PIC_FOUR_WAY) as u32);
     ctx.builder.load_fixed_i32(fourth_epoch_address);
-    ctx.builder.load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder
+        .load_fixed_i64(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
     ctx.builder.wrap_i64_to_i32();
     ctx.builder.eq_i32();
     ctx.builder.and_i32();
@@ -5043,8 +5106,7 @@ fn gen_dynamic_chain_site_pic_lookup(
     ctx.builder.free_local(cycle_limit);
     ctx.builder.free_local(virt_address);
     unsafe {
-        DYNAMIC_CHAIN_SITE_PIC_COMPILED =
-            DYNAMIC_CHAIN_SITE_PIC_COMPILED.saturating_add(1);
+        DYNAMIC_CHAIN_SITE_PIC_COMPILED = DYNAMIC_CHAIN_SITE_PIC_COMPILED.saturating_add(1);
     }
 }
 
@@ -5240,8 +5302,7 @@ fn jit_generate_module(
                     // Normal returns take the zero-dispatch direct continuation.
                     // A callee that deliberately changed [esp] still gets the
                     // ordinary AbsoluteEip lookup and module-exit semantics.
-                    let return_virt = block.virt_addr & !0xFFF
-                        | block.end_addr as i32 & 0xFFF;
+                    let return_virt = block.virt_addr & !0xFFF | block.end_addr as i32 & 0xFFF;
                     if let Some(local) = return_eip_local.as_ref() {
                         ctx.builder.get_local(local);
                     }
@@ -5261,17 +5322,12 @@ fn jit_generate_module(
                     // unusual mismatching return reaches this store.
                     if let Some(local) = return_eip_local.as_ref() {
                         ctx.builder.get_local(local);
-                        ctx.builder.store_aligned_i32(
-                            global_pointers::instruction_pointer as u32,
-                        );
+                        ctx.builder
+                            .store_aligned_i32(global_pointers::instruction_pointer as u32);
                     }
 
                     if unsafe { JIT_INLINE_INTRA_MODULE_DISPATCH } {
-                        gen_find_cache_entry_in_page_inline(
-                            ctx,
-                            wasm_table_index,
-                            state_flags,
-                        );
+                        gen_find_cache_entry_in_page_inline(ctx, wasm_table_index, state_flags);
                     }
                     else {
                         codegen::gen_get_eip(ctx.builder);
@@ -5354,8 +5410,8 @@ fn jit_generate_module(
                                     // The boundary helper may have parked/switched the
                                     // thread or delivered an interrupt. Continue only
                                     // when its architectural fallthrough is untouched.
-                                    let next_virt = block.virt_addr & !0xFFF
-                                        | next_block_addr as i32 & 0xFFF;
+                                    let next_virt =
+                                        block.virt_addr & !0xFFF | next_block_addr as i32 & 0xFFF;
                                     codegen::gen_get_eip(ctx.builder);
                                     ctx.builder.const_i32(next_virt);
                                     ctx.builder.eq_i32();
@@ -5364,9 +5420,10 @@ fn jit_generate_module(
                                     // CAN lower the live cycle limit. Read the shared
                                     // page rather than jit_cycle_limit_cached, then
                                     // account for this module's pending instructions.
-                                    ctx.builder.load_fixed_i32(
-                                        std::ptr::addr_of!(hypercall::HYPERCALL_PAGE) as u32,
-                                    );
+                                    ctx.builder.load_fixed_i32(std::ptr::addr_of!(
+                                        hypercall::HYPERCALL_PAGE
+                                    )
+                                        as u32);
                                     let live_limit = ctx.builder.tee_new_local();
                                     ctx.builder.const_i32(0);
                                     ctx.builder.ne_i32();
@@ -5376,10 +5433,10 @@ fn jit_generate_module(
                                     );
                                     ctx.builder.get_local(&ctx.instruction_counter);
                                     ctx.builder.add_i32();
-                                    ctx.builder.load_fixed_i32(
-                                        std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter)
-                                            as u32,
-                                    );
+                                    ctx.builder.load_fixed_i32(std::ptr::addr_of!(
+                                        cpu::jit_cycle_start_instruction_counter
+                                    )
+                                        as u32);
                                     ctx.builder.sub_i32();
                                     ctx.builder.get_local(&live_limit);
                                     ctx.builder.ltu_i32();
@@ -5409,7 +5466,10 @@ fn jit_generate_module(
                         codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
                         // Terminating instruction set eip at runtime (ret/int/iret/far jmp)
-                        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_DYNAMIC);
+                        codegen::gen_dispatch_stat_increment(
+                            ctx.builder,
+                            stat::MODULE_EXIT_DYNAMIC,
+                        );
                         ctx.builder.br(ctx.exit_label);
                     },
                     BasicBlockType::AbsoluteEip => {
@@ -5445,11 +5505,7 @@ fn jit_generate_module(
 
                         // Check if we can stay in this module, if not exit
                         if unsafe { JIT_INLINE_INTRA_MODULE_DISPATCH } {
-                            gen_find_cache_entry_in_page_inline(
-                                ctx,
-                                wasm_table_index,
-                                state_flags,
-                            );
+                            gen_find_cache_entry_in_page_inline(ctx, wasm_table_index, state_flags);
                         }
                         else {
                             codegen::gen_get_eip(ctx.builder);
@@ -5487,9 +5543,8 @@ fn jit_generate_module(
                             }
                             else {
                                 ctx.builder.const_i32(state_flags.to_u32() as i32);
-                                ctx.builder.call_fn1_ret(
-                                    "jit_find_cache_entry_for_dynamic_chaining",
-                                );
+                                ctx.builder
+                                    .call_fn1_ret("jit_find_cache_entry_for_dynamic_chaining");
                             }
                             let packed_target = ctx.builder.tee_new_local();
 
@@ -6120,14 +6175,14 @@ fn jit_generate_module(
 
     {
         ctx.builder.block_end(); // default case for the brtable
-        // A dispatch index with no matching case is a STALE dispatch — a recycled
-        // wasm_table_index whose old tlb_code state_table wasn't swept yet, or a
-        // racing invalidation mid-slice. Every path that can land here (module
-        // entry, in-page re-dispatch, ret-speculation) has already materialized
-        // the runtime instruction_pointer, so the recoverable move is a clean
-        // module exit: the interpreter re-resolves the eip through the normal
-        // cache path (worst case: recompile). `unreachable` turned this race
-        // into a fatal wasm trap. Debug builds still flag it via check_dispatcher_target.
+                                 // A dispatch index with no matching case is a STALE dispatch — a recycled
+                                 // wasm_table_index whose old tlb_code state_table wasn't swept yet, or a
+                                 // racing invalidation mid-slice. Every path that can land here (module
+                                 // entry, in-page re-dispatch, ret-speculation) has already materialized
+                                 // the runtime instruction_pointer, so the recoverable move is a clean
+                                 // module exit: the interpreter re-resolves the eip through the normal
+                                 // cache path (worst case: recompile). `unreachable` turned this race
+                                 // into a fatal wasm trap. Debug builds still flag it via check_dispatcher_target.
         ctx.builder.br(ctx.exit_label);
     }
     {
@@ -6245,19 +6300,25 @@ fn opcode_can_keep_x87_writeback(eip: u32) -> bool {
         // Integer arithmetic/compare memory forms and FUCOMPP.
         0xDA => mod_bits != 3 || (reg == 5 && rm == 1),
         // FILD/FIST m32 and F(U)COMI register forms.
-        0xDB => (mod_bits != 3 && matches!(reg, 0 | 1 | 2 | 3))
-            || (mod_bits == 3 && matches!(reg, 5 | 6)),
+        0xDB => {
+            (mod_bits != 3 && matches!(reg, 0 | 1 | 2 | 3))
+                || (mod_bits == 3 && matches!(reg, 5 | 6))
+        },
         // All DC arithmetic/compare forms use the same wrappers as D8.
         0xDC => true,
         // FLD/FST/FSTP m64, FXCH/FST(P) and FUCOMP register forms.
-        0xDD => (mod_bits != 3 && matches!(reg, 0 | 2 | 3))
-            || (mod_bits == 3 && matches!(reg, 1 | 2 | 3 | 5)),
+        0xDD => {
+            (mod_bits != 3 && matches!(reg, 0 | 2 | 3))
+                || (mod_bits == 3 && matches!(reg, 1 | 2 | 3 | 5))
+        },
         // Integer memory arithmetic and register arithmetic/compare forms.
         0xDE => true,
         // FIST m16 plus the cache-aware register forms.
-        0xDF => (mod_bits != 3 && matches!(reg, 1 | 2 | 3))
-            || (mod_bits == 3 && matches!(reg, 1 | 2 | 3 | 5 | 6))
-            || (mod_bits == 3 && reg == 4 && rm == 0),
+        0xDF => {
+            (mod_bits != 3 && matches!(reg, 1 | 2 | 3))
+                || (mod_bits == 3 && matches!(reg, 1 | 2 | 3 | 5 | 6))
+                || (mod_bits == 3 && reg == 4 && rm == 0)
+        },
         _ => false,
     }
 }
@@ -6333,9 +6394,14 @@ fn jit_generate_basic_block(
     // nothing is emitted for unwatched pages (zero cost when profiling is off).
     if trace_profiler::is_enabled() && trace_profiler::is_page_watched(Page::page_of(block.addr)) {
         let (kind, condition, succ_fallthrough, succ_taken) = match block.ty {
-            BasicBlockType::Normal { next_block_addr, .. } => {
-                (trace_profiler::KIND_NORMAL, 0u8, next_block_addr.unwrap_or(0), 0)
-            },
+            BasicBlockType::Normal {
+                next_block_addr, ..
+            } => (
+                trace_profiler::KIND_NORMAL,
+                0u8,
+                next_block_addr.unwrap_or(0),
+                0,
+            ),
             BasicBlockType::ConditionalJump {
                 next_block_addr,
                 next_block_branch_taken_addr,
@@ -6428,8 +6494,7 @@ fn jit_generate_basic_block(
         // (incl. EMMS) alias the same fpu_st storage and must invalidate too.
         if ctx.x87_local_cache.iter().any(|s| s.is_some())
             && (x87_writeback_barrier
-                || (!ctx.x87_cache_kept
-                    && (opcode_is_x87(start_eip) || opcode_is_mmx(start_eip))))
+                || (!ctx.x87_cache_kept && (opcode_is_x87(start_eip) || opcode_is_mmx(start_eip))))
         {
             codegen::gen_x87_local_cache_invalidate_all_runtime(ctx);
         }
@@ -6456,9 +6521,8 @@ fn jit_generate_basic_block(
         }
 
         if was_block_boundary
-            || (!unsafe {
-                JIT_EXACT_PAGE_TAIL || JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS
-            } && is_near_end_of_page(end_addr))
+            || (!unsafe { JIT_EXACT_PAGE_TAIL || JIT_CONTIGUOUS_CROSS_PAGE_INSTRUCTIONS }
+                && is_near_end_of_page(end_addr))
             || end_addr > stop_addr
         {
             dbg_log!(
@@ -6492,8 +6556,8 @@ pub fn jit_increase_hotness_and_maybe_compile(
 
     let mut ctx = get_jit_state();
     let page = Page::page_of(phys_address);
-    let already_deferred = unsafe { JIT_DEFERRED_COMPILE_QUEUE }
-        && ctx.deferred_compile_pages.contains(&page);
+    let already_deferred =
+        unsafe { JIT_DEFERRED_COMPILE_QUEUE } && ctx.deferred_compile_pages.contains(&page);
     // Interpreting on a page that already owns a module means compiled code
     // exists here and simply does not cover this entry point. Such a page has
     // already proven itself hot, and recompiling it only widens an existing
@@ -6505,11 +6569,16 @@ pub fn jit_increase_hotness_and_maybe_compile(
         let page_hotness = ctx.entry_points.entry(page).or_insert_with(|| {
             cpu::tlb_set_has_code(page, true);
             profiler::stat_increment(stat::RUN_INTERPRETED_NEW_PAGE);
-            PageHotness { hotness: 0, entry_points: HashSet::new() }
+            PageHotness {
+                hotness: 0,
+                entry_points: HashSet::new(),
+            }
         });
 
         if tail_entry_compilable(Some(virt_address), phys_address, cs_offset, state_flags) {
-            page_hotness.entry_points.insert(phys_address as u16 & 0xFFF);
+            page_hotness
+                .entry_points
+                .insert(phys_address as u16 & 0xFFF);
         }
 
         // A queued page keeps learning entry points, but does not repeatedly pay
@@ -6597,9 +6666,7 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
         for i in 0..unsafe { cpu::valid_tlb_entries_count } {
             let page = unsafe { cpu::valid_tlb_entries[i as usize] };
             let meta = dispatch_meta_get(page as u32);
-            dbg_assert!(
-                meta == 0 || dispatch_meta_table_index(meta) != wasm_table_index.to_u16()
-            );
+            dbg_assert!(meta == 0 || dispatch_meta_table_index(meta) != wasm_table_index.to_u16());
         }
     }
 
@@ -6795,9 +6862,7 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     }
 
     if !did_have_code {
-        unsafe {
-            JIT_PAGE_INVALIDATIONS_NO_CODE = JIT_PAGE_INVALIDATIONS_NO_CODE.wrapping_add(1)
-        };
+        unsafe { JIT_PAGE_INVALIDATIONS_NO_CODE = JIT_PAGE_INVALIDATIONS_NO_CODE.wrapping_add(1) };
         profiler::stat_increment(stat::DIRTY_PAGE_DID_NOT_HAVE_CODE);
     }
 }
@@ -6885,7 +6950,9 @@ fn jit_clear_cache(ctx: &mut JitState) {
 pub fn jit_page_has_code(page: Page) -> bool { jit_page_has_code_ctx(&mut get_jit_state(), page) }
 
 fn jit_page_has_code_ctx(ctx: &mut JitState, page: Page) -> bool {
-    ctx.pages.contains_key(&page) || ctx.entry_points.contains_key(&page) || ctx.external_pages.contains_key(&page)
+    ctx.pages.contains_key(&page)
+        || ctx.entry_points.contains_key(&page)
+        || ctx.external_pages.contains_key(&page)
 }
 
 #[no_mangle]
@@ -6913,9 +6980,7 @@ pub fn jit_get_cache_size() -> u32 {
 
 // Ungated JIT-table diagnostics for slot pressure / hidden-index pile-up.
 #[no_mangle]
-pub fn jit_debug_free_slots() -> u32 {
-    get_jit_state().wasm_table_index_free_list.len() as u32
-}
+pub fn jit_debug_free_slots() -> u32 { get_jit_state().wasm_table_index_free_list.len() as u32 }
 #[no_mangle]
 pub fn jit_debug_module_count() -> u32 {
     let ctx = get_jit_state();
@@ -6926,9 +6991,7 @@ pub fn jit_debug_module_count() -> u32 {
     set.len() as u32
 }
 #[no_mangle]
-pub fn jit_debug_page_count() -> u32 {
-    get_jit_state().pages.len() as u32
-}
+pub fn jit_debug_page_count() -> u32 { get_jit_state().pages.len() as u32 }
 #[no_mangle]
 pub fn jit_debug_hidden_count() -> u32 {
     get_jit_state()
@@ -7129,9 +7192,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
 }
 
 #[no_mangle]
-pub fn jit_leaf_call_fusion_sites_compiled() -> u32 {
-    unsafe { LEAF_CALL_FUSION_SITES_COMPILED }
-}
+pub fn jit_leaf_call_fusion_sites_compiled() -> u32 { unsafe { LEAF_CALL_FUSION_SITES_COMPILED } }
 
 #[no_mangle]
 pub fn jit_exact_page_tail_instructions_compiled() -> u32 {
@@ -7150,9 +7211,7 @@ pub fn x87_writeback_enabled() -> bool {
     unsafe { JIT_X87_WRITEBACK && JIT_X87_LOCALS }
 }
 
-pub fn fpu_ordered_compare_first_enabled() -> bool {
-    unsafe { JIT_FPU_ORDERED_COMPARE_FIRST }
-}
+pub fn fpu_ordered_compare_first_enabled() -> bool { unsafe { JIT_FPU_ORDERED_COMPARE_FIRST } }
 
 pub fn dynamic_chain_budget_fast_exit_enabled() -> bool {
     unsafe { JIT_DYNAMIC_CHAIN_BUDGET_FAST_EXIT }
@@ -7190,9 +7249,7 @@ pub fn jit_get_compile_deferred_pending() -> u32 {
 pub fn jit_get_compile_pending() -> u32 { get_jit_state().compiling.len() as u32 }
 
 #[no_mangle]
-pub fn jit_get_compile_pending_high_water() -> u32 {
-    unsafe { JIT_COMPILE_PENDING_HIGH_WATER }
-}
+pub fn jit_get_compile_pending_high_water() -> u32 { unsafe { JIT_COMPILE_PENDING_HIGH_WATER } }
 
 #[no_mangle]
 pub fn jit_get_compile_total_us() -> f64 { unsafe { JIT_COMPILE_TOTAL_US as f64 } }
@@ -7263,7 +7320,7 @@ pub fn jit_hot_profile_precompile(budget: u32) -> u32 {
     };
     let mut remaining = candidates.len() as u32;
     let mut compiled = 0u32;
-    let (cs_offset, state_flags) = unsafe { (cpu::get_seg_cs() as u32, cpu::get_state_flags()) };
+    let (cs_offset, state_flags) = (cpu::get_seg_cs() as u32, cpu::get_state_flags());
     for (page, hash, entries) in candidates {
         if compiled >= budget
             || ctx.compiling.len() >= unsafe { JIT_MAX_PENDING_COMPILES.max(1) as usize }
@@ -7284,10 +7341,14 @@ pub fn jit_hot_profile_precompile(budget: u32) -> u32 {
         {
             let hot = ctx.entry_points.entry(page).or_insert_with(|| {
                 cpu::tlb_set_has_code(page, true);
-                PageHotness { hotness: 0, entry_points: HashSet::new() }
+                PageHotness {
+                    hotness: 0,
+                    entry_points: HashSet::new(),
+                }
             });
             for e in entries {
-                if tail_entry_compilable(None, page.to_address() | e as u32, cs_offset, state_flags) {
+                if tail_entry_compilable(None, page.to_address() | e as u32, cs_offset, state_flags)
+                {
                     hot.entry_points.insert(e);
                     seeded = true;
                 }
@@ -7297,9 +7358,22 @@ pub fn jit_hot_profile_precompile(budget: u32) -> u32 {
         if !seeded {
             continue;
         }
-        let first = *ctx.entry_points.get(&page).unwrap().entry_points.iter().min().unwrap() as u32;
+        let first = *ctx
+            .entry_points
+            .get(&page)
+            .unwrap()
+            .entry_points
+            .iter()
+            .min()
+            .unwrap() as u32;
         let phys = page.to_address() | first;
-        jit_analyze_and_generate(&mut ctx, (page.to_address() | first) as i32, phys, cs_offset, state_flags);
+        jit_analyze_and_generate(
+            &mut ctx,
+            (page.to_address() | first) as i32,
+            phys,
+            cs_offset,
+            state_flags,
+        );
         compiled += 1;
         remaining -= 1;
         unsafe {
@@ -7341,7 +7415,7 @@ fn hot_profile_force(ctx: &mut JitState, page: Page, phys_address: u32) -> bool 
         // A recorded entry the module cannot contain (a profile written before
         // page-tail entries were gated) would force the page on every visit,
         // for an analysis that then finds nothing new to compile.
-        let (cs_offset, state_flags) = unsafe { (cpu::get_seg_cs() as u32, cpu::get_state_flags()) };
+        let (cs_offset, state_flags) = (cpu::get_seg_cs() as u32, cpu::get_state_flags());
         if !tail_entry_compilable(None, phys_address, cs_offset, state_flags) {
             return false;
         }
@@ -7358,9 +7432,12 @@ fn hot_profile_force(ctx: &mut JitState, page: Page, phys_address: u32) -> bool 
     }
     let hot = ctx.entry_points.entry(page).or_insert_with(|| {
         cpu::tlb_set_has_code(page, true);
-        PageHotness { hotness: 0, entry_points: HashSet::new() }
+        PageHotness {
+            hotness: 0,
+            entry_points: HashSet::new(),
+        }
     });
-    let (cs_offset, state_flags) = unsafe { (cpu::get_seg_cs() as u32, cpu::get_state_flags()) };
+    let (cs_offset, state_flags) = (cpu::get_seg_cs() as u32, cpu::get_state_flags());
     for e in entries {
         if tail_entry_compilable(None, page.to_address() | e as u32, cs_offset, state_flags) {
             hot.entry_points.insert(e);
@@ -7435,7 +7512,10 @@ pub fn jit_hot_profile_import_commit(len: u32) -> u32 {
     let mut guard = HOT_PROFILE.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
     for (page, p) in parsed {
-        let e = map.entry(page).or_insert_with(|| HotProfilePage { hash: p.hash, entries: Vec::new() });
+        let e = map.entry(page).or_insert_with(|| HotProfilePage {
+            hash: p.hash,
+            entries: Vec::new(),
+        });
         e.hash = p.hash;
         for off in p.entries {
             if !e.entries.contains(&off) {
@@ -7455,7 +7535,10 @@ pub fn jit_hot_profile_export_build() -> u32 {
         HOT_PROFILE.lock().unwrap().clone().unwrap_or_default();
     let mut add = |page: Page, entry_points: &mut dyn Iterator<Item = u16>| {
         if let Some(h) = hot_profile_page_hash(page) {
-            let e = merged.entry(page).or_insert_with(|| HotProfilePage { hash: h, entries: Vec::new() });
+            let e = merged.entry(page).or_insert_with(|| HotProfilePage {
+                hash: h,
+                entries: Vec::new(),
+            });
             e.hash = h;
             for off in entry_points {
                 if !e.entries.contains(&off) {
@@ -7468,20 +7551,28 @@ pub fn jit_hot_profile_export_build() -> u32 {
     // every block start the interpreter saw on it: the secondary page of a
     // multi-page module has an empty module list but real entries of its own,
     // and those are what the next session's forced recompile needs.
-    let mut hot_entries = |page: Page| -> Vec<u16> {
+    let hot_entries = |page: Page| -> Vec<u16> {
         ctx.entry_points
             .get(&page)
             .map(|h| h.entry_points.iter().copied().collect())
             .unwrap_or_default()
     };
     for (page, info) in ctx.pages.iter() {
-        let mut it = info.entry_points.iter().map(|(e, _)| *e).chain(hot_entries(*page));
+        let mut it = info
+            .entry_points
+            .iter()
+            .map(|(e, _)| *e)
+            .chain(hot_entries(*page));
         add(*page, &mut it);
     }
     for state in ctx.compiling.values() {
         if let CompilingPageState::Compiling { pages } = state {
             for (page, info) in pages.iter() {
-                let mut it = info.entry_points.iter().map(|(e, _)| *e).chain(hot_entries(*page));
+                let mut it = info
+                    .entry_points
+                    .iter()
+                    .map(|(e, _)| *e)
+                    .chain(hot_entries(*page));
                 add(*page, &mut it);
             }
         }
@@ -7542,7 +7633,9 @@ pub fn jit_register_external_module(
     raw_state_flags: u32,
     initial_state: u32,
 ) -> u32 {
-    if wasm_table_index < WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS || wasm_table_index >= WASM_TABLE_SIZE {
+    if wasm_table_index < WASM_TABLE_SIZE - EXTERNAL_MODULE_SLOTS
+        || wasm_table_index >= WASM_TABLE_SIZE
+    {
         return 0;
     }
     let index = WasmTableIndex(wasm_table_index as u16);
@@ -7585,7 +7678,12 @@ fn publish_external(info: &PageInfo, phys_page: Page) {
                 (entry as u32 >> 12 ^ virt_page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
             );
             if tlb_physical_page == phys_page {
-                dispatch_ext_set(Page::of_u32(virt_page as u32), info.wasm_table_index, &info.entry_points, info.state_flags);
+                dispatch_ext_set(
+                    Page::of_u32(virt_page as u32),
+                    info.wasm_table_index,
+                    &info.entry_points,
+                    info.state_flags,
+                );
             }
         }
     }
@@ -7621,8 +7719,12 @@ static mut EXTERNAL_MISSES: u32 = 0;
 #[inline]
 pub fn note_external_dispatch(hit: bool) {
     unsafe {
-        if hit { EXTERNAL_DISPATCHES = EXTERNAL_DISPATCHES.wrapping_add(1); }
-        else { EXTERNAL_MISSES = EXTERNAL_MISSES.wrapping_add(1); }
+        if hit {
+            EXTERNAL_DISPATCHES = EXTERNAL_DISPATCHES.wrapping_add(1);
+        }
+        else {
+            EXTERNAL_MISSES = EXTERNAL_MISSES.wrapping_add(1);
+        }
     }
 }
 
@@ -7666,7 +7768,14 @@ pub fn jit_ext_miss_top(rank: u32, field: u32) -> u32 {
             .collect();
         v.sort_unstable_by(|a, b| b.cmp(a));
         match v.get(rank as usize) {
-            Some(&(count, eip)) => if field == 0 { eip } else { count },
+            Some(&(count, eip)) => {
+                if field == 0 {
+                    eip
+                }
+                else {
+                    count
+                }
+            },
             None => 0,
         }
     }
@@ -7700,8 +7809,12 @@ pub fn ext_trace_exit(eip: u32, retired: u32) {
 #[no_mangle]
 pub fn jit_ext_trace(slot: u32, field: u32) -> u32 {
     unsafe {
-        if field == 3 { return EXT_TRACE_NEXT; }
-        if slot as usize >= EXT_TRACE_LEN || slot >= EXT_TRACE_NEXT { return 0; }
+        if field == 3 {
+            return EXT_TRACE_NEXT;
+        }
+        if slot as usize >= EXT_TRACE_LEN || slot >= EXT_TRACE_NEXT {
+            return 0;
+        }
         let i = (EXT_TRACE_NEXT.wrapping_sub(1).wrapping_sub(slot) as usize) % EXT_TRACE_LEN;
         EXT_TRACE[i][(field as usize).min(2)]
     }
@@ -7721,12 +7834,17 @@ pub fn jit_debug_dispatch(virt_address: u32) -> u32 {
     let meta = dispatch_meta_get(page);
     let meta2 = dispatch_ext_get(page);
     let mut out = 0u32;
-    if meta != 0 { out |= 1 << 31; }
+    if meta != 0 {
+        out |= 1 << 31;
+    }
     if meta2 != 0 {
         out |= 1 << 30;
-        if cpu::get_state_flags().to_u32() == dispatch_meta_state_flags(meta2) { out |= 1 << 29; }
+        if cpu::get_state_flags().to_u32() == dispatch_meta_state_flags(meta2) {
+            out |= 1 << 29;
+        }
         out |= dispatch_state_lookup(meta2, virt_address) as u32;
-    } else {
+    }
+    else {
         out |= 0xFFFF;
     }
     out
@@ -7734,7 +7852,12 @@ pub fn jit_debug_dispatch(virt_address: u32) -> u32 {
 
 #[no_mangle]
 pub fn jit_hot_profile_pages() -> u32 {
-    HOT_PROFILE.lock().unwrap().as_ref().map(|m| m.len() as u32).unwrap_or(0)
+    HOT_PROFILE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.len() as u32)
+        .unwrap_or(0)
 }
 
 #[no_mangle]

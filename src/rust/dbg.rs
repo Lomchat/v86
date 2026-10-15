@@ -26,6 +26,9 @@ pub fn console_log_to_js_console<T: std::string::ToString>(s: T) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn console_log_to_js_console<T: std::string::ToString>(_s: T) {}
+
 #[cfg(target_arch = "wasm32")]
 pub fn dbg_trace() {
     if DEBUG {

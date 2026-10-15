@@ -179,50 +179,50 @@ const CMD_DRAW_INDEXED_UP: u32 = 8;
 // ---------------------------------------------------------------------------
 const LAYOUT_LEN: usize = 44;
 const LAYOUT_TABLE: [u32; LAYOUT_LEN] = [
-    OFF_RENDER_STATES as u32,      // 0
-    OFF_SAMPLER_STAGE0 as u32,     // 1
-    OFF_STREAM_SOURCE as u32,      // 2
-    OFF_INDEX_BUFFER as u32,       // 3
-    OFF_VS_HANDLE as u32,          // 4
-    OFF_PS_HANDLE as u32,          // 5
-    OFF_DECL_HANDLE as u32,        // 6
-    OFF_FVF as u32,                // 7
-    OFF_TEXTURE_BOUND_IDS as u32,  // 8
-    OFF_TEXTURE_CUBE_FLAGS as u32, // 9
-    OFF_SHADER_CONST_LEN_VS as u32,// 10
-    OFF_SHADER_CONST_LEN_PS as u32,// 11
-    OFF_VS_CONSTANTS as u32,       // 12
-    OFF_PS_CONSTANTS as u32,       // 13
-    OFF_VS_CONST_VERSION as u32,   // 14
-    OFF_PS_CONST_VERSION as u32,   // 15
-    OFF_CMD_TYPES as u32,          // 16
-    OFF_CMD_A as u32,              // 17
-    OFF_CMD_B as u32,              // 18
-    OFF_CMD_C as u32,              // 19
-    OFF_PIPELINE_KEY as u32,       // 20
-    OFF_BIND_GROUP_KEY as u32,     // 21
-    OFF_COMMAND_COUNT as u32,      // 22
-    OFF_BUMP_ARENA as u32,         // 23
-    OFF_BUMP_CURSOR as u32,        // 24
-    OFF_COMMANDS_EMITTED as u32,   // 25
-    OFF_ARENA_HIGH_WATER as u32,   // 26
-    OFF_OVERFLOW_COUNT as u32,     // 27
-    OFF_FFP_FALLBACK_COUNT as u32, // 28
-    OFF_MISMATCH_COUNT as u32,     // 29
-    CMD_CAP as u32,                // 30 — capacity, not an offset
-    ARENA_SIZE as u32,             // 31 — total size, not an offset
-    OFF_BLOCK_SLOTS as u32,        // 32
-    BLOCK_SLOT_SIZE as u32,        // 33 — stride, not an offset
-    BLOCK_SLOT_COUNT as u32,       // 34 — capacity, not an offset
-    OFF_BLOCK_CHANGED as u32,      // 35
-    BLOCK_CHANGED_CAP as u32,      // 36 — capacity (u32 pairs), not an offset
-    BLOCK_MASK_RS as u32,          // 37 — intra-slot offsets from here down
-    BLOCK_MASK_SAMP as u32,        // 38
-    BLOCK_VS_RANGES as u32,        // 39
-    BLOCK_PS_RANGES as u32,        // 40
-    BLOCK_RS_VALUES as u32,        // 41
-    BLOCK_SAMP_VALUES as u32,      // 42
-    BLOCK_CONST_POOL as u32,       // 43
+    OFF_RENDER_STATES as u32,       // 0
+    OFF_SAMPLER_STAGE0 as u32,      // 1
+    OFF_STREAM_SOURCE as u32,       // 2
+    OFF_INDEX_BUFFER as u32,        // 3
+    OFF_VS_HANDLE as u32,           // 4
+    OFF_PS_HANDLE as u32,           // 5
+    OFF_DECL_HANDLE as u32,         // 6
+    OFF_FVF as u32,                 // 7
+    OFF_TEXTURE_BOUND_IDS as u32,   // 8
+    OFF_TEXTURE_CUBE_FLAGS as u32,  // 9
+    OFF_SHADER_CONST_LEN_VS as u32, // 10
+    OFF_SHADER_CONST_LEN_PS as u32, // 11
+    OFF_VS_CONSTANTS as u32,        // 12
+    OFF_PS_CONSTANTS as u32,        // 13
+    OFF_VS_CONST_VERSION as u32,    // 14
+    OFF_PS_CONST_VERSION as u32,    // 15
+    OFF_CMD_TYPES as u32,           // 16
+    OFF_CMD_A as u32,               // 17
+    OFF_CMD_B as u32,               // 18
+    OFF_CMD_C as u32,               // 19
+    OFF_PIPELINE_KEY as u32,        // 20
+    OFF_BIND_GROUP_KEY as u32,      // 21
+    OFF_COMMAND_COUNT as u32,       // 22
+    OFF_BUMP_ARENA as u32,          // 23
+    OFF_BUMP_CURSOR as u32,         // 24
+    OFF_COMMANDS_EMITTED as u32,    // 25
+    OFF_ARENA_HIGH_WATER as u32,    // 26
+    OFF_OVERFLOW_COUNT as u32,      // 27
+    OFF_FFP_FALLBACK_COUNT as u32,  // 28
+    OFF_MISMATCH_COUNT as u32,      // 29
+    CMD_CAP as u32,                 // 30 — capacity, not an offset
+    ARENA_SIZE as u32,              // 31 — total size, not an offset
+    OFF_BLOCK_SLOTS as u32,         // 32
+    BLOCK_SLOT_SIZE as u32,         // 33 — stride, not an offset
+    BLOCK_SLOT_COUNT as u32,        // 34 — capacity, not an offset
+    OFF_BLOCK_CHANGED as u32,       // 35
+    BLOCK_CHANGED_CAP as u32,       // 36 — capacity (u32 pairs), not an offset
+    BLOCK_MASK_RS as u32,           // 37 — intra-slot offsets from here down
+    BLOCK_MASK_SAMP as u32,         // 38
+    BLOCK_VS_RANGES as u32,         // 39
+    BLOCK_PS_RANGES as u32,         // 40
+    BLOCK_RS_VALUES as u32,         // 41
+    BLOCK_SAMP_VALUES as u32,       // 42
+    BLOCK_CONST_POOL as u32,        // 43
 ];
 
 #[no_mangle]
@@ -232,9 +232,7 @@ pub static LAYOUT_TABLE_STATIC: [u32; LAYOUT_LEN] = LAYOUT_TABLE;
 /// contract). JS reads this once at boot to build its typed views — no offset is ever
 /// hardcoded on the JS side.
 #[no_mangle]
-pub fn get_d3d9_arena_layout_ptr() -> u32 {
-    addr_of!(LAYOUT_TABLE_STATIC) as u32
-}
+pub fn get_d3d9_arena_layout_ptr() -> u32 { addr_of!(LAYOUT_TABLE_STATIC) as u32 }
 
 // Backing storage as [u64; N] rather than [u8; N] — JS builds Uint32Array/Float32Array
 // views directly over this memory (byteOffset must be a multiple of the element size),
@@ -264,35 +262,23 @@ static mut LAST_DRAW_STATE_PS_VERSION: u32 = 0;
 static mut LAST_DRAW_STATE_OFFSET: u32 = 0;
 
 #[inline(always)]
-unsafe fn arena_ptr() -> *mut u8 {
-    addr_of_mut!(D3D9_ARENA).cast::<u8>()
-}
+unsafe fn arena_ptr() -> *mut u8 { addr_of_mut!(D3D9_ARENA).cast::<u8>() }
 
 #[inline(always)]
-unsafe fn rd_u32(off: usize) -> u32 {
-    *(arena_ptr().add(off) as *const u32)
-}
+unsafe fn rd_u32(off: usize) -> u32 { *(arena_ptr().add(off) as *const u32) }
 
 #[inline(always)]
-unsafe fn wr_u32(off: usize, v: u32) {
-    *(arena_ptr().add(off) as *mut u32) = v;
-}
+unsafe fn wr_u32(off: usize, v: u32) { *(arena_ptr().add(off) as *mut u32) = v; }
 
 #[inline(always)]
-unsafe fn rd_i32(off: usize) -> i32 {
-    *(arena_ptr().add(off) as *const i32)
-}
+unsafe fn rd_i32(off: usize) -> i32 { *(arena_ptr().add(off) as *const i32) }
 
 #[inline(always)]
-unsafe fn rd_u16(off: usize) -> u16 {
-    *(arena_ptr().add(off) as *const u16)
-}
+unsafe fn rd_u16(off: usize) -> u16 { *(arena_ptr().add(off) as *const u16) }
 
 /// Returns the WASM-linear pointer to D3D9_ARENA for JS to create typed views.
 #[no_mangle]
-pub fn get_d3d9_arena_ptr() -> u32 {
-    unsafe { arena_ptr() as u32 }
-}
+pub fn get_d3d9_arena_ptr() -> u32 { unsafe { arena_ptr() as u32 } }
 
 /// Reset per-frame cursors (command count, bump arena). Called from JS's existing
 /// Present/EndScene handler, alongside RenderFrame::reset().
@@ -327,9 +313,7 @@ const D3DRS_DESTBLENDALPHA: usize = 208;
 const D3DRS_BLENDOPALPHA: usize = 209;
 
 #[inline(always)]
-unsafe fn rs(state: usize) -> i32 {
-    rd_i32(OFF_RENDER_STATES + state * 4)
-}
+unsafe fn rs(state: usize) -> i32 { rd_i32(OFF_RENDER_STATES + state * 4) }
 
 /// Port of computeBlendKey (d3d9-blend.ts:138-144) + alphaTestKey (d3d9-device.ts:2126-2129).
 /// CRITICAL: both TS functions COLLAPSE their key to a constant when the corresponding
@@ -356,7 +340,8 @@ unsafe fn derive_blend_alpha_fields() -> (u32, u32, u32) {
         let blend_op_a = (rs(D3DRS_BLENDOPALPHA) & 0x7) as u32;
         let bak = separate_alpha | (src_blend_a << 1) | (dst_blend_a << 6) | (blend_op_a << 11);
         (core, bak)
-    } else {
+    }
+    else {
         (0u32, 0u32) // matches computeBlendKey's `n${writeMask}` short-circuit
     };
     // writeMask + the enable flag itself are always part of the key (present in both of
@@ -368,7 +353,8 @@ unsafe fn derive_blend_alpha_fields() -> (u32, u32, u32) {
         let alpha_func = (rs(D3DRS_ALPHAFUNC) & 0xf) as u32;
         let alpha_ref = (rs(D3DRS_ALPHAREF) & 0xff) as u32;
         alpha_test | (alpha_func << 1) | (alpha_ref << 5)
-    } else {
+    }
+    else {
         0 // matches alphaTestKey's "a0" short-circuit
     };
 
@@ -519,8 +505,10 @@ unsafe fn capture_draw_state(
         return LAST_DRAW_STATE_OFFSET;
     }
 
-    let vs_len = rd_u16(OFF_SHADER_CONST_LEN_VS + (vs_handle as usize % SHADER_HANDLE_SLOTS) * 2) as usize;
-    let ps_len = rd_u16(OFF_SHADER_CONST_LEN_PS + (ps_handle as usize % SHADER_HANDLE_SLOTS) * 2) as usize;
+    let vs_len =
+        rd_u16(OFF_SHADER_CONST_LEN_VS + (vs_handle as usize % SHADER_HANDLE_SLOTS) * 2) as usize;
+    let ps_len =
+        rd_u16(OFF_SHADER_CONST_LEN_PS + (ps_handle as usize % SHADER_HANDLE_SLOTS) * 2) as usize;
     let vs_bytes = vs_len.min(VS_CONST_FLOATS) * 4;
     let ps_bytes = ps_len.min(PS_CONST_FLOATS) * 4;
 
@@ -536,7 +524,8 @@ unsafe fn capture_draw_state(
     let cull = (rs(D3DRS_CULLMODE) & 0xff) as u32;
     let z_enable = (rs(D3DRS_ZENABLE) != 0) as u32;
     let z_write = (rs(D3DRS_ZWRITEENABLE) != 0) as u32;
-    let render_bits0 = cull | (z_enable << 8) | (z_write << 9) | (topology << 16) | (force_cull_none << 24);
+    let render_bits0 =
+        cull | (z_enable << 8) | (z_write << 9) | (topology << 16) | (force_cull_none << 24);
 
     let (blend_key, blend_alpha_key, alpha_key) = derive_blend_alpha_fields();
 
@@ -574,7 +563,14 @@ unsafe fn capture_draw_state(
 // Command SoA emission
 // ---------------------------------------------------------------------------
 
-unsafe fn push_command(cmd_type: u32, a: u32, b: u32, c: u32, pipeline_key: u32, bind_group_key: u32) -> bool {
+unsafe fn push_command(
+    cmd_type: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    pipeline_key: u32,
+    bind_group_key: u32,
+) -> bool {
     let count = rd_u32(OFF_COMMAND_COUNT) as usize;
     if count >= CMD_CAP {
         let overflow = rd_u32(OFF_OVERFLOW_COUNT);
@@ -596,7 +592,11 @@ unsafe fn push_command(cmd_type: u32, a: u32, b: u32, c: u32, pipeline_key: u32,
 /// Emit SetVertexBuffer/SetIndexBuffer commands if the binding changed since the last
 /// draw, then SetPipeline + BindProgrammable, returning (pipelineKey, bindGroupKey) or
 /// None if the arena is full or this isn't a programmable (VS+PS-bound) draw.
-unsafe fn emit_draw_prelude(topology: u32, stride: u32, force_cull_none: u32) -> Option<(u32, u32)> {
+unsafe fn emit_draw_prelude(
+    topology: u32,
+    stride: u32,
+    force_cull_none: u32,
+) -> Option<(u32, u32)> {
     let vs_handle = rd_u32(OFF_VS_HANDLE);
     let ps_handle = rd_u32(OFF_PS_HANDLE);
     if vs_handle == 0 || ps_handle == 0 {
@@ -610,7 +610,14 @@ unsafe fn emit_draw_prelude(topology: u32, stride: u32, force_cull_none: u32) ->
     let stream_offset = rd_u32(OFF_STREAM_SOURCE + 4);
     let stream_stride = rd_u32(OFF_STREAM_SOURCE + 8);
     if LAST_BOUND_STREAM != (stream_buffer, stream_offset, stream_stride) {
-        if !push_command(CMD_SET_VERTEX_BUFFER, stream_buffer, stream_offset, stream_stride, 0, 0) {
+        if !push_command(
+            CMD_SET_VERTEX_BUFFER,
+            stream_buffer,
+            stream_offset,
+            stream_stride,
+            0,
+            0,
+        ) {
             return None;
         }
         LAST_BOUND_STREAM = (stream_buffer, stream_offset, stream_stride);
@@ -626,21 +633,51 @@ unsafe fn emit_draw_prelude(topology: u32, stride: u32, force_cull_none: u32) ->
     }
 
     let cmask = cube_mask();
-    let pipeline_key = derive_pipeline_key(vs_handle, ps_handle, decl_handle, stride, topology, force_cull_none, cmask);
+    let pipeline_key = derive_pipeline_key(
+        vs_handle,
+        ps_handle,
+        decl_handle,
+        stride,
+        topology,
+        force_cull_none,
+        cmask,
+    );
     let bind_group_key = derive_bind_group_key(cmask);
 
     // Captured BEFORE emitting SetPipeline so its slot offset can ride commandB —
     // on a cache miss the executor needs the raw ingredients back (pipelineKey is only
     // a hash), and this capture is what makes those ingredients frame-timing-safe.
-    let draw_state_offset = capture_draw_state(vs_handle, ps_handle, decl_handle, stride, topology, force_cull_none, pipeline_key);
+    let draw_state_offset = capture_draw_state(
+        vs_handle,
+        ps_handle,
+        decl_handle,
+        stride,
+        topology,
+        force_cull_none,
+        pipeline_key,
+    );
     if draw_state_offset == u32::MAX {
         return None;
     }
 
-    if !push_command(CMD_SET_PIPELINE, pipeline_key, draw_state_offset, 0, pipeline_key, bind_group_key) {
+    if !push_command(
+        CMD_SET_PIPELINE,
+        pipeline_key,
+        draw_state_offset,
+        0,
+        pipeline_key,
+        bind_group_key,
+    ) {
         return None;
     }
-    if !push_command(CMD_BIND_PROGRAMMABLE, draw_state_offset, 0, 0, pipeline_key, bind_group_key) {
+    if !push_command(
+        CMD_BIND_PROGRAMMABLE,
+        draw_state_offset,
+        0,
+        0,
+        pipeline_key,
+        bind_group_key,
+    ) {
         return None;
     }
 
@@ -666,7 +703,7 @@ pub unsafe fn d3d9_record_draw(
                 return -1;
             }
             pipeline_key as i32
-        }
+        },
         None => -1,
     }
 }
@@ -683,11 +720,18 @@ pub unsafe fn d3d9_record_draw_indexed(
 ) -> i32 {
     match emit_draw_prelude(topology, stride, force_cull_none) {
         Some((pipeline_key, _bind_group_key)) => {
-            if !push_command(CMD_DRAW_INDEXED, index_count, start_index, base_vertex, pipeline_key, 0) {
+            if !push_command(
+                CMD_DRAW_INDEXED,
+                index_count,
+                start_index,
+                base_vertex,
+                pipeline_key,
+                0,
+            ) {
                 return -1;
             }
             pipeline_key as i32
-        }
+        },
         None => -1,
     }
 }
@@ -710,7 +754,13 @@ pub unsafe fn d3d9_record_draw_up(
     if capture_offset == u32::MAX {
         return -1;
     }
-    if copy_guest_bytes(guest_vertex_ptr, OFF_BUMP_ARENA + capture_offset as usize, byte_len).is_err() {
+    if copy_guest_bytes(
+        guest_vertex_ptr,
+        OFF_BUMP_ARENA + capture_offset as usize,
+        byte_len,
+    )
+    .is_err()
+    {
         return -1;
     }
     match emit_draw_prelude(topology, stride, force_cull_none) {
@@ -718,11 +768,18 @@ pub unsafe fn d3d9_record_draw_up(
             // B carries the bump-arena byte offset of the captured vertex data, C its
             // length — the executor reads both to build/refresh the pooled upload
             // buffer, mirroring RenderFrame::queueUpload today.
-            if !push_command(CMD_DRAW_UP, vertex_count, capture_offset, byte_len, pipeline_key, 0) {
+            if !push_command(
+                CMD_DRAW_UP,
+                vertex_count,
+                capture_offset,
+                byte_len,
+                pipeline_key,
+                0,
+            ) {
                 return -1;
             }
             pipeline_key as i32
-        }
+        },
         None => -1,
     }
 }
@@ -745,14 +802,26 @@ pub unsafe fn d3d9_record_draw_indexed_up(
     if vertex_capture_offset == u32::MAX {
         return -1;
     }
-    if copy_guest_bytes(guest_vertex_ptr, OFF_BUMP_ARENA + vertex_capture_offset as usize, vertex_byte_len).is_err() {
+    if copy_guest_bytes(
+        guest_vertex_ptr,
+        OFF_BUMP_ARENA + vertex_capture_offset as usize,
+        vertex_byte_len,
+    )
+    .is_err()
+    {
         return -1;
     }
     let index_capture_offset = bump_alloc(index_byte_len as usize);
     if index_capture_offset == u32::MAX {
         return -1;
     }
-    if copy_guest_bytes(guest_index_ptr, OFF_BUMP_ARENA + index_capture_offset as usize, index_byte_len).is_err() {
+    if copy_guest_bytes(
+        guest_index_ptr,
+        OFF_BUMP_ARENA + index_capture_offset as usize,
+        index_byte_len,
+    )
+    .is_err()
+    {
         return -1;
     }
     match emit_draw_prelude(topology, stride, force_cull_none) {
@@ -773,7 +842,7 @@ pub unsafe fn d3d9_record_draw_indexed_up(
                 return -1;
             }
             pipeline_key as i32
-        }
+        },
         None => -1,
     }
 }
@@ -893,8 +962,10 @@ pub unsafe fn d3d9_block_apply(slot: u32) -> u32 {
     }
 
     block_for_each_const_range(s, |kind, r, pool_off, mirror_byte_off, count| {
-        let block_bytes =
-            std::slice::from_raw_parts(arena_ptr().add(s + BLOCK_CONST_POOL + pool_off * 4), count * 4);
+        let block_bytes = std::slice::from_raw_parts(
+            arena_ptr().add(s + BLOCK_CONST_POOL + pool_off * 4),
+            count * 4,
+        );
         let mirror_bytes = std::slice::from_raw_parts(arena_ptr().add(mirror_byte_off), count * 4);
         if block_bytes != mirror_bytes {
             push(kind << 16 | r as u32, pool_off as u32);
@@ -915,7 +986,8 @@ unsafe fn copy_guest_bytes(guest_src: i32, dst_off: usize, len: u32) -> Result<(
     let dst = arena_ptr().add(dst_off);
     if (gm.read_block)(guest_src, dst, len) {
         Ok(())
-    } else {
+    }
+    else {
         Err(())
     }
 }

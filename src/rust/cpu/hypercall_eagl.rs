@@ -68,14 +68,35 @@ fn ftol_low32(x: f64) -> u32 {
 ///   unknown mode → EAX=0x8876086C (D3DERR_INVALIDCALL), no writes
 unsafe fn handle_eagl_shader_const_convert() -> bool {
     let esp = read_reg32(ESP);
-    let desc = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
-    let dst = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
-    let src = match safe_read32s(esp + 12) { Ok(v) => v, Err(_) => return false };
-    let count = match safe_read32s(esp + 16) { Ok(v) => v as u32, Err(_) => return false };
+    let desc = match safe_read32s(esp + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let dst = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let src = match safe_read32s(esp + 12) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let count = match safe_read32s(esp + 16) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
 
-    let mode = match safe_read32s(desc) { Ok(v) => v as u32, Err(_) => return false };
-    let rows = match safe_read32s(desc + 0x14) { Ok(v) => v as u32, Err(_) => return false };
-    let cols = match safe_read32s(desc + 0x18) { Ok(v) => v as u32, Err(_) => return false };
+    let mode = match safe_read32s(desc) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let rows = match safe_read32s(desc + 0x14) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let cols = match safe_read32s(desc + 0x18) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
 
     if mode < 1 || mode > 3 {
         write_reg32(EAX, 0x8876086Cu32 as i32);
@@ -98,13 +119,25 @@ unsafe fn handle_eagl_shader_const_convert() -> bool {
             let s = src_item + rr * 0x10;
             let d = dst_item + rr * dst_row_stride;
             for cc in 0..c as i32 {
-                let sv = match safe_read32s(s + cc * 4) { Ok(v) => v, Err(_) => return false };
+                let sv = match safe_read32s(s + cc * 4) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
                 let out = match mode {
                     3 => sv,
                     2 => ftol_low32(f32::from_bits(sv as u32) as f64) as i32,
-                    _ => if ftol_low32(f32::from_bits(sv as u32) as f64) != 0 { 1 } else { 0 },
+                    _ => {
+                        if ftol_low32(f32::from_bits(sv as u32) as f64) != 0 {
+                            1
+                        }
+                        else {
+                            0
+                        }
+                    },
                 };
-                if safe_write32(d + cc * 4, out).is_err() { return false; }
+                if safe_write32(d + cc * 4, out).is_err() {
+                    return false;
+                }
             }
         }
     }
@@ -155,16 +188,40 @@ unsafe fn handle_eagl_apply_packed() -> bool {
 
 unsafe fn handle_eagl_apply(family: ApplyFamily, layout: ApplyLayout) -> bool {
     let esp = read_reg32(ESP);
-    let desc_cur = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
-    let src_cur = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
-    let dst_cur = match safe_read32s(esp + 12) { Ok(v) => v, Err(_) => return false };
-    let budget = match safe_read32s(esp + 16) { Ok(v) => v, Err(_) => return false };
+    let desc_cur = match safe_read32s(esp + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let src_cur = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let dst_cur = match safe_read32s(esp + 12) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let budget = match safe_read32s(esp + 16) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
     // Entry snapshot of the by-ref cells for clean fall-through on abort.
-    let d0 = match safe_read32s(desc_cur) { Ok(v) => v, Err(_) => return false };
-    let s0 = match safe_read32s(src_cur) { Ok(v) => v, Err(_) => return false };
-    let t0 = match safe_read32s(dst_cur) { Ok(v) => v, Err(_) => return false };
-    let b0 = match safe_read32s(budget) { Ok(v) => v, Err(_) => return false };
+    let d0 = match safe_read32s(desc_cur) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let s0 = match safe_read32s(src_cur) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let t0 = match safe_read32s(dst_cur) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let b0 = match safe_read32s(budget) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     // Same sane envelope as the JS guard — beyond it, defer to the guest.
     if b0 as u32 > 4096 {
         return false;
@@ -264,7 +321,7 @@ unsafe fn eagl_apply_walk(
                     let sv = safe_read32s(s).map_err(|_| ())?;
                     let out = match family {
                         ApplyFamily::Int => match mode {
-                            1 => ((sv as f64) as f32).to_bits() as i32,        // FILD i32 → FSTP f32
+                            1 => ((sv as f64) as f32).to_bits() as i32, // FILD i32 → FSTP f32
                             2 => ((sv as u32 as f64) as f32).to_bits() as i32, // u32 → f32 (FADD 2^32)
                             _ => ((f32::from_bits(sv as u32) as f64) as f32).to_bits() as i32, // FLD/FSTP
                         },
@@ -275,17 +332,16 @@ unsafe fn eagl_apply_walk(
                     };
                     if commit {
                         safe_write32(dst, out).map_err(|_| ())?;
-                    } else {
+                    }
+                    else {
                         let _ = out;
                     }
                 }
                 safe_write32(dst_cur, dst_base.wrapping_add(dst_step as i32)).map_err(|_| ())?;
                 safe_write32(budget, (rem - budget_step) as i32).map_err(|_| ())?;
             }
-            safe_write32(
-                src_cur,
-                src_base.wrapping_add((cols * rows * 4) as i32),
-            ).map_err(|_| ())?;
+            safe_write32(src_cur, src_base.wrapping_add((cols * rows * 4) as i32))
+                .map_err(|_| ())?;
         }
         safe_write32(desc_cur, d.wrapping_add(0x1c)).map_err(|_| ())?;
         return Ok(0);
@@ -311,10 +367,25 @@ unsafe fn eagl_apply_walk(
                 // float walk (FUN_005c8303); the other two into themselves.
                 ret = match layout {
                     ApplyLayout::Packed => eagl_apply_walk(
-                        ApplyFamily::Float, ApplyLayout::Register,
-                        desc_cur, src_cur, dst_cur, budget, depth + 1, commit)?,
+                        ApplyFamily::Float,
+                        ApplyLayout::Register,
+                        desc_cur,
+                        src_cur,
+                        dst_cur,
+                        budget,
+                        depth + 1,
+                        commit,
+                    )?,
                     ApplyLayout::Register => eagl_apply_walk(
-                        family, layout, desc_cur, src_cur, dst_cur, budget, depth + 1, commit)?,
+                        family,
+                        layout,
+                        desc_cur,
+                        src_cur,
+                        dst_cur,
+                        budget,
+                        depth + 1,
+                        commit,
+                    )?,
                 };
                 if ret < 0 {
                     return Ok(ret);
@@ -409,10 +480,25 @@ struct EaglTokenCfg {
     tex_fid: i32,
 }
 static mut EAGL_TOKEN_CFG: EaglTokenCfg = EaglTokenCfg {
-    ptr: 0, generation: 0, token_table: 0, ring_ctrl: 0, ring_base: 0, capacity: 0,
-    owner_global: 0, srs_fid: 0, srs_shadow: 0, srs_skip: 0,
-    samp_fid: 0, samp_shadow: 0, samp_skip: 0, tss_fid: 0,
-    fvf_fid: 0, svs_fid: 0, sps_fid: 0, vscf_fid: 0, pscf_fid: 0,
+    ptr: 0,
+    generation: 0,
+    token_table: 0,
+    ring_ctrl: 0,
+    ring_base: 0,
+    capacity: 0,
+    owner_global: 0,
+    srs_fid: 0,
+    srs_shadow: 0,
+    srs_skip: 0,
+    samp_fid: 0,
+    samp_shadow: 0,
+    samp_skip: 0,
+    tss_fid: 0,
+    fvf_fid: 0,
+    svs_fid: 0,
+    sps_fid: 0,
+    vscf_fid: 0,
+    pscf_fid: 0,
     tex_fid: 0,
 };
 
@@ -447,13 +533,19 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
     if cfg == 0 {
         return false;
     }
-    let ver = match safe_read32s(cfg) { Ok(v) => v, Err(_) => return false };
+    let ver = match safe_read32s(cfg) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     // v2 fields are a prefix of v3 (phase 3 adds validate/scratch cells only).
     if ver < 2 || ver > 3 {
         return false;
     }
     // (ptr, generation) cache key — generation is one read instead of ~16.
-    let generation = match safe_read32s(cfg + 0x38) { Ok(v) => v, Err(_) => return false };
+    let generation = match safe_read32s(cfg + 0x38) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     {
         let c = &*addr_of!(EAGL_TOKEN_CFG);
         if c.ptr != cfg || c.generation != generation {
@@ -465,22 +557,40 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
 
     let esp = read_reg32(ESP);
     let this_ctx = read_reg32(ECX);
-    let node = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
-    let mut stage = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
+    let node = match safe_read32s(esp + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut stage = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     if node == 0 {
         return false;
     }
     // Original entry semantics: param_3 == -1 → param_2[1] (the RAW node,
     // before alias resolution).
     if stage == -1 {
-        stage = match safe_read32s(node + 4) { Ok(v) => v, Err(_) => return false };
+        stage = match safe_read32s(node + 4) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
     }
     // *node == -1 → the aliased/compiled node at node[0x19].
     let mut n = node;
-    let mut tok = match safe_read32s(n) { Ok(v) => v, Err(_) => return false };
+    let mut tok = match safe_read32s(n) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     if tok == -1 {
-        n = match safe_read32s(node + 0x64) { Ok(v) => v, Err(_) => return false };
-        tok = match safe_read32s(n) { Ok(v) => v, Err(_) => return false };
+        n = match safe_read32s(node + 0x64) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        tok = match safe_read32s(n) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
     }
 
     let c = &*addr_of!(EAGL_TOKEN_CFG);
@@ -490,8 +600,14 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
     };
     let class = desc >> 24;
     // dev = *(this + 8); vtable = *dev.
-    let dev = match safe_read32s(this_ctx + 8) { Ok(v) => v, Err(_) => return false };
-    let vt = match safe_read32s(dev) { Ok(v) => v, Err(_) => return false };
+    let dev = match safe_read32s(this_ctx + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let vt = match safe_read32s(dev) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
     match class {
         1 | 2 | 8 => eagl_dispatch_simple(c, dev, vt, class, desc, stage, n),
@@ -502,28 +618,56 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
 
 /// Single-pass hot path for classes 1/2/8 (~1M calls/s — every read counts).
 unsafe fn eagl_dispatch_simple(
-    c: &EaglTokenCfg, dev: i32, vt: i32, class: u32, desc: u32, stage: i32, n: i32,
+    c: &EaglTokenCfg,
+    dev: i32,
+    vt: i32,
+    class: u32,
+    desc: u32,
+    stage: i32,
+    n: i32,
 ) -> bool {
     let d3d_enum = (desc & 0xff_ffff) as i32;
     // Value = node[0x1a] for all three classes.
-    let value = match safe_read32s(n + 0x68) { Ok(v) => v, Err(_) => return false };
+    let value = match safe_read32s(n + 0x68) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
     // (vtable offset, expected funcId, shadow table/skip addr, shadow slot key, argc)
     let (vt_off, expect_fid, shadow_base, skip_addr, slot, argc): (i32, i32, i32, i32, i32, i32) =
         match class {
-            1 => (0xe4, c.srs_fid, c.srs_shadow, c.srs_skip,
-                  if (d3d_enum as u32) < 256 { d3d_enum } else { -1 }, 3),
+            1 => (
+                0xe4,
+                c.srs_fid,
+                c.srs_shadow,
+                c.srs_skip,
+                if (d3d_enum as u32) < 256 { d3d_enum } else { -1 },
+                3,
+            ),
             2 => (0x10c, c.tss_fid, 0, 0, -1, 4),
-            8 => (0x114, c.samp_fid, c.samp_shadow, c.samp_skip,
-                  if (stage as u32) < 16 && (d3d_enum as u32) < 16 { (stage << 4) | d3d_enum } else { -1 },
-                  4),
+            8 => (
+                0x114,
+                c.samp_fid,
+                c.samp_shadow,
+                c.samp_skip,
+                if (stage as u32) < 16 && (d3d_enum as u32) < 16 {
+                    (stage << 4) | d3d_enum
+                }
+                else {
+                    -1
+                },
+                4,
+            ),
             _ => return false,
         };
 
     // Perform the virtual call — but only for the KNOWN callee shape: our WBUF
     // setter stub starts `B8 <funcId:u32>`. Anything else (proxied device,
     // unpatched setter) → the JS tier / original.
-    let fid = match eagl_stub_fid(vt, vt_off, expect_fid) { Ok(v) => v, Err(_) => return false };
+    let fid = match eagl_stub_fid(vt, vt_off, expect_fid) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
     // Ring capacity gate FIRST (before any shadow mutation): the trampoline's
     // .ovf path OUT-traps to the real setter thunk (drain-first) — replicated
@@ -531,7 +675,10 @@ unsafe fn eagl_dispatch_simple(
     // pre-dispatch drain) completes the call.
     let ring_ctrl = c.ring_ctrl;
     let ring_base = c.ring_base;
-    let head = match safe_read32s(ring_ctrl) { Ok(v) => v, Err(_) => return false };
+    let head = match safe_read32s(ring_ctrl) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     if head < 0 || head >= c.capacity - 36 {
         return false;
     }
@@ -544,15 +691,26 @@ unsafe fn eagl_dispatch_simple(
     // invisible, so this order makes every abort point safe.
     let mut shadow_slot_addr = 0i32;
     if shadow_base != 0 && slot >= 0 && c.owner_global != 0 {
-        let owner = match safe_read32s(c.owner_global) { Ok(v) => v, Err(_) => return false };
+        let owner = match safe_read32s(c.owner_global) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         if owner == dev {
             let slot_addr = shadow_base + slot * 4;
-            let cur = match safe_read32s(slot_addr) { Ok(v) => v, Err(_) => return false };
+            let cur = match safe_read32s(slot_addr) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
             if cur == value {
                 // Redundant set: bump the skip counter, EAX = D3D_OK.
                 if skip_addr != 0 {
-                    let cnt = match safe_read32s(skip_addr) { Ok(v) => v, Err(_) => return false };
-                    if safe_write32(skip_addr, cnt.wrapping_add(1)).is_err() { return false; }
+                    let cnt = match safe_read32s(skip_addr) {
+                        Ok(v) => v,
+                        Err(_) => return false,
+                    };
+                    if safe_write32(skip_addr, cnt.wrapping_add(1)).is_err() {
+                        return false;
+                    }
                 }
                 write_reg32(EAX, 0);
                 return true;
@@ -563,11 +721,16 @@ unsafe fn eagl_dispatch_simple(
 
     // Ring append: [funcId][dev][(stage)][enum][value], head += stride.
     let entry = ring_base + head;
-    if safe_write32(entry, fid).is_err() { return false; }
-    if safe_write32(entry + 4, dev).is_err() { return false; }
+    if safe_write32(entry, fid).is_err() {
+        return false;
+    }
+    if safe_write32(entry + 4, dev).is_err() {
+        return false;
+    }
     let ok = if argc == 3 {
         safe_write32(entry + 8, d3d_enum).is_ok() && safe_write32(entry + 12, value).is_ok()
-    } else {
+    }
+    else {
         safe_write32(entry + 8, stage).is_ok()
             && safe_write32(entry + 12, d3d_enum).is_ok()
             && safe_write32(entry + 16, value).is_ok()
@@ -576,7 +739,9 @@ unsafe fn eagl_dispatch_simple(
         return false;
     }
     if shadow_slot_addr != 0 {
-        if safe_write32(shadow_slot_addr, value).is_err() { return false; }
+        if safe_write32(shadow_slot_addr, value).is_err() {
+            return false;
+        }
     }
     if safe_write32(ring_ctrl, head + (argc + 1) * 4).is_err() {
         return false;
@@ -654,7 +819,8 @@ impl EaglPass {
             self.model_addr[self.model_n] = addr;
             self.model_val[self.model_n] = val;
             self.model_n += 1;
-        } else {
+        }
+        else {
             self.model_ovf = true;
         }
     }
@@ -678,17 +844,39 @@ unsafe fn eagl_stub_fid(vt: i32, vt_off: i32, expect_fid: i32) -> Result<i32, ()
 /// two-pass form: scan validates and reserves ring room; commit replicates
 /// the shadow compare/skip/update + ring append of the single-pass path.
 unsafe fn eagl_emit_state(
-    c: &EaglTokenCfg, dev: i32, vt: i32, class: u32,
-    d3d_enum: i32, stage: i32, value: i32, p: &mut EaglPass,
+    c: &EaglTokenCfg,
+    dev: i32,
+    vt: i32,
+    class: u32,
+    d3d_enum: i32,
+    stage: i32,
+    value: i32,
+    p: &mut EaglPass,
 ) -> Result<(), ()> {
     let (vt_off, expect_fid, shadow_base, skip_addr, slot, argc): (i32, i32, i32, i32, i32, i32) =
         match class {
-            1 => (0xe4, c.srs_fid, c.srs_shadow, c.srs_skip,
-                  if (d3d_enum as u32) < 256 { d3d_enum } else { -1 }, 3),
+            1 => (
+                0xe4,
+                c.srs_fid,
+                c.srs_shadow,
+                c.srs_skip,
+                if (d3d_enum as u32) < 256 { d3d_enum } else { -1 },
+                3,
+            ),
             2 => (0x10c, c.tss_fid, 0, 0, -1, 4),
-            8 => (0x114, c.samp_fid, c.samp_shadow, c.samp_skip,
-                  if (stage as u32) < 16 && (d3d_enum as u32) < 16 { (stage << 4) | d3d_enum } else { -1 },
-                  4),
+            8 => (
+                0x114,
+                c.samp_fid,
+                c.samp_shadow,
+                c.samp_skip,
+                if (stage as u32) < 16 && (d3d_enum as u32) < 16 {
+                    (stage << 4) | d3d_enum
+                }
+                else {
+                    -1
+                },
+                4,
+            ),
             _ => return Err(()),
         };
     let fid = eagl_stub_fid(vt, vt_off, expect_fid)?;
@@ -731,7 +919,8 @@ unsafe fn eagl_emit_state(
         if argc == 3 {
             safe_write32(entry + 8, d3d_enum).map_err(|_| ())?;
             safe_write32(entry + 12, value).map_err(|_| ())?;
-        } else {
+        }
+        else {
             safe_write32(entry + 8, stage).map_err(|_| ())?;
             safe_write32(entry + 12, d3d_enum).map_err(|_| ())?;
             safe_write32(entry + 16, value).map_err(|_| ())?;
@@ -748,7 +937,12 @@ unsafe fn eagl_emit_state(
 /// [funcId][dev][value]. SetVertexShader/SetPixelShader carry the raw guest
 /// COM pointer — the drain handler resolves it, same as the trampoline path.
 unsafe fn eagl_emit_2arg(
-    c: &EaglTokenCfg, vt: i32, vt_off: i32, expect_fid: i32, dev: i32, value: i32,
+    c: &EaglTokenCfg,
+    vt: i32,
+    vt_off: i32,
+    expect_fid: i32,
+    dev: i32,
+    value: i32,
     p: &mut EaglPass,
 ) -> Result<(), ()> {
     let fid = eagl_stub_fid(vt, vt_off, expect_fid)?;
@@ -768,7 +962,13 @@ unsafe fn eagl_emit_2arg(
 /// 1..=256; a zero-count call is a device no-op the guest also makes, so it
 /// is skipped rather than appended).
 unsafe fn eagl_emit_const_f(
-    c: &EaglTokenCfg, vt: i32, pix: bool, dev: i32, start_reg: i32, src: i32, cnt: i32,
+    c: &EaglTokenCfg,
+    vt: i32,
+    pix: bool,
+    dev: i32,
+    start_reg: i32,
+    src: i32,
+    cnt: i32,
     p: &mut EaglPass,
 ) -> Result<(), ()> {
     if cnt < 0 || cnt > 256 {
@@ -777,11 +977,8 @@ unsafe fn eagl_emit_const_f(
     if cnt == 0 {
         return Ok(());
     }
-    let (vt_off, expect_fid) = if pix {
-        (VT_SET_PS_CONST_F, c.pscf_fid)
-    } else {
-        (VT_SET_VS_CONST_F, c.vscf_fid)
-    };
+    let (vt_off, expect_fid) =
+        if pix { (VT_SET_PS_CONST_F, c.pscf_fid) } else { (VT_SET_VS_CONST_F, c.vscf_fid) };
     let fid = eagl_stub_fid(vt, vt_off, expect_fid)?;
     let bytes = cnt * 16;
     if !p.commit {
@@ -789,7 +986,8 @@ unsafe fn eagl_emit_const_f(
         // dword touch both. The commit pass then reads every dword safely.
         safe_read32s(src).map_err(|_| ())?;
         safe_read32s(src.wrapping_add(bytes - 4)).map_err(|_| ())?;
-    } else {
+    }
+    else {
         let entry = c.ring_base + p.head;
         safe_write32(entry, fid).map_err(|_| ())?;
         safe_write32(entry + 4, dev).map_err(|_| ())?;
@@ -810,8 +1008,15 @@ unsafe fn eagl_emit_const_f(
 /// class switch. Ok(hr) = guest-visible result; Err = decline the WHOLE
 /// top-level call (scan pass only — the ring is untouched).
 unsafe fn eagl_dispatch_token(
-    c: &EaglTokenCfg, ctx: i32, mode: i32, dev: i32, vt: i32,
-    node: i32, stage_in: i32, depth: u32, p: &mut EaglPass,
+    c: &EaglTokenCfg,
+    ctx: i32,
+    mode: i32,
+    dev: i32,
+    vt: i32,
+    node: i32,
+    stage_in: i32,
+    depth: u32,
+    p: &mut EaglPass,
 ) -> Result<i32, ()> {
     if node == 0 {
         return Err(());
@@ -826,8 +1031,8 @@ unsafe fn eagl_dispatch_token(
         n = safe_read32s(node + 0x64).map_err(|_| ())?;
         tok = safe_read32s(n).map_err(|_| ())?;
     }
-    let desc = safe_read32s(c.token_table.wrapping_add(tok.wrapping_mul(0x1c)))
-        .map_err(|_| ())? as u32;
+    let desc =
+        safe_read32s(c.token_table.wrapping_add(tok.wrapping_mul(0x1c))).map_err(|_| ())? as u32;
     match desc >> 24 {
         cls @ (1 | 2 | 8) => {
             let value = safe_read32s(n + 0x68).map_err(|_| ())?;
@@ -849,8 +1054,16 @@ unsafe fn eagl_dispatch_token(
 /// sub-ids and their exact guest routing are transcribed from the decompile
 /// (the 0x60001xx-0x60004xx chain collapses to the two constant-F sets).
 unsafe fn eagl_class6(
-    c: &EaglTokenCfg, ctx: i32, mode: i32, dev: i32, vt: i32,
-    n: i32, desc: u32, stage: i32, depth: u32, p: &mut EaglPass,
+    c: &EaglTokenCfg,
+    ctx: i32,
+    mode: i32,
+    dev: i32,
+    vt: i32,
+    n: i32,
+    desc: u32,
+    stage: i32,
+    depth: u32,
+    p: &mut EaglPass,
 ) -> Result<i32, ()> {
     // Mode 2 = state-block record: every device call must go through the real
     // BeginStateBlock path, not the ring. The guest filter already routes
@@ -921,18 +1134,27 @@ unsafe fn eagl_resolve_record(ctx: i32, n: i32) -> Result<i32, ()> {
     let nid = safe_read32s(n + 0xc).map_err(|_| ())?;
     let r = safe_read32s(page_tbl.wrapping_add(nid.wrapping_mul(4))).map_err(|_| ())?;
     let t = safe_read32s(r + 0x38).map_err(|_| ())?;
-    let a = safe_read32s(r + 0x28).map_err(|_| ())?
+    let a = safe_read32s(r + 0x28)
+        .map_err(|_| ())?
         .wrapping_add(safe_read32s(n + 0x14).map_err(|_| ())?);
     let idx = if t == 0 {
         let off = safe_read32s(ctx + 0x2c).map_err(|_| ())?;
         safe_read32s(a.wrapping_add(off)).map_err(|_| ())?
-    } else {
-        let inner_off = safe_read32s(safe_read32s(ctx + 0xc).map_err(|_| ())? + 8).map_err(|_| ())?;
+    }
+    else {
+        let inner_off =
+            safe_read32s(safe_read32s(ctx + 0xc).map_err(|_| ())? + 8).map_err(|_| ())?;
         let inner = safe_read32s(a.wrapping_add(inner_off)).map_err(|_| ())?;
-        safe_read32s(safe_read32s(t + 8).map_err(|_| ())?.wrapping_add(inner.wrapping_mul(4)))
-            .map_err(|_| ())?
+        safe_read32s(
+            safe_read32s(t + 8)
+                .map_err(|_| ())?
+                .wrapping_add(inner.wrapping_mul(4)),
+        )
+        .map_err(|_| ())?
     };
-    Ok(idx.wrapping_mul(0x1c).wrapping_add(safe_read32s(ctx + 0x24).map_err(|_| ())?))
+    Ok(idx
+        .wrapping_mul(0x1c)
+        .wrapping_add(safe_read32s(ctx + 0x24).map_err(|_| ())?))
 }
 
 /// Class 5 — SetTexture (guest case 5, non-record mode): resolve the texture
@@ -940,8 +1162,14 @@ unsafe fn eagl_resolve_record(ctx: i32, n: i32) -> Result<i32, ()> {
 /// (GetDeviceCaps format validation) never reaches here — the whole batch is
 /// gated on mode != 2.
 unsafe fn eagl_class5_texture(
-    c: &EaglTokenCfg, ctx: i32, mode: i32, dev: i32, vt: i32,
-    n: i32, stage: i32, p: &mut EaglPass,
+    c: &EaglTokenCfg,
+    ctx: i32,
+    mode: i32,
+    dev: i32,
+    vt: i32,
+    n: i32,
+    stage: i32,
+    p: &mut EaglPass,
 ) -> Result<i32, ()> {
     if mode == 2 || c.tex_fid == 0 {
         return Err(());
@@ -961,8 +1189,15 @@ unsafe fn eagl_class5_texture(
 }
 
 unsafe fn eagl_class6_bind(
-    c: &EaglTokenCfg, ctx: i32, mode: i32, dev: i32, vt: i32,
-    n: i32, pix: bool, depth: u32, p: &mut EaglPass,
+    c: &EaglTokenCfg,
+    ctx: i32,
+    mode: i32,
+    dev: i32,
+    vt: i32,
+    n: i32,
+    pix: bool,
+    depth: u32,
+    p: &mut EaglPass,
 ) -> Result<i32, ()> {
     let rec = eagl_resolve_record(ctx, n)?;
     if safe_read32s(rec + 0xc).map_err(|_| ())? == 0 {
@@ -972,7 +1207,8 @@ unsafe fn eagl_class6_bind(
     let handle = safe_read32s(rec + 4).map_err(|_| ())?;
     if pix {
         eagl_emit_2arg(c, vt, VT_SET_PIXEL_SHADER, c.sps_fid, dev, handle, p)?;
-    } else {
+    }
+    else {
         eagl_emit_2arg(c, vt, VT_SET_VERTEX_SHADER, c.svs_fid, dev, handle, p)?;
     }
 
@@ -1010,8 +1246,8 @@ unsafe fn eagl_class6_bind(
                 let sub_arr = safe_read32s(hdr_ptr + 0x30).map_err(|_| ())?;
                 let sub = safe_read32s(sub_arr.wrapping_add(k.wrapping_mul(4))).map_err(|_| ())?;
                 if sub != 0 {
-                    let pass_id = safe_read32s(safe_read32s(sub + 4).map_err(|_| ())? + 4)
-                        .map_err(|_| ())?;
+                    let pass_id =
+                        safe_read32s(safe_read32s(sub + 4).map_err(|_| ())? + 4).map_err(|_| ())?;
                     let page_tbl = safe_read32s(ctx + 0x8c).map_err(|_| ())?;
                     let pr = safe_read32s(page_tbl.wrapping_add(pass_id.wrapping_mul(4)))
                         .map_err(|_| ())?;
@@ -1022,7 +1258,17 @@ unsafe fn eagl_class6_bind(
                     let base = safe_read32s(pr + 0x40).map_err(|_| ())?;
                     for i in 0..m {
                         let sub_node = base.wrapping_add(i.wrapping_mul(0xac));
-                        let hr = eagl_dispatch_token(c, ctx, mode, dev, vt, sub_node, reg, depth + 1, p)?;
+                        let hr = eagl_dispatch_token(
+                            c,
+                            ctx,
+                            mode,
+                            dev,
+                            vt,
+                            sub_node,
+                            reg,
+                            depth + 1,
+                            p,
+                        )?;
                         if hr < 0 {
                             // Guest aborts the whole commit on a negative
                             // sub-result — partial device calls stand.
@@ -1050,13 +1296,24 @@ unsafe fn eagl_class6_bind(
 /// is published once, after the commit walk completes or aborts — every
 /// intermediate state is invisible to the drain.
 unsafe fn eagl_dispatch_class6_batch(
-    c: &EaglTokenCfg, ctx: i32, dev: i32, vt: i32, node: i32, stage: i32,
+    c: &EaglTokenCfg,
+    ctx: i32,
+    dev: i32,
+    vt: i32,
+    node: i32,
+    stage: i32,
 ) -> bool {
-    let mode = match safe_read32s(ctx + 0x84) { Ok(v) => v, Err(_) => return false };
+    let mode = match safe_read32s(ctx + 0x84) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     if mode == 2 {
         return false;
     }
-    let head0 = match safe_read32s(c.ring_ctrl) { Ok(v) => v, Err(_) => return false };
+    let head0 = match safe_read32s(c.ring_ctrl) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     if head0 < 0 || head0 > c.capacity {
         return false;
     }

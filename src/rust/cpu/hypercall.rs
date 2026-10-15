@@ -54,15 +54,13 @@
 
 use std::ptr::{addr_of, addr_of_mut};
 
-use crate::cpu::memory;
-use crate::cpu::cpu::{
-    read_reg32, safe_read32s, safe_write32, write_reg32, EAX, EDX, ESP,
-};
-use crate::cpu::hypercall_rtti::{rt_dynamic_cast, RtDynamicCastResult};
+use crate::cpu::cpu::{read_reg32, safe_read32s, safe_write32, write_reg32, EAX, EDX, ESP};
 use crate::cpu::fpu::{
     fpu_get_st0, fpu_get_sti, fpu_pop, fpu_push, fpu_truncate_to_i64, fpu_write_st,
 };
 use crate::cpu::global_pointers::{fpu_stack_ptr, instruction_counter};
+use crate::cpu::hypercall_rtti::{rt_dynamic_cast, RtDynamicCastResult};
+use crate::cpu::memory;
 use crate::softfloat::F80;
 
 /// Dedicated page for hypercall shared data + preemption control.
@@ -106,8 +104,8 @@ const HC_FLS_SLOT_COUNT: usize = 129;
 // GUEST RAM at hc_slab_ctl_ptr and is accessed via SLAB_REL_* below; the legacy 0x1400-based
 // page layout is documented in the header block above and mirrored on the JS side.
 const OFF_HC_SLAB_CTL_PTR: usize = 0x1444; // guest addr of slab control block (0 = legacy page)
-// 0x1448..0x1C48 is the retired in-page event table; the event mirror now lives in guest RAM
-// behind OFF_HC_EVENT_MIRROR_PTR so it can cover the whole kernel handle window.
+                                           // 0x1448..0x1C48 is the retired in-page event table; the event mirror now lives in guest RAM
+                                           // behind OFF_HC_EVENT_MIRROR_PTR so it can cover the whole kernel handle window.
 
 // Relative offsets WITHIN the slab control block (page fields rebased to 0). Used when the
 // control block lives in guest RAM (hc_slab_ctl_ptr != 0).
@@ -161,30 +159,24 @@ const MUX_REC_MAX: u32 = 0xFF;
 const WAIT_TIMEOUT: i32 = 0x102;
 
 const SLAB_MAGIC: u32 = 0x534C4100; // "SLA\0" (BUSY) — low nibble reserved for bin index
-// FREE marker ("SLF\0"). A block on the per-bin free list carries this in its header so a
-// double-free is rejected (the BUSY-only validate fails) and getSlabSizeForPtr won't report a
-// free-listed block as a live sized allocation. MUST mirror the inline stubs + TS SLAB_MAGIC_FREE.
+                                    // FREE marker ("SLF\0"). A block on the per-bin free list carries this in its header so a
+                                    // double-free is rejected (the BUSY-only validate fails) and getSlabSizeForPtr won't report a
+                                    // free-listed block as a live sized allocation. MUST mirror the inline stubs + TS SLAB_MAGIC_FREE.
 const SLAB_MAGIC_FREE: u32 = 0x534C4600;
 const HEAP_ZERO_MEMORY_FLAG: u32 = 0x08;
 const BIN_SIZES: [u32; 9] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
 /// Helper: raw pointer to HYPERCALL_PAGE (avoids static_mut_refs warnings).
 #[inline(always)]
-pub(crate) unsafe fn hp_ptr() -> *const u8 {
-    addr_of!(HYPERCALL_PAGE).cast::<u8>()
-}
+pub(crate) unsafe fn hp_ptr() -> *const u8 { addr_of!(HYPERCALL_PAGE).cast::<u8>() }
 
 /// Helper: mutable raw pointer to HYPERCALL_PAGE.
 #[inline(always)]
-unsafe fn hp_mut() -> *mut u8 {
-    addr_of_mut!(HYPERCALL_PAGE).cast::<u8>()
-}
+unsafe fn hp_mut() -> *mut u8 { addr_of_mut!(HYPERCALL_PAGE).cast::<u8>() }
 
 /// Returns the WASM-linear pointer to HYPERCALL_PAGE for JS to create typed views.
 #[no_mangle]
-pub fn get_hypercall_page_ptr() -> u32 {
-    unsafe { hp_ptr() as u32 }
-}
+pub fn get_hypercall_page_ptr() -> u32 { unsafe { hp_ptr() as u32 } }
 
 /// Interpolated guest-virtual time in MICROSECONDS — the exact same base + interpolation
 /// the QPC hypercall (handle_qpc) serves to the guest: JS-written perf counter snapshot
@@ -223,7 +215,8 @@ pub unsafe fn read_cycle_limit() -> u32 {
             // JS uses 0 as an urgent-exit request for async parks / scheduler wakeups.
             0
         }
-    } else {
+    }
+    else {
         val
     }
 }
@@ -237,15 +230,11 @@ static mut PARK_EIP: u32 = 0;
 
 /// JS boot hook: tell the cycle loop where the async-park spin loop lives.
 #[no_mangle]
-pub unsafe fn set_park_eip(addr: u32) {
-    PARK_EIP = addr;
-}
+pub unsafe fn set_park_eip(addr: u32) { PARK_EIP = addr; }
 
 /// True when `eip` is parked on the spin-loop base (exact match).
 #[inline(always)]
-pub unsafe fn eip_at_park(eip: u32) -> bool {
-    PARK_EIP != 0 && eip == PARK_EIP
-}
+pub unsafe fn eip_at_park(eip: u32) -> bool { PARK_EIP != 0 && eip == PARK_EIP }
 
 /// Try to dispatch a hypercall for the given function ID.
 /// Returns true if handled in WASM, false to fall through to JS.
@@ -400,7 +389,8 @@ unsafe fn handle_get_tick_count() -> bool {
     let delta_ms = if mips_est > 0 {
         let delta_insn = (*instruction_counter).wrapping_sub(insn_at_update);
         delta_insn / (mips_est * 1000)
-    } else {
+    }
+    else {
         0
     };
 
@@ -428,11 +418,7 @@ unsafe fn handle_qpc() -> bool {
 
     // Interpolate: delta_micros ≈ (insn_now - insn_at_update) / mips_estimate
     let delta_insn = (*instruction_counter).wrapping_sub(insn_at_update);
-    let delta_micros = if mips_est > 0 {
-        delta_insn / mips_est
-    } else {
-        0
-    };
+    let delta_micros = if mips_est > 0 { delta_insn / mips_est } else { 0 };
 
     let qpc = (base_lo as u64 | (base_hi as u64) << 32) + delta_micros as u64;
 
@@ -488,7 +474,9 @@ unsafe fn handle_get_last_error() -> bool {
 /// info yet → fall through so the JS thunk answers (and seeds the page on the next switch).
 unsafe fn handle_get_current_thread_id() -> bool {
     let tid = *(hp_ptr().add(OFF_HC_CURRENT_THREAD_ID) as *const u32);
-    if tid == 0 { return false; }
+    if tid == 0 {
+        return false;
+    }
     write_reg32(EAX, tid as i32);
     true
 }
@@ -631,10 +619,14 @@ unsafe fn handle_enter_critical_section() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    if ptr == 0 { return false; }
+    if ptr == 0 {
+        return false;
+    }
 
     let current_thread = *(hp_ptr().add(OFF_HC_CURRENT_THREAD_ID) as *const u32);
-    if current_thread == 0 { return false; } // no thread info → JS fallback
+    if current_thread == 0 {
+        return false;
+    } // no thread info → JS fallback
 
     // Read OwningThread at offset 12
     let owner = match safe_read32s(ptr + 12) {
@@ -644,9 +636,15 @@ unsafe fn handle_enter_critical_section() -> bool {
 
     if owner == 0 {
         // FREE — acquire it
-        if safe_write32(ptr + 4, 0).is_err() { return false; }         // LockCount = 0
-        if safe_write32(ptr + 8, 1).is_err() { return false; }         // RecursionCount = 1
-        if safe_write32(ptr + 12, current_thread as i32).is_err() { return false; } // OwningThread
+        if safe_write32(ptr + 4, 0).is_err() {
+            return false;
+        } // LockCount = 0
+        if safe_write32(ptr + 8, 1).is_err() {
+            return false;
+        } // RecursionCount = 1
+        if safe_write32(ptr + 12, current_thread as i32).is_err() {
+            return false;
+        } // OwningThread
         write_reg32(EAX, 0);
         return true;
     }
@@ -657,7 +655,9 @@ unsafe fn handle_enter_critical_section() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if safe_write32(ptr + 8, rec + 1).is_err() { return false; }
+        if safe_write32(ptr + 8, rec + 1).is_err() {
+            return false;
+        }
         write_reg32(EAX, 0);
         return true;
     }
@@ -681,7 +681,9 @@ unsafe fn handle_leave_critical_section() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    if ptr == 0 { return false; }
+    if ptr == 0 {
+        return false;
+    }
 
     // Verify ownership: only the owning thread may release.
     // Non-owner releases fall to JS for proper error reporting (FATAL_GUARD 0x3009).
@@ -702,7 +704,9 @@ unsafe fn handle_leave_critical_section() -> bool {
 
     if rec > 1 {
         // Still recursive — just decrement, no wake needed
-        if safe_write32(ptr + 8, rec - 1).is_err() { return false; }
+        if safe_write32(ptr + 8, rec - 1).is_err() {
+            return false;
+        }
         write_reg32(EAX, 0);
         return true;
     }
@@ -727,9 +731,15 @@ unsafe fn handle_leave_critical_section() -> bool {
     }
 
     // No current waiter — release fully in WASM even if a semaphore remains.
-    if safe_write32(ptr + 4, -1).is_err() { return false; }  // LockCount = -1 (free)
-    if safe_write32(ptr + 8, 0).is_err() { return false; }   // RecursionCount = 0
-    if safe_write32(ptr + 12, 0).is_err() { return false; }  // OwningThread = 0
+    if safe_write32(ptr + 4, -1).is_err() {
+        return false;
+    } // LockCount = -1 (free)
+    if safe_write32(ptr + 8, 0).is_err() {
+        return false;
+    } // RecursionCount = 0
+    if safe_write32(ptr + 12, 0).is_err() {
+        return false;
+    } // OwningThread = 0
 
     write_reg32(EAX, 0);
     true
@@ -750,7 +760,9 @@ unsafe fn handle_screen_to_client() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    if lp_point == 0 { return false; }
+    if lp_point == 0 {
+        return false;
+    }
 
     let page = hp_ptr();
     let win_x = *(page.add(OFF_HC_WINDOW_X) as *const i32);
@@ -765,8 +777,12 @@ unsafe fn handle_screen_to_client() -> bool {
         Err(_) => return false,
     };
 
-    if safe_write32(lp_point, sx - win_x).is_err() { return false; }
-    if safe_write32(lp_point + 4, sy - win_y).is_err() { return false; }
+    if safe_write32(lp_point, sx - win_x).is_err() {
+        return false;
+    }
+    if safe_write32(lp_point + 4, sy - win_y).is_err() {
+        return false;
+    }
 
     write_reg32(EAX, 1);
     true
@@ -807,14 +823,20 @@ unsafe fn handle_get_cursor_pos() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    if lp_point == 0 { return false; }
+    if lp_point == 0 {
+        return false;
+    }
 
     let page = hp_ptr();
     let cx = *(page.add(OFF_HC_CURSOR_X) as *const i32);
     let cy = *(page.add(OFF_HC_CURSOR_Y) as *const i32);
 
-    if safe_write32(lp_point, cx).is_err() { return false; }
-    if safe_write32(lp_point + 4, cy).is_err() { return false; }
+    if safe_write32(lp_point, cx).is_err() {
+        return false;
+    }
+    if safe_write32(lp_point + 4, cy).is_err() {
+        return false;
+    }
 
     write_reg32(EAX, 1);
     true
@@ -830,11 +852,26 @@ unsafe fn handle_get_cursor_pos() -> bool {
 /// Inaccessible pointers decline to the existing JavaScript implementation.
 unsafe fn handle_d3dx_vec3_catmull_rom() -> bool {
     let esp = read_reg32(ESP);
-    let p_out = match safe_read32s(esp + 4) { Ok(v) if v != 0 => v, _ => return false };
-    let p0 = match safe_read32s(esp + 8) { Ok(v) if v != 0 => v, _ => return false };
-    let p1 = match safe_read32s(esp + 12) { Ok(v) if v != 0 => v, _ => return false };
-    let p2 = match safe_read32s(esp + 16) { Ok(v) if v != 0 => v, _ => return false };
-    let p3 = match safe_read32s(esp + 20) { Ok(v) if v != 0 => v, _ => return false };
+    let p_out = match safe_read32s(esp + 4) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let p0 = match safe_read32s(esp + 8) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let p1 = match safe_read32s(esp + 12) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let p2 = match safe_read32s(esp + 16) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let p3 = match safe_read32s(esp + 20) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
     let s = match safe_read32s(esp + 24) {
         Ok(v) => f32::from_bits(v as u32),
         Err(_) => return false,
@@ -847,16 +884,20 @@ unsafe fn handle_d3dx_vec3_catmull_rom() -> bool {
     for i in 0..3i32 {
         let off = i * 4;
         v0[i as usize] = match safe_read32s(p0.wrapping_add(off)) {
-            Ok(v) => f32::from_bits(v as u32), Err(_) => return false,
+            Ok(v) => f32::from_bits(v as u32),
+            Err(_) => return false,
         };
         v1[i as usize] = match safe_read32s(p1.wrapping_add(off)) {
-            Ok(v) => f32::from_bits(v as u32), Err(_) => return false,
+            Ok(v) => f32::from_bits(v as u32),
+            Err(_) => return false,
         };
         v2[i as usize] = match safe_read32s(p2.wrapping_add(off)) {
-            Ok(v) => f32::from_bits(v as u32), Err(_) => return false,
+            Ok(v) => f32::from_bits(v as u32),
+            Err(_) => return false,
         };
         v3[i as usize] = match safe_read32s(p3.wrapping_add(off)) {
-            Ok(v) => f32::from_bits(v as u32), Err(_) => return false,
+            Ok(v) => f32::from_bits(v as u32),
+            Err(_) => return false,
         };
     }
 
@@ -864,11 +905,11 @@ unsafe fn handle_d3dx_vec3_catmull_rom() -> bool {
     let s3 = s2 * s;
     let mut out = [0.0f32; 3];
     for i in 0..3usize {
-        out[i] = 0.5f32 * (
-            2.0f32 * v1[i] + (v2[i] - v0[i]) * s
-            + (2.0f32 * v0[i] - 5.0f32 * v1[i] + 4.0f32 * v2[i] - v3[i]) * s2
-            + (v3[i] - 3.0f32 * v2[i] + 3.0f32 * v1[i] - v0[i]) * s3
-        );
+        out[i] = 0.5f32
+            * (2.0f32 * v1[i]
+                + (v2[i] - v0[i]) * s
+                + (2.0f32 * v0[i] - 5.0f32 * v1[i] + 4.0f32 * v2[i] - v3[i]) * s2
+                + (v3[i] - 3.0f32 * v2[i] + 3.0f32 * v1[i] - v0[i]) * s3);
     }
 
     for i in 0..3i32 {
@@ -887,9 +928,18 @@ unsafe fn handle_d3dx_vec3_catmull_rom() -> bool {
 /// the API boundary, matching JavaScript Number semantics.
 unsafe fn handle_d3dx_matrix_inverse() -> bool {
     let esp = read_reg32(ESP);
-    let p_out = match safe_read32s(esp + 4) { Ok(v) if v != 0 => v, _ => return false };
-    let p_determinant = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
-    let p_matrix = match safe_read32s(esp + 12) { Ok(v) if v != 0 => v, _ => return false };
+    let p_out = match safe_read32s(esp + 4) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let p_determinant = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let p_matrix = match safe_read32s(esp + 12) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
 
     let mut rows = [[0.0f64; 8]; 4];
     for row in 0..4usize {
@@ -930,19 +980,26 @@ unsafe fn handle_d3dx_matrix_inverse() -> bool {
             rows[col][i] /= pivot;
         }
         for row in 0..4usize {
-            if row == col { continue; }
+            if row == col {
+                continue;
+            }
             let factor = rows[row][col];
-            if factor == 0.0 { continue; }
+            if factor == 0.0 {
+                continue;
+            }
             for i in 0..8usize {
                 rows[row][i] -= factor * rows[col][i];
             }
         }
     }
 
-    if p_determinant != 0 && safe_write32(
-        p_determinant,
-        ((determinant * sign) as f32).to_bits() as i32,
-    ).is_err() {
+    if p_determinant != 0
+        && safe_write32(
+            p_determinant,
+            ((determinant * sign) as f32).to_bits() as i32,
+        )
+        .is_err()
+    {
         return false;
     }
     for row in 0..4usize {
@@ -959,9 +1016,7 @@ unsafe fn handle_d3dx_matrix_inverse() -> bool {
 
 /// Helper: set ST(0) in-place without push/pop
 #[inline(always)]
-unsafe fn fpu_set_st0(value: F80) {
-    fpu_write_st(*fpu_stack_ptr as i32, value);
-}
+unsafe fn fpu_set_st0(value: F80) { fpu_write_st(*fpu_stack_ptr as i32, value); }
 
 /// Helper: read an f64 from the x86 stack at the given address
 #[inline(always)]
@@ -991,8 +1046,8 @@ unsafe fn handle_ftol() -> bool {
     // MSVC `_ftol2_sse` return the indefinite integer INT64_MIN instead.
     let v = fpu_truncate_to_i64(st0);
     fpu_pop();
-    write_reg32(EAX, v as i32);          // low 32
-    write_reg32(EDX, (v >> 32) as i32);  // high 32
+    write_reg32(EAX, v as i32); // low 32
+    write_reg32(EDX, (v >> 32) as i32); // high 32
     true
 }
 
@@ -1236,7 +1291,12 @@ struct HcReadCursor {
 
 impl HcReadCursor {
     fn new() -> Self {
-        Self { virt_page: 0, phys_page: 0, direct_ram: false, valid: false }
+        Self {
+            virt_page: 0,
+            phys_page: 0,
+            direct_ram: false,
+            valid: false,
+        }
     }
 
     unsafe fn read8(&mut self, addr: i32) -> Result<i32, ()> {
@@ -1251,12 +1311,7 @@ impl HcReadCursor {
         }
 
         let phys = self.phys_page | (virt & 0xFFF);
-        Ok(if self.direct_ram {
-            memory::read8_no_mmap_check(phys)
-        }
-        else {
-            memory::read8(phys)
-        })
+        Ok(if self.direct_ram { memory::read8_no_mmap_check(phys) } else { memory::read8(phys) })
     }
 }
 
@@ -1287,9 +1342,13 @@ unsafe fn handle_wcslen() -> bool {
             Ok(v) => v,
             Err(_) => break,
         };
-        if ch == 0 { break; }
+        if ch == 0 {
+            break;
+        }
         len += 1;
-        if len > 0x100000 { break; }
+        if len > 0x100000 {
+            break;
+        }
     }
     write_reg32(EAX, len as i32);
     true
@@ -1316,10 +1375,16 @@ unsafe fn handle_wcscpy() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if hc_safe_write16(dst + i as i32 * 2, ch).is_err() { return false; }
-        if ch == 0 { break; }
+        if hc_safe_write16(dst + i as i32 * 2, ch).is_err() {
+            return false;
+        }
+        if ch == 0 {
+            break;
+        }
         i += 1;
-        if i > 0x100000 { break; }
+        if i > 0x100000 {
+            break;
+        }
     }
     write_reg32(EAX, dst);
     true
@@ -1347,9 +1412,13 @@ unsafe fn handle_wcscat() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if ch == 0 { break; }
+        if ch == 0 {
+            break;
+        }
         dst_len += 1;
-        if dst_len > 0x100000 { break; }
+        if dst_len > 0x100000 {
+            break;
+        }
     }
     // Copy src
     let mut i: u32 = 0;
@@ -1358,10 +1427,16 @@ unsafe fn handle_wcscat() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if hc_safe_write16(dst + (dst_len + i) as i32 * 2, ch).is_err() { return false; }
-        if ch == 0 { break; }
+        if hc_safe_write16(dst + (dst_len + i) as i32 * 2, ch).is_err() {
+            return false;
+        }
+        if ch == 0 {
+            break;
+        }
         i += 1;
-        if i > 0x100000 { break; }
+        if i > 0x100000 {
+            break;
+        }
     }
     write_reg32(EAX, dst);
     true
@@ -1391,10 +1466,16 @@ unsafe fn handle_wcsicmp() -> bool {
         // ASCII tolower
         let l1 = if c1 >= 0x41 && c1 <= 0x5A { c1 + 0x20 } else { c1 };
         let l2 = if c2 >= 0x41 && c2 <= 0x5A { c2 + 0x20 } else { c2 };
-        if l1 != l2 { break (l1 as i32) - (l2 as i32); }
-        if c1 == 0 { break 0i32; }
+        if l1 != l2 {
+            break (l1 as i32) - (l2 as i32);
+        }
+        if c1 == 0 {
+            break 0i32;
+        }
         i += 1;
-        if i > 0x100000 { break 0i32; }
+        if i > 0x100000 {
+            break 0i32;
+        }
     };
     write_reg32(EAX, result);
     true
@@ -1425,9 +1506,13 @@ unsafe fn handle_wcschr() -> bool {
             write_reg32(EAX, str_ptr + i as i32 * 2);
             return true;
         }
-        if ch == 0 { break; }
+        if ch == 0 {
+            break;
+        }
         i += 1;
-        if i > 0x100000 { break; }
+        if i > 0x100000 {
+            break;
+        }
     }
     write_reg32(EAX, 0);
     true
@@ -1464,7 +1549,9 @@ unsafe fn handle_wcsstr() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if hc == 0 { break; }
+        if hc == 0 {
+            break;
+        }
         if hc == first {
             let mut j: u32 = 1;
             let matched = loop {
@@ -1472,14 +1559,20 @@ unsafe fn handle_wcsstr() -> bool {
                     Ok(v) => v,
                     Err(_) => return false,
                 };
-                if nc == 0 { break true; }
+                if nc == 0 {
+                    break true;
+                }
                 let h2 = match hc_safe_read16(haystack + (i + j) as i32 * 2) {
                     Ok(v) => v,
                     Err(_) => return false,
                 };
-                if h2 != nc { break false; }
+                if h2 != nc {
+                    break false;
+                }
                 j += 1;
-                if j > 0x100000 { break false; }
+                if j > 0x100000 {
+                    break false;
+                }
             };
             if matched {
                 write_reg32(EAX, haystack + i as i32 * 2);
@@ -1487,7 +1580,9 @@ unsafe fn handle_wcsstr() -> bool {
             }
         }
         i += 1;
-        if i > 0x100000 { break; }
+        if i > 0x100000 {
+            break;
+        }
     }
     write_reg32(EAX, 0);
     true
@@ -1515,7 +1610,9 @@ unsafe fn handle_wcsnicmp() -> bool {
     let limit: u32 = if count > 0 { count } else { 0x10000 };
     let mut i: u32 = 0;
     let result = loop {
-        if i >= limit { break 0i32; }
+        if i >= limit {
+            break 0i32;
+        }
         let c1 = match hc_safe_read16(s1 + i as i32 * 2) {
             Ok(v) => v as u32,
             Err(_) => return false,
@@ -1527,8 +1624,12 @@ unsafe fn handle_wcsnicmp() -> bool {
         // ASCII tolower
         let l1 = if c1 >= 0x41 && c1 <= 0x5A { c1 + 0x20 } else { c1 };
         let l2 = if c2 >= 0x41 && c2 <= 0x5A { c2 + 0x20 } else { c2 };
-        if l1 != l2 { break (l1 as i32) - (l2 as i32); }
-        if c1 == 0 { break 0i32; }
+        if l1 != l2 {
+            break (l1 as i32) - (l2 as i32);
+        }
+        if c1 == 0 {
+            break 0i32;
+        }
         i += 1;
     };
     write_reg32(EAX, result);
@@ -1559,20 +1660,27 @@ unsafe fn handle_wcsncpy() -> bool {
         return true;
     }
     // Defer pathologically large copies to JS rather than spin in WASM.
-    if count > 0x100000 { return false; }
+    if count > 0x100000 {
+        return false;
+    }
     let mut i: u32 = 0;
     let mut hit_null = false;
     while i < count {
         let ch = if hit_null {
             0
-        } else {
+        }
+        else {
             match hc_safe_read16(src + i as i32 * 2) {
                 Ok(v) => v,
                 Err(_) => return false,
             }
         };
-        if hc_safe_write16(dst + i as i32 * 2, ch).is_err() { return false; }
-        if ch == 0 { hit_null = true; }
+        if hc_safe_write16(dst + i as i32 * 2, ch).is_err() {
+            return false;
+        }
+        if ch == 0 {
+            hit_null = true;
+        }
         i += 1;
     }
     write_reg32(EAX, dst);
@@ -1605,7 +1713,9 @@ unsafe fn handle_memcpy() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if safe_write32(dst + i as i32, val).is_err() { return false; }
+        if safe_write32(dst + i as i32, val).is_err() {
+            return false;
+        }
         i += 4;
     }
     while i < len {
@@ -1613,7 +1723,9 @@ unsafe fn handle_memcpy() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if hc_safe_write8(dst + i as i32, byte).is_err() { return false; }
+        if hc_safe_write8(dst + i as i32, byte).is_err() {
+            return false;
+        }
         i += 1;
     }
     write_reg32(EAX, dst);
@@ -1643,11 +1755,15 @@ unsafe fn handle_memset() -> bool {
     let fill32 = c | (c << 8) | (c << 16) | (c << 24);
     let mut i: u32 = 0;
     while i + 4 <= len {
-        if safe_write32(dst + i as i32, fill32).is_err() { return false; }
+        if safe_write32(dst + i as i32, fill32).is_err() {
+            return false;
+        }
         i += 4;
     }
     while i < len {
-        if hc_safe_write8(dst + i as i32, c).is_err() { return false; }
+        if hc_safe_write8(dst + i as i32, c).is_err() {
+            return false;
+        }
         i += 1;
     }
     write_reg32(EAX, dst);
@@ -1672,9 +1788,13 @@ unsafe fn handle_strlen() -> bool {
             Ok(v) => v,
             Err(_) => break,
         };
-        if ch == 0 { break; }
+        if ch == 0 {
+            break;
+        }
         len += 1;
-        if len > 0x100000 { break; }
+        if len > 0x100000 {
+            break;
+        }
     }
     write_reg32(EAX, len as i32);
     true
@@ -1703,10 +1823,16 @@ unsafe fn handle_strcmp() -> bool {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
-        if c1 != c2 { break (c1 as i32) - (c2 as i32); }
-        if c1 == 0 { break 0i32; }
+        if c1 != c2 {
+            break (c1 as i32) - (c2 as i32);
+        }
+        if c1 == 0 {
+            break 0i32;
+        }
         i += 1;
-        if i > 0x100000 { break 0i32; }
+        if i > 0x100000 {
+            break 0i32;
+        }
     };
     write_reg32(EAX, result);
     true
@@ -1734,10 +1860,16 @@ unsafe fn handle_strcpy() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if hc_safe_write8(dst + i as i32, ch).is_err() { return false; }
-        if ch == 0 { break; }
+        if hc_safe_write8(dst + i as i32, ch).is_err() {
+            return false;
+        }
+        if ch == 0 {
+            break;
+        }
         i += 1;
-        if i > 0x100000 { break; }
+        if i > 0x100000 {
+            break;
+        }
     }
     write_reg32(EAX, dst);
     true
@@ -1768,10 +1900,16 @@ unsafe fn handle_stricmp() -> bool {
         };
         let l1 = if c1 >= 0x41 && c1 <= 0x5A { c1 + 0x20 } else { c1 };
         let l2 = if c2 >= 0x41 && c2 <= 0x5A { c2 + 0x20 } else { c2 };
-        if l1 != l2 { break (l1 as i32) - (l2 as i32); }
-        if c1 == 0 { break 0i32; }
+        if l1 != l2 {
+            break (l1 as i32) - (l2 as i32);
+        }
+        if c1 == 0 {
+            break 0i32;
+        }
         i += 1;
-        if i > 0x100000 { break 0i32; }
+        if i > 0x100000 {
+            break 0i32;
+        }
     };
     write_reg32(EAX, result);
     true
@@ -1841,7 +1979,9 @@ unsafe fn handle_strnicmp() -> bool {
     let mut r2 = HcReadCursor::new();
     let mut i: u32 = 0;
     let result = loop {
-        if i >= count { break 0i32; }
+        if i >= count {
+            break 0i32;
+        }
         let c1 = match r1.read8(s1.wrapping_add(i as i32)) {
             Ok(v) => v as u32,
             Err(_) => return false,
@@ -1852,8 +1992,12 @@ unsafe fn handle_strnicmp() -> bool {
         };
         let l1 = if c1 >= 0x41 && c1 <= 0x5A { c1 + 0x20 } else { c1 };
         let l2 = if c2 >= 0x41 && c2 <= 0x5A { c2 + 0x20 } else { c2 };
-        if l1 != l2 { break (l1 as i32) - (l2 as i32); }
-        if c1 == 0 { break 0i32; }
+        if l1 != l2 {
+            break (l1 as i32) - (l2 as i32);
+        }
+        if c1 == 0 {
+            break 0i32;
+        }
         i += 1;
     };
     write_reg32(EAX, result);
@@ -1889,7 +2033,9 @@ unsafe fn handle_strstr() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if ch == 0 { break; }
+        if ch == 0 {
+            break;
+        }
         needle_cache[needle_len] = ch as u8;
         needle_len += 1;
     }
@@ -1927,7 +2073,9 @@ unsafe fn handle_strstr() -> bool {
                 Ok(v) => v,
                 Err(_) => return false,
             };
-            if hc == 0 { break; }
+            if hc == 0 {
+                break;
+            }
             let byte = hc as u8;
             while matched > 0 && byte != needle_cache[matched] {
                 matched = prefix[matched - 1] as usize;
@@ -1941,7 +2089,9 @@ unsafe fn handle_strstr() -> bool {
                 return true;
             }
             i += 1;
-            if i > 0x100000 { break; }
+            if i > 0x100000 {
+                break;
+            }
         }
         write_reg32(EAX, 0);
         return true;
@@ -1954,12 +2104,16 @@ unsafe fn handle_strstr() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if hc == 0 { break; }
+        if hc == 0 {
+            break;
+        }
         if hc == first {
             let mut j: u32 = 1;
             let matched = loop {
                 let nc = if cached_needle {
-                    if j as usize >= needle_len { break true; }
+                    if j as usize >= needle_len {
+                        break true;
+                    }
                     needle_cache[j as usize] as i32
                 }
                 else {
@@ -1968,14 +2122,20 @@ unsafe fn handle_strstr() -> bool {
                         Err(_) => return false,
                     }
                 };
-                if !cached_needle && nc == 0 { break true; }
+                if !cached_needle && nc == 0 {
+                    break true;
+                }
                 let h2 = match hay_reader.read8(haystack.wrapping_add((i + j) as i32)) {
                     Ok(v) => v,
                     Err(_) => return false,
                 };
-                if h2 != nc { break false; }
+                if h2 != nc {
+                    break false;
+                }
                 j += 1;
-                if j > 0x100000 { break false; }
+                if j > 0x100000 {
+                    break false;
+                }
             };
             if matched {
                 write_reg32(EAX, haystack + i as i32);
@@ -1983,7 +2143,9 @@ unsafe fn handle_strstr() -> bool {
             }
         }
         i += 1;
-        if i > 0x100000 { break; }
+        if i > 0x100000 {
+            break;
+        }
     }
     write_reg32(EAX, 0);
     true
@@ -2010,7 +2172,12 @@ unsafe fn handle_atoi() -> bool {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
-        if c == 0x20 || (c >= 0x09 && c <= 0x0D) { p += 1; } else { break; }
+        if c == 0x20 || (c >= 0x09 && c <= 0x0D) {
+            p += 1;
+        }
+        else {
+            break;
+        }
     }
     // Optional sign.
     let mut neg = false;
@@ -2030,9 +2197,13 @@ unsafe fn handle_atoi() -> bool {
             Ok(v) => v as u32,
             Err(_) => return false,
         };
-        if d < '0' as u32 || d > '9' as u32 { break; }
+        if d < '0' as u32 || d > '9' as u32 {
+            break;
+        }
         digits += 1;
-        if digits > 15 { return false; } // stays exact in f64 → matches JS parseInt|0; longer → JS
+        if digits > 15 {
+            return false;
+        } // stays exact in f64 → matches JS parseInt|0; longer → JS
         acc = acc * 10 + (d - '0' as u32) as i64;
         p += 1;
     }
@@ -2150,9 +2321,7 @@ unsafe fn kernel_handle_slot(handle: u32) -> Option<u32> {
 }
 
 #[inline]
-unsafe fn mutex_mirror_base() -> u32 {
-    *(hp_ptr().add(OFF_HC_MUTEX_MIRROR_PTR) as *const u32)
-}
+unsafe fn mutex_mirror_base() -> u32 { *(hp_ptr().add(OFF_HC_MUTEX_MIRROR_PTR) as *const u32) }
 
 #[inline]
 unsafe fn read_mutex_mirror(slot: u32) -> u32 {
@@ -2173,9 +2342,7 @@ unsafe fn write_mutex_mirror(slot: u32, value: u32) {
 }
 
 #[inline]
-unsafe fn event_mirror_base() -> u32 {
-    *(hp_ptr().add(OFF_HC_EVENT_MIRROR_PTR) as *const u32)
-}
+unsafe fn event_mirror_base() -> u32 { *(hp_ptr().add(OFF_HC_EVENT_MIRROR_PTR) as *const u32) }
 
 /// 0 (not EVT_VALID) until JS has allocated the table, so every fast path declines to JS.
 #[inline]
@@ -2233,7 +2400,8 @@ unsafe fn handle_release_mutex() -> bool {
         // scheduler's waiter bit is set; only the final release needs JS to
         // choose and wake a waiting thread.
         write_mutex_mirror(slot, (mux & !MUX_REC_MASK) | ((rec - 1) << MUX_REC_SHIFT));
-    } else {
+    }
+    else {
         if mux & MUX_HAS_WAITERS != 0 {
             return false;
         }
@@ -2350,11 +2518,7 @@ unsafe fn handle_sleep() -> bool {
         let limit = *(page.add(OFF_HC_SLEEP_STARVATION_LIMIT) as *const u32);
         // A sole runnable thread only needs a host yield for a proven storm.
         // 64 * the guest-fairness limit = 4096 calls with today's limit of 64.
-        let effective_limit = if has_peers != 0 {
-            limit
-        } else {
-            limit.saturating_mul(64)
-        };
+        let effective_limit = if has_peers != 0 { limit } else { limit.saturating_mul(64) };
 
         if effective_limit > 0 && counter < effective_limit {
             // Not yet starved — remain entirely in WASM.
@@ -2444,16 +2608,36 @@ unsafe fn handle_fls_get_value() -> bool {
 /// Map requested byte count to a size-class bin index (0–8).
 /// Returns None for 0 bytes or >4KB (JS fallback).
 fn size_to_bin(bytes: u32) -> Option<u32> {
-    if bytes == 0 { return None; }
-    if bytes <= 16 { return Some(0); }
-    if bytes <= 32 { return Some(1); }
-    if bytes <= 64 { return Some(2); }
-    if bytes <= 128 { return Some(3); }
-    if bytes <= 256 { return Some(4); }
-    if bytes <= 512 { return Some(5); }
-    if bytes <= 1024 { return Some(6); }
-    if bytes <= 2048 { return Some(7); }
-    if bytes <= 4096 { return Some(8); }
+    if bytes == 0 {
+        return None;
+    }
+    if bytes <= 16 {
+        return Some(0);
+    }
+    if bytes <= 32 {
+        return Some(1);
+    }
+    if bytes <= 64 {
+        return Some(2);
+    }
+    if bytes <= 128 {
+        return Some(3);
+    }
+    if bytes <= 256 {
+        return Some(4);
+    }
+    if bytes <= 512 {
+        return Some(5);
+    }
+    if bytes <= 1024 {
+        return Some(6);
+    }
+    if bytes <= 2048 {
+        return Some(7);
+    }
+    if bytes <= 4096 {
+        return Some(8);
+    }
     None
 }
 
@@ -2474,24 +2658,40 @@ unsafe fn handle_heap_alloc() -> bool {
     // The slab control block lives in GUEST RAM at hc_slab_ctl_ptr (the inline x86 stubs can
     // only address guest RAM; this page is unreachable from guest code). ctl==0 ⇒ slab off.
     let ctl = *(page.add(OFF_HC_SLAB_CTL_PTR) as *const u32);
-    if ctl == 0 { return false; }
+    if ctl == 0 {
+        return false;
+    }
     let slab_base = slab_rd(ctl, SLAB_REL_BASE);
-    if slab_base == 0 { return false; } // slab not initialized
+    if slab_base == 0 {
+        return false;
+    } // slab not initialized
 
     let esp = read_reg32(ESP);
     // HeapAlloc(hHeap, dwFlags, dwBytes) at ESP+4, +8, +12
-    let dw_flags = match safe_read32s(esp + 8) { Ok(v) => v as u32, Err(_) => return false };
-    let dw_bytes = match safe_read32s(esp + 12) { Ok(v) => v as u32, Err(_) => return false };
+    let dw_flags = match safe_read32s(esp + 8) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let dw_bytes = match safe_read32s(esp + 12) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
 
-    if dw_bytes == 0 { return false; } // let JS set ERROR_NOT_ENOUGH_MEMORY
+    if dw_bytes == 0 {
+        return false;
+    } // let JS set ERROR_NOT_ENOUGH_MEMORY
 
     let bin = match size_to_bin(dw_bytes) {
         Some(b) => b,
         None => {
             // >4KB — count fallback, let JS handle
-            slab_wr(ctl, SLAB_REL_FALLBACK_COUNT, slab_rd(ctl, SLAB_REL_FALLBACK_COUNT).wrapping_add(1));
+            slab_wr(
+                ctl,
+                SLAB_REL_FALLBACK_COUNT,
+                slab_rd(ctl, SLAB_REL_FALLBACK_COUNT).wrapping_add(1),
+            );
             return false;
-        }
+        },
     };
     let size_class = BIN_SIZES[bin as usize];
     let zero = (dw_flags & HEAP_ZERO_MEMORY_FLAG) != 0;
@@ -2508,9 +2708,15 @@ unsafe fn handle_heap_alloc() -> bool {
         // so getSlabSizeForPtr (BUSY-only) reports it as not-live and a later inline free
         // sends it down .slow → the free is lost / the block is double-owned.
         memory::write32_no_mmap_or_dirty_check(head - 4, (SLAB_MAGIC | bin) as i32);
-        if zero { zero_block(head, size_class); }
+        if zero {
+            zero_block(head, size_class);
+        }
         write_reg32(EAX, head as i32);
-        slab_wr(ctl, SLAB_REL_ALLOC_COUNT, slab_rd(ctl, SLAB_REL_ALLOC_COUNT).wrapping_add(1));
+        slab_wr(
+            ctl,
+            SLAB_REL_ALLOC_COUNT,
+            slab_rd(ctl, SLAB_REL_ALLOC_COUNT).wrapping_add(1),
+        );
         return true;
     }
 
@@ -2520,7 +2726,11 @@ unsafe fn handle_heap_alloc() -> bool {
     let user_ptr = bump + 16;
     let new_bump = user_ptr + size_class;
     if new_bump > slab_end {
-        slab_wr(ctl, SLAB_REL_FALLBACK_COUNT, slab_rd(ctl, SLAB_REL_FALLBACK_COUNT).wrapping_add(1));
+        slab_wr(
+            ctl,
+            SLAB_REL_FALLBACK_COUNT,
+            slab_rd(ctl, SLAB_REL_FALLBACK_COUNT).wrapping_add(1),
+        );
         return false; // slab exhausted → JS allocates + can refill slab
     }
 
@@ -2528,10 +2738,16 @@ unsafe fn handle_heap_alloc() -> bool {
     memory::write32_no_mmap_or_dirty_check(user_ptr - 4, (SLAB_MAGIC | bin) as i32);
     slab_wr(ctl, SLAB_REL_BUMP, new_bump);
 
-    if zero { zero_block(user_ptr, size_class); }
+    if zero {
+        zero_block(user_ptr, size_class);
+    }
 
     write_reg32(EAX, user_ptr as i32);
-    slab_wr(ctl, SLAB_REL_ALLOC_COUNT, slab_rd(ctl, SLAB_REL_ALLOC_COUNT).wrapping_add(1));
+    slab_wr(
+        ctl,
+        SLAB_REL_ALLOC_COUNT,
+        slab_rd(ctl, SLAB_REL_ALLOC_COUNT).wrapping_add(1),
+    );
     true
 }
 
@@ -2540,12 +2756,19 @@ unsafe fn handle_heap_alloc() -> bool {
 unsafe fn handle_heap_free() -> bool {
     let page = hp_ptr();
     let ctl = *(page.add(OFF_HC_SLAB_CTL_PTR) as *const u32);
-    if ctl == 0 { return false; }
+    if ctl == 0 {
+        return false;
+    }
     let slab_base = slab_rd(ctl, SLAB_REL_BASE);
-    if slab_base == 0 { return false; }
+    if slab_base == 0 {
+        return false;
+    }
 
     let esp = read_reg32(ESP);
-    let lp_mem = match safe_read32s(esp + 12) { Ok(v) => v as u32, Err(_) => return false };
+    let lp_mem = match safe_read32s(esp + 12) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
 
     if lp_mem == 0 {
         write_reg32(EAX, 1); // HeapFree(NULL) = TRUE per Windows spec
@@ -2554,13 +2777,19 @@ unsafe fn handle_heap_free() -> bool {
 
     let slab_end = slab_rd(ctl, SLAB_REL_END);
     // Must be within slab with room for header
-    if lp_mem < slab_base + 16 || lp_mem >= slab_end { return false; }
+    if lp_mem < slab_base + 16 || lp_mem >= slab_end {
+        return false;
+    }
 
     // Validate slab header at [lp_mem - 4]
     let header = memory::read32_no_mmap_check(lp_mem - 4) as u32;
-    if (header & 0xFFFFFF00) != SLAB_MAGIC { return false; }
+    if (header & 0xFFFFFF00) != SLAB_MAGIC {
+        return false;
+    }
     let bin = header & 0x0F;
-    if bin > 8 { return false; }
+    if bin > 8 {
+        return false;
+    }
 
     // Mark the block FREE before linking it in — mirrors the inline stub's `MOV byte [EAX-3],'F'`.
     // The BUSY-only validate above already rejected an already-FREE block, so this closes the
@@ -2574,7 +2803,11 @@ unsafe fn handle_heap_free() -> bool {
     memory::write32_no_mmap_or_dirty_check(lp_mem, old_head as i32);
     slab_wr(ctl, fl_rel, lp_mem);
 
-    slab_wr(ctl, SLAB_REL_FREE_COUNT, slab_rd(ctl, SLAB_REL_FREE_COUNT).wrapping_add(1));
+    slab_wr(
+        ctl,
+        SLAB_REL_FREE_COUNT,
+        slab_rd(ctl, SLAB_REL_FREE_COUNT).wrapping_add(1),
+    );
     write_reg32(EAX, 1); // TRUE
     true
 }
@@ -2609,11 +2842,11 @@ unsafe fn handle_rt_dynamic_cast() -> bool {
         RtDynamicCastResult::Success(addr) => {
             write_reg32(EAX, addr as i32);
             true
-        }
+        },
         RtDynamicCastResult::FailNull => {
             write_reg32(EAX, 0);
             true
-        }
+        },
         RtDynamicCastResult::FailBadCast => false,
     }
 }

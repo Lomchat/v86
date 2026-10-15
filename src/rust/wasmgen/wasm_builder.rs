@@ -11,7 +11,7 @@ pub trait SafeToU8 {
 }
 impl SafeToU8 for usize {
     fn safe_to_u8(self) -> u8 {
-        dbg_assert!(self <= ::std::u8::MAX as usize);
+        dbg_assert!(self <= u8::MAX as usize);
         self as u8
     }
 }
@@ -21,13 +21,14 @@ pub trait SafeToU16 {
 }
 impl SafeToU16 for usize {
     fn safe_to_u16(self) -> u16 {
-        dbg_assert!(self <= ::std::u16::MAX as usize);
+        dbg_assert!(self <= u16::MAX as usize);
         self as u16
     }
 }
 
 #[derive(PartialEq)]
 #[allow(non_camel_case_types)]
+#[allow(dead_code)]
 enum FunctionType {
     FN0,
     FN1,
@@ -241,7 +242,9 @@ impl WasmBuilder {
 
         dbg_assert!(
             self.local_count as usize
-                == self.free_locals_i32.len() + self.free_locals_i64.len() + self.free_locals_f64.len(),
+                == self.free_locals_i32.len()
+                    + self.free_locals_i64.len()
+                    + self.free_locals_f64.len(),
             "All locals should have been freed"
         );
 
@@ -905,6 +908,7 @@ impl WasmBuilder {
         self.instruction_body.push(op::MEM_ALIGN128);
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
+    #[allow(dead_code)]
     pub fn load_unaligned_v128(&mut self, byte_offset: u32) {
         self.instruction_body.push(op::OP_SIMD_PREFIX);
         self.instruction_body.push(op::SIMD_V128_LOAD);
@@ -917,6 +921,7 @@ impl WasmBuilder {
         self.instruction_body.push(op::MEM_ALIGN128);
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
+    #[allow(dead_code)]
     pub fn store_unaligned_v128(&mut self, byte_offset: u32) {
         self.instruction_body.push(op::OP_SIMD_PREFIX);
         self.instruction_body.push(op::SIMD_V128_STORE);
@@ -941,6 +946,7 @@ impl WasmBuilder {
         self.instruction_body.push(op::SIMD_I64X2_SHL_LEB0);
         self.instruction_body.push(op::SIMD_I64X2_SHL_LEB1);
     }
+    #[allow(dead_code)]
     pub fn shr_s_i64x2(&mut self) {
         self.instruction_body.push(op::OP_SIMD_PREFIX);
         self.instruction_body.push(op::SIMD_I64X2_SHR_S_LEB0);
@@ -1286,6 +1292,7 @@ impl WasmBuilder {
 
     pub fn call_fn0(&mut self, name: &str) { self.call_fn(name, FunctionType::FN0) }
     pub fn call_fn0_ret(&mut self, name: &str) { self.call_fn(name, FunctionType::FN0_RET) }
+    #[allow(dead_code)]
     pub fn call_fn0_ret_i64(&mut self, name: &str) { self.call_fn(name, FunctionType::FN0_RET_I64) }
     pub fn call_fn1(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1) }
     pub fn call_fn1_ret(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1_RET) }

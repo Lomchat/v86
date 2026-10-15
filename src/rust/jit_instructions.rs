@@ -234,10 +234,17 @@ fn sse_mov_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32) {
 /// Inline bitwise v128 op for reg/reg SSE2 ANDPD/ANDPS/ORPD/ORPS/XORPD/XORPS.
 /// Semantics mirror `pand_r128(source=r1, dest=r2)`: r2 = r1 OP r2.
 #[repr(u8)]
-enum SseBitOp { And, Or, Xor }
+enum SseBitOp {
+    And,
+    Or,
+    Xor,
+}
 
 #[repr(u8)]
-enum SseI64x2Op { Add, Sub }
+enum SseI64x2Op {
+    Add,
+    Sub,
+}
 
 /// Inline i64x2 arithmetic for PADDQ/PSUBQ reg/reg (load+load+op+store).
 fn sse_i64x2_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseI64x2Op) {
@@ -258,7 +265,12 @@ fn sse_i64x2_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseI64x2Op) {
 }
 
 #[repr(u8)]
-enum SseScalarOp { Add, Sub, Mul, Div }
+enum SseScalarOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
 
 /// Scalar SSE2 arithmetic (MULSD/ADDSD/SUBSD/DIVSD, 32-bit MULSS/ADDSS/SUBSS/DIVSS)
 /// via pure scalar f64/f32: two scalar loads, the op, and an f64 store to the low 8
@@ -268,10 +280,13 @@ enum SseScalarOp { Add, Sub, Mul, Div }
 fn sse_scalar_f64_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseScalarOp) {
     codegen::gen_mark_fpu_simd_dirty_once(ctx);
     // r2_lo = r2_lo OP r1_lo; upper 64 bits of r2 untouched.
-    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
-    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
     ctx.builder.load_aligned_f64(0);
-    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
     ctx.builder.load_aligned_f64(0);
     match op {
         SseScalarOp::Add => ctx.builder.add_f64(),
@@ -285,10 +300,13 @@ fn sse_scalar_f64_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseScalarO
 fn sse_scalar_f32_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseScalarOp) {
     codegen::gen_mark_fpu_simd_dirty_once(ctx);
     // r2_lo32 = r2_lo32 OP r1_lo32; upper 96 bits of r2 untouched.
-    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
-    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
     ctx.builder.load_aligned_f32(0);
-    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
     ctx.builder.load_aligned_f32(0);
     match op {
         SseScalarOp::Add => ctx.builder.add_f32(),
@@ -3684,9 +3702,7 @@ pub fn instr16_D9_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_modrm_resolve(ctx, modrm_byte);
     codegen::gen_trigger_ud(ctx);
 }
-pub fn instr16_D9_1_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fpu_relaxed_fxch(ctx, r);
-}
+pub fn instr16_D9_1_reg_jit(ctx: &mut JitContext, r: u32) { codegen::gen_fpu_relaxed_fxch(ctx, r); }
 pub fn instr32_D9_1_reg_jit(ctx: &mut JitContext, r: u32) { instr16_D9_1_reg_jit(ctx, r) }
 pub fn instr32_D9_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     instr16_D9_1_mem_jit(ctx, modrm_byte)
@@ -4008,9 +4024,7 @@ pub fn instr16_DD_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder.free_local_i64(value_local);
     codegen::gen_fn0_const(ctx.builder, "fpu_pop");
 }
-pub fn instr16_DD_1_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fpu_relaxed_fxch(ctx, r);
-}
+pub fn instr16_DD_1_reg_jit(ctx: &mut JitContext, r: u32) { codegen::gen_fpu_relaxed_fxch(ctx, r); }
 pub fn instr32_DD_1_reg_jit(ctx: &mut JitContext, r: u32) { instr16_DD_1_reg_jit(ctx, r) }
 pub fn instr32_DD_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     instr16_DD_1_mem_jit(ctx, modrm_byte)
@@ -4115,9 +4129,7 @@ pub fn instr_DE_7_reg_jit(ctx: &mut JitContext, r: u32) {
 pub fn instr_DF_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_fpu_relaxed_fist_m16(ctx, modrm_byte, true, true);
 }
-pub fn instr_DF_1_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_fpu_relaxed_fxch(ctx, r);
-}
+pub fn instr_DF_1_reg_jit(ctx: &mut JitContext, r: u32) { codegen::gen_fpu_relaxed_fxch(ctx, r); }
 
 pub fn instr_DF_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_fpu_relaxed_fist_m16(ctx, modrm_byte, false, false);
@@ -4855,7 +4867,15 @@ fn gen_string_ins(ctx: &mut JitContext, ins: String, size: u8, prefix: u8) {
         let prefix = ctx.cpu.prefixes & PREFIX_MASK_SEGMENT;
         dbg_assert!(prefix != SEG_PREFIX_ZERO);
         let seg = if prefix != 0 { (prefix - 1) as u32 } else { regs::DS };
-        let size_code = if size == 8 { 0 } else if size == 16 { 1 } else { 2 };
+        let size_code = if size == 8 {
+            0
+        }
+        else if size == 16 {
+            1
+        }
+        else {
+            2
+        };
         let packed = size_code | (ctx.cpu.asize_32() as i32) << 2 | (seg as i32) << 8;
 
         codegen::gen_get_reg32(ctx, regs::ESI);
@@ -4890,7 +4910,15 @@ fn gen_string_ins(ctx: &mut JitContext, ins: String, size: u8, prefix: u8) {
         codegen::gen_move_registers_from_locals_to_memory(ctx);
         ctx.builder.const_i32(ctx.cpu.asize_32() as i32);
         ctx.builder.const_i32(seg as i32);
-        let name = if size == 8 { "movsb_rep" } else if size == 16 { "movsw_rep" } else { "movsd_rep" };
+        let name = if size == 8 {
+            "movsb_rep"
+        }
+        else if size == 16 {
+            "movsw_rep"
+        }
+        else {
+            "movsd_rep"
+        };
         ctx.builder.call_fn2(name);
         codegen::gen_move_registers_from_memory_to_locals(ctx);
         codegen::gen_get_reg32(ctx, regs::ECX);

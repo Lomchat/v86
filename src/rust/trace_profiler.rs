@@ -64,9 +64,7 @@ pub fn hotpage_note(eip: u32) {
 }
 
 #[no_mangle]
-pub unsafe fn hotpage_arm(on: u32) {
-    HOTPAGE_ARMED = on != 0;
-}
+pub unsafe fn hotpage_arm(on: u32) { HOTPAGE_ARMED = on != 0; }
 
 #[no_mangle]
 pub unsafe fn hotpage_reset() {
@@ -92,9 +90,7 @@ pub unsafe fn hotpage_snapshot() -> u32 {
 }
 
 #[no_mangle]
-pub unsafe fn hotpage_addr(i: u32) -> u32 {
-    HOTPAGE_SNAPSHOT.get(i as usize).map_or(0, |e| e.0)
-}
+pub unsafe fn hotpage_addr(i: u32) -> u32 { HOTPAGE_SNAPSHOT.get(i as usize).map_or(0, |e| e.0) }
 
 #[no_mangle]
 pub unsafe fn hotpage_count_at(i: u32) -> u32 {
@@ -131,9 +127,9 @@ pub struct BlockRecord {
     pub last_instruction_addr: u32, // physical address of the terminal instruction
     pub end_addr: u32,
     pub kind: u8,
-    pub condition: u8,           // Jcc condition for KIND_CONDITIONAL, else 0
-    pub succ_fallthrough: u32,   // 0 = none/unknown (target outside module)
-    pub succ_taken: u32,         // 0 = none/unknown
+    pub condition: u8,         // Jcc condition for KIND_CONDITIONAL, else 0
+    pub succ_fallthrough: u32, // 0 = none/unknown (target outside module)
+    pub succ_taken: u32,       // 0 = none/unknown
     pub number_of_instructions: u32,
     pub is_entry_block: bool,
     pub slot: u32, // index into BLOCK_EXEC_COUNTS, u32::MAX = unassigned (slot cap hit)
@@ -171,9 +167,7 @@ fn state() -> &'static mut State {
 
 pub fn is_enabled() -> bool { unsafe { ENABLED } }
 
-pub fn is_page_watched(page: Page) -> bool {
-    unsafe { ENABLED && WATCHED_PAGES.contains(&page) }
-}
+pub fn is_page_watched(page: Page) -> bool { unsafe { ENABLED && WATCHED_PAGES.contains(&page) } }
 
 /// Assign (or look up) the exec-counter slot for a block and register its CFG
 /// record. Called from jit_generate_module for blocks on watched pages.
@@ -328,53 +322,82 @@ pub unsafe fn trace2_block_snapshot() -> u32 {
 
 #[no_mangle]
 pub unsafe fn trace2_block_addr(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.0.addr)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.0.addr)
 }
 #[no_mangle]
 pub unsafe fn trace2_block_last_ins_addr(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.0.last_instruction_addr)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.0.last_instruction_addr)
 }
 #[no_mangle]
 pub unsafe fn trace2_block_end_addr(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.0.end_addr)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.0.end_addr)
 }
 #[no_mangle]
 pub unsafe fn trace2_block_kind(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.0.kind as u32)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.0.kind as u32)
 }
 #[no_mangle]
 pub unsafe fn trace2_block_condition(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.0.condition as u32)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.0.condition as u32)
 }
 #[no_mangle]
 pub unsafe fn trace2_block_succ_fallthrough(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.0.succ_fallthrough)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.0.succ_fallthrough)
 }
 #[no_mangle]
 pub unsafe fn trace2_block_succ_taken(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.0.succ_taken)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.0.succ_taken)
 }
 #[no_mangle]
 pub unsafe fn trace2_block_instructions(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.0.number_of_instructions)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.0.number_of_instructions)
 }
 #[no_mangle]
 pub unsafe fn trace2_block_is_entry(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.0.is_entry_block as u32)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.0.is_entry_block as u32)
 }
 /// Exec count, truncated to u32 (4 billion executions per snapshot window is
 /// beyond any realistic profiling session).
 #[no_mangle]
 pub unsafe fn trace2_block_exec(i: u32) -> u32 {
-    state().block_snapshot.get(i as usize).map_or(0, |e| e.1.min(u32::MAX as u64) as u32)
+    state()
+        .block_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.1.min(u32::MAX as u64) as u32)
 }
 
 /// Build the indirect-target snapshot (sorted by hits, desc). Returns count.
 #[no_mangle]
 pub unsafe fn trace2_indirect_snapshot() -> u32 {
     let s = state();
-    let mut v: Vec<(u32, u32, u64)> =
-        s.indirects.iter().map(|(&(f, t), &h)| (f, t, h)).collect();
+    let mut v: Vec<(u32, u32, u64)> = s.indirects.iter().map(|(&(f, t), &h)| (f, t, h)).collect();
     v.sort_by(|a, b| b.2.cmp(&a.2));
     s.indirect_snapshot = v;
     s.indirect_snapshot.len() as u32
@@ -390,5 +413,8 @@ pub unsafe fn trace2_indirect_target(i: u32) -> u32 {
 }
 #[no_mangle]
 pub unsafe fn trace2_indirect_hits(i: u32) -> u32 {
-    state().indirect_snapshot.get(i as usize).map_or(0, |e| e.2.min(u32::MAX as u64) as u32)
+    state()
+        .indirect_snapshot
+        .get(i as usize)
+        .map_or(0, |e| e.2.min(u32::MAX as u64) as u32)
 }

@@ -2319,7 +2319,10 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
     let compiling = HashSet::from_iter(ctx.compiling.keys().copied());
     dbg_assert!(free.intersection(&used).next().is_none());
     dbg_assert!(used.intersection(&compiling).next().is_none());
-    dbg_assert!(free.len() + used.len() + compiling.len() == (WASM_TABLE_SIZE - 1) as usize);
+    dbg_assert!(
+        free.len() + used.len() + compiling.len()
+            == (WASM_TABLE_SIZE - 1 - EXTERNAL_MODULE_SLOTS) as usize
+    );
 
     for state in ctx.compiling.values() {
         if let CompilingPageState::Compiling { pages } = state {

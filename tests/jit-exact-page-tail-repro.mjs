@@ -103,7 +103,7 @@ function run(exactTail, image = buildImage, crossPage = false)
         let timer;
         const finish = status => {
             clearTimeout(timer);
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             const cpu = emulator.v86.cpu;
             resolve({
                 status,

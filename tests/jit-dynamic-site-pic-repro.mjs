@@ -63,7 +63,7 @@ function run(pic, secondWay = false, budgetFastExit = true, cycleLimit = 100_003
             clearTimeout(timer);
             const cpu = emulator.v86.cpu;
             const elapsedMs = performance.now() - started;
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             resolve({
                 status,
                 pic: cpu.get_jit_config?.(30) >>> 0,

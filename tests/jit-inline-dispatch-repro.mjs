@@ -92,7 +92,7 @@ function run({ inline, crossPage = false })
         const finish = status => {
             clearTimeout(timer);
             const elapsedMs = performance.now() - started;
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             const cpu = emulator.v86.cpu;
             resolve({
                 status,

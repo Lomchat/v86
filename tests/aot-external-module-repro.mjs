@@ -80,7 +80,7 @@ function run(label, { external = false } = {})
         let timer, startedAt = 0;
         const finish = status => {
             clearTimeout(timer);
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             const cpu = emulator.v86.cpu;
             const ex = cpu.wm.exports;
             resolve({

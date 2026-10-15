@@ -107,7 +107,7 @@ function roundTrip(bytes)
             cpu.wm.exports["jit_hot_profile_clear"]();
             const pages = importProfile(cpu, bytes);
             const out = exportProfile(cpu);
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             resolve({ pages, out });
         });
     });
@@ -122,7 +122,7 @@ function run(label, { profile = null, patch = null, mode = 0 } = {})
         let timer, startedAt = 0;
         const finish = status => {
             clearTimeout(timer);
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             const cpu = emulator.v86.cpu;
             const ex = cpu.wm.exports;
             resolve({

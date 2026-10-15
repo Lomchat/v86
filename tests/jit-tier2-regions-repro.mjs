@@ -86,7 +86,7 @@ function run(mode)
                 regionPromotions: w.jit_get_tier2_region_promotions?.() ?? -1,
                 regionSeeds: w.jit_get_tier2_region_seeds?.() ?? -1,
             };
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             resolve(result);
         };
         emulator.bus.register("cpu-event-halt", () => finish("halt"));

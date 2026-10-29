@@ -228,17 +228,22 @@ c!(MEM_ALIGN128, 4);
 // Reference: https://webassembly.github.io/spec/core/appendix/index-instructions.html
 c!(OP_SIMD_PREFIX, 0xfd);
 // Memory ops — memarg (align+offset) follows like other load/store ops.
-c!(SIMD_V128_LOAD, 0x00);      // v128.load
-c!(SIMD_V128_STORE, 0x0b);     // v128.store
-// Most-useful fixed-size ops (all single-byte sub-opcodes here).
-c!(SIMD_V128_AND, 0x4e);       // v128.and  (78)
-c!(SIMD_V128_OR, 0x50);        // v128.or   (80)
-c!(SIMD_V128_XOR, 0x51);       // v128.xor  (81)
-// Multi-byte sub-opcodes (>= 128) — emitted via two LEB bytes.
-// i64x2 shifts: sub-opcode values 203 (SHL) / 204 (SHR_S) / 205 (SHR_U).
-c!(SIMD_I64X2_SHL_LEB0, 0xcb);   c!(SIMD_I64X2_SHL_LEB1, 0x01);   // 203
-c!(SIMD_I64X2_SHR_S_LEB0, 0xcc); c!(SIMD_I64X2_SHR_S_LEB1, 0x01); // 204
-c!(SIMD_I64X2_SHR_U_LEB0, 0xcd); c!(SIMD_I64X2_SHR_U_LEB1, 0x01); // 205
-// i64x2 arithmetic.
-c!(SIMD_I64X2_ADD_LEB0, 0xce); c!(SIMD_I64X2_ADD_LEB1, 0x01);   // 206
-c!(SIMD_I64X2_SUB_LEB0, 0xd1); c!(SIMD_I64X2_SUB_LEB1, 0x01);   // 209
+c!(SIMD_V128_LOAD, 0x00); // v128.load
+c!(SIMD_V128_STORE, 0x0b); // v128.store
+                           // Most-useful fixed-size ops (all single-byte sub-opcodes here).
+c!(SIMD_V128_AND, 0x4e); // v128.and  (78)
+c!(SIMD_V128_OR, 0x50); // v128.or   (80)
+c!(SIMD_V128_XOR, 0x51); // v128.xor  (81)
+                         // Multi-byte sub-opcodes (>= 128) — emitted via two LEB bytes.
+                         // i64x2 shifts: sub-opcode values 203 (SHL) / 204 (SHR_S) / 205 (SHR_U).
+c!(SIMD_I64X2_SHL_LEB0, 0xcb);
+c!(SIMD_I64X2_SHL_LEB1, 0x01); // 203
+c!(SIMD_I64X2_SHR_S_LEB0, 0xcc);
+c!(SIMD_I64X2_SHR_S_LEB1, 0x01); // 204
+c!(SIMD_I64X2_SHR_U_LEB0, 0xcd);
+c!(SIMD_I64X2_SHR_U_LEB1, 0x01); // 205
+                                 // i64x2 arithmetic.
+c!(SIMD_I64X2_ADD_LEB0, 0xce);
+c!(SIMD_I64X2_ADD_LEB1, 0x01); // 206
+c!(SIMD_I64X2_SUB_LEB0, 0xd1);
+c!(SIMD_I64X2_SUB_LEB1, 0x01); // 209

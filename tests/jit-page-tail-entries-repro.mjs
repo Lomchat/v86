@@ -62,7 +62,7 @@ function run(enabled)
         let startedAt = 0;
         const finish = status => {
             clearTimeout(timer);
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             const cpu = emulator.v86.cpu;
             resolve({
                 status,

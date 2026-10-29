@@ -25,8 +25,4 @@ fn read_block(addr: i32, dst: *mut u8, len: u32) -> bool {
     }
 }
 
-pub fn init() {
-    set_guest_mem(GuestMem {
-        read_block,
-    });
-}
+pub fn init() { set_guest_mem(GuestMem { read_block }); }

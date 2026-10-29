@@ -37,6 +37,7 @@ export default [
                 "Image": "readonly",
                 "OffscreenCanvas": "readonly",
                 "BroadcastChannel": "readonly",
+                "MessageChannel": "readonly",
 
                 "AudioContext": "readonly",
                 "AudioWorkletProcessor": "readonly",

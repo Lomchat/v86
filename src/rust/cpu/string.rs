@@ -98,12 +98,11 @@ pub unsafe fn movs_rep_jit_fast(src: i32, dst: i64, count: i64, packed: i32) -> 
     let ds = *segment_offsets.offset(seg as isize);
     let direction = if *flags & FLAG_DIRECTION != 0 { -1 } else { 1 };
 
-    let (mut phys_dst, skip_dirty_page) = match
-        translate_address_write_jit_and_can_skip_dirty(es.wrapping_add(dst as i32))
-    {
-        Ok(value) => value,
-        Err(()) => return 2,
-    };
+    let (mut phys_dst, skip_dirty_page) =
+        match translate_address_write_jit_and_can_skip_dirty(es.wrapping_add(dst as i32)) {
+            Ok(value) => value,
+            Err(()) => return 2,
+        };
     let mut phys_src = match translate_address_read_jit(ds.wrapping_add(src as i32)) {
         Ok(value) => value,
         Err(()) => return 2,

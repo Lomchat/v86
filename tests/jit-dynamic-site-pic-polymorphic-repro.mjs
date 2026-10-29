@@ -67,7 +67,7 @@ const result = await new Promise(resolve => {
         clearTimeout(timer);
         const cpu = emulator.v86.cpu;
         const ex = cpu.wm.exports;
-        try { emulator.stop(); } catch {}
+        try { emulator.stop(); } catch{}
         resolve({
             status,
             eax: cpu.reg32[0] >>> 0,
@@ -121,7 +121,7 @@ function runTimed(secondWay, fourWay = false, callCount = 2)
             clearTimeout(timer);
             const cpu = emulator.v86.cpu;
             const elapsedMs = performance.now() - started;
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             resolve({
                 status,
                 secondWay: cpu.get_jit_config?.(32) >>> 0,

@@ -20,9 +20,7 @@ static mut GUEST_MEM: Option<GuestMem> = None;
 
 /// Install the host's accessors. Call once at emulator init, before any arena function
 /// that touches guest memory (d3d9_record_draw_up / d3d9_record_draw_indexed_up).
-pub fn set_guest_mem(gm: GuestMem) {
-    unsafe { GUEST_MEM = Some(gm) }
-}
+pub fn set_guest_mem(gm: GuestMem) { unsafe { GUEST_MEM = Some(gm) } }
 
 pub(crate) fn guest_mem() -> Option<&'static GuestMem> {
     unsafe { (*std::ptr::addr_of!(GUEST_MEM)).as_ref() }

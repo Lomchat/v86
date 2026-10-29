@@ -44,12 +44,22 @@ def main():
 
     lld = find_rust_lld()
 
+    # rustc >= 1.98 no longer passes --allow-undefined (our imports from JS are
+    # undefined symbols), and newer wasm-ld places the stack first by default
+    args += ["--allow-undefined"]
+    if supports_flag(lld, "--no-stack-first"):
+        args += ["--no-stack-first"]
+
     result = subprocess.run([lld] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     print(result.stderr, file=sys.stderr)
     print(result.stdout)
 
     result.check_returncode()
+
+def supports_flag(lld, flag):
+    out = subprocess.run([lld, "-flavor", "wasm", "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return flag in out.stdout.decode("utf8")
 
 def find_host_triplet():
     rustc = subprocess.run(["rustc", "--version", "--verbose"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)

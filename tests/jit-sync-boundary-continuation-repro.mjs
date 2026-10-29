@@ -102,7 +102,7 @@ function run(enabled)
         let timer, startedAt = 0;
         const finish = status => {
             clearTimeout(timer);
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             const cpu = emulator.v86.cpu;
             resolve({
                 status,
@@ -146,7 +146,7 @@ function runRedirectGuard(enabled)
         let timer;
         const finish = status => {
             clearTimeout(timer);
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             const cpu = emulator.v86.cpu;
             resolve({
                 status,

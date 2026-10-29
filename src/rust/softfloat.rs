@@ -9,14 +9,17 @@ pub static mut PRECISION_SINGLE: bool = false;
 
 #[inline]
 fn apply_precision(f: f64) -> f64 {
-    if unsafe { PRECISION_SINGLE } { f as f32 as f64 } else { f }
+    if unsafe { PRECISION_SINGLE } {
+        f as f32 as f64
+    }
+    else {
+        f
+    }
 }
 
 // Codegen reads this to skip the relaxed inline binop (raw f64) under PC=single.
 #[allow(dead_code)]
-pub fn is_precision_single() -> bool {
-    unsafe { PRECISION_SINGLE }
-}
+pub fn is_precision_single() -> bool { unsafe { PRECISION_SINGLE } }
 
 /// Relaxed FPU mode: store raw f64 bits directly in F80.mantissa with RELAXED_TAG.
 /// Eliminates the F80 biasing overhead in to_f64()/of_f64() (~8% WASM CPU for Re-Volt).
@@ -30,7 +33,9 @@ const RELAXED_TAG: u16 = 0x7FFE;
 
 #[no_mangle]
 pub extern "C" fn set_relaxed_fpu(enabled: u32) {
-    unsafe { FPU_RELAXED = enabled != 0; }
+    unsafe {
+        FPU_RELAXED = enabled != 0;
+    }
 }
 
 // The f64 transcendentals behind fsin/fcos/fptan/fpatan, exported so that
@@ -45,14 +50,10 @@ pub extern "C" fn x87_tan_f64(x: f64) -> f64 { x.tan() }
 pub extern "C" fn x87_atan2_f64(y: f64, x: f64) -> f64 { y.atan2(x) }
 
 #[no_mangle]
-pub extern "C" fn get_relaxed_fpu() -> u32 {
-    unsafe { FPU_RELAXED as u32 }
-}
+pub extern "C" fn get_relaxed_fpu() -> u32 { unsafe { FPU_RELAXED as u32 } }
 
 #[allow(dead_code)]
-pub fn is_fpu_relaxed() -> bool {
-    unsafe { FPU_RELAXED }
-}
+pub fn is_fpu_relaxed() -> bool { unsafe { FPU_RELAXED } }
 
 /// When off (default), the relaxed fast path emits no hit/fallback counter increment.
 /// Toggle on (and clear the JIT cache so blocks recompile) only to measure hit-rate.
@@ -60,18 +61,16 @@ static mut FPU_RELAXED_STATS: bool = false;
 
 #[no_mangle]
 pub extern "C" fn set_fpu_relaxed_stats(enabled: u32) {
-    unsafe { FPU_RELAXED_STATS = enabled != 0; }
+    unsafe {
+        FPU_RELAXED_STATS = enabled != 0;
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn get_fpu_relaxed_stats() -> u32 {
-    unsafe { FPU_RELAXED_STATS as u32 }
-}
+pub extern "C" fn get_fpu_relaxed_stats() -> u32 { unsafe { FPU_RELAXED_STATS as u32 } }
 
 #[allow(dead_code)]
-pub fn is_fpu_relaxed_stats() -> bool {
-    unsafe { FPU_RELAXED_STATS }
-}
+pub fn is_fpu_relaxed_stats() -> bool { unsafe { FPU_RELAXED_STATS } }
 
 pub enum RoundingMode {
     NearEven,
@@ -131,7 +130,9 @@ impl F80 {
 
     pub fn sign(&self) -> bool {
         // A relaxed slot keeps the f64 sign in bit 63 of its mantissa.
-        if self.sign_exponent == RELAXED_TAG { return (self.mantissa >> 63) == 1; }
+        if self.sign_exponent == RELAXED_TAG {
+            return (self.mantissa >> 63) == 1;
+        }
         (self.sign_exponent >> 15) == 1
     }
     pub fn exponent(&self) -> i16 { (self.sign_exponent as i16 & 0x7FFF) - 0x3FFF }
@@ -198,7 +199,10 @@ impl F80 {
         // Relaxed fast path: store f64 bits directly, skip biasing
         unsafe {
             if FPU_RELAXED {
-                return F80 { mantissa: src, sign_exponent: RELAXED_TAG };
+                return F80 {
+                    mantissa: src,
+                    sign_exponent: RELAXED_TAG,
+                };
             }
         }
         F80::of_f64_strict(src)
@@ -272,13 +276,9 @@ impl F80 {
         (f as f32).to_bits() as i32
     }
 
-    pub fn of_i32(src: i32) -> F80 {
-        F80::of_f64((src as f64).to_bits())
-    }
+    pub fn of_i32(src: i32) -> F80 { F80::of_f64((src as f64).to_bits()) }
 
-    pub fn of_i64(src: i64) -> F80 {
-        F80::of_f64((src as f64).to_bits())
-    }
+    pub fn of_i64(src: i64) -> F80 { F80::of_f64((src as f64).to_bits()) }
 
     pub fn to_i32(&self) -> i32 {
         let f = f64::from_bits(self.to_f64());
@@ -295,7 +295,8 @@ impl F80 {
         };
         if rounded >= (i32::MAX as f64 + 1.0) || rounded < (i32::MIN as f64) {
             i32::MIN // overflow -> indefinite
-        } else {
+        }
+        else {
             rounded as i32
         }
     }
@@ -315,7 +316,8 @@ impl F80 {
         };
         if rounded >= (i64::MAX as f64 + 1.0) || rounded < (i64::MIN as f64) {
             i64::MIN // overflow -> indefinite
-        } else {
+        }
+        else {
             rounded as i64
         }
     }
@@ -324,7 +326,8 @@ impl F80 {
         let f = f64::from_bits(self.to_f64());
         if f.is_nan() || f >= (i32::MAX as f64 + 1.0) || f < (i32::MIN as f64) {
             i32::MIN
-        } else {
+        }
+        else {
             f as i32
         }
     }
@@ -333,7 +336,8 @@ impl F80 {
         let f = f64::from_bits(self.to_f64());
         if f.is_nan() || f >= (i64::MAX as f64 + 1.0) || f < (i64::MIN as f64) {
             i64::MIN
-        } else {
+        }
+        else {
             f as i64
         }
     }
@@ -350,9 +354,16 @@ impl F80 {
     pub fn abs(self) -> F80 {
         if self.sign_exponent == RELAXED_TAG {
             // Relaxed format: sign is bit 63 of mantissa (f64 bits)
-            F80 { mantissa: self.mantissa & !(1u64 << 63), sign_exponent: RELAXED_TAG }
-        } else {
-            F80 { mantissa: self.mantissa, sign_exponent: self.sign_exponent & !0x8000 }
+            F80 {
+                mantissa: self.mantissa & !(1u64 << 63),
+                sign_exponent: RELAXED_TAG,
+            }
+        }
+        else {
+            F80 {
+                mantissa: self.mantissa,
+                sign_exponent: self.sign_exponent & !0x8000,
+            }
         }
     }
     pub fn two_pow(self) -> F80 { F80::of_f64x(2.0f64.powf(self.to_f64x())) }
@@ -361,7 +372,8 @@ impl F80 {
     pub fn to_true_f80(self) -> F80 {
         if self.sign_exponent == RELAXED_TAG {
             F80::of_f64_strict(self.mantissa)
-        } else {
+        }
+        else {
             self
         }
     }
@@ -382,13 +394,22 @@ impl F80 {
         let new_exp = exp_field + n;
         // Overflow -> signed Inf (cap below RELAXED_TAG so the result can't alias it)
         if new_exp >= 0x7FFE {
-            return F80 { mantissa: 0x8000000000000000, sign_exponent: sign_bit | 0x7FFF };
+            return F80 {
+                mantissa: 0x8000000000000000,
+                sign_exponent: sign_bit | 0x7FFF,
+            };
         }
         // Underflow -> signed zero
         if new_exp <= 0 {
-            return F80 { mantissa: 0, sign_exponent: sign_bit };
+            return F80 {
+                mantissa: 0,
+                sign_exponent: sign_bit,
+            };
         }
-        F80 { mantissa: v.mantissa, sign_exponent: sign_bit | (new_exp as u16) }
+        F80 {
+            mantissa: v.mantissa,
+            sign_exponent: sign_bit | (new_exp as u16),
+        }
     }
 
     pub fn round(self) -> F80 {
@@ -404,20 +425,12 @@ impl F80 {
         F80::of_f64x(rounded)
     }
 
-    pub fn trunc(self) -> F80 {
-        F80::of_f64x(self.to_f64x().trunc())
-    }
+    pub fn trunc(self) -> F80 { F80::of_f64x(self.to_f64x().trunc()) }
 
-    pub fn sqrt(self) -> F80 {
-        F80::of_f64x(apply_precision(self.to_f64x().sqrt()))
-    }
+    pub fn sqrt(self) -> F80 { F80::of_f64x(apply_precision(self.to_f64x().sqrt())) }
 
-    pub fn is_finite(self) -> bool {
-        self != F80::POS_INFINITY && self != F80::NEG_INFINITY
-    }
-    pub fn is_nan(self) -> bool {
-        self != self
-    }
+    pub fn is_finite(self) -> bool { self != F80::POS_INFINITY && self != F80::NEG_INFINITY }
+    pub fn is_nan(self) -> bool { self != self }
 
     pub fn set_rounding_mode(mode: RoundingMode) {
         unsafe {
@@ -469,11 +482,18 @@ fn round_ties_even(f: f64) -> f64 {
         let candidate = f.round();
         if (candidate as i64) % 2 != 0 {
             // Rounded to odd, go the other way
-            if f > 0.0 { candidate - 1.0 } else { candidate + 1.0 }
-        } else {
+            if f > 0.0 {
+                candidate - 1.0
+            }
+            else {
+                candidate + 1.0
+            }
+        }
+        else {
             candidate
         }
-    } else {
+    }
+    else {
         rounded
     }
 }
@@ -484,7 +504,10 @@ impl std::ops::Add for F80 {
         // Fast path: both operands already hold raw f64 bits
         if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
             let r = apply_precision(f64::from_bits(self.mantissa) + f64::from_bits(other.mantissa));
-            return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
+            return F80 {
+                mantissa: r.to_bits(),
+                sign_exponent: RELAXED_TAG,
+            };
         }
         let a = f64::from_bits(self.to_f64());
         let b = f64::from_bits(other.to_f64());
@@ -496,7 +519,10 @@ impl std::ops::Sub for F80 {
     fn sub(self, other: Self) -> Self {
         if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
             let r = apply_precision(f64::from_bits(self.mantissa) - f64::from_bits(other.mantissa));
-            return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
+            return F80 {
+                mantissa: r.to_bits(),
+                sign_exponent: RELAXED_TAG,
+            };
         }
         let a = f64::from_bits(self.to_f64());
         let b = f64::from_bits(other.to_f64());
@@ -508,8 +534,12 @@ impl std::ops::Neg for F80 {
     fn neg(self) -> Self {
         if self.sign_exponent == RELAXED_TAG {
             // Relaxed format: sign is bit 63 of mantissa (f64 bits)
-            F80 { mantissa: self.mantissa ^ (1u64 << 63), sign_exponent: RELAXED_TAG }
-        } else {
+            F80 {
+                mantissa: self.mantissa ^ (1u64 << 63),
+                sign_exponent: RELAXED_TAG,
+            }
+        }
+        else {
             let mut result = self;
             result.sign_exponent ^= 1 << 15;
             result
@@ -521,7 +551,10 @@ impl std::ops::Mul for F80 {
     fn mul(self, other: Self) -> Self {
         if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
             let r = apply_precision(f64::from_bits(self.mantissa) * f64::from_bits(other.mantissa));
-            return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
+            return F80 {
+                mantissa: r.to_bits(),
+                sign_exponent: RELAXED_TAG,
+            };
         }
         let a = f64::from_bits(self.to_f64());
         let b = f64::from_bits(other.to_f64());
@@ -533,7 +566,10 @@ impl std::ops::Div for F80 {
     fn div(self, other: Self) -> Self {
         if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
             let r = apply_precision(f64::from_bits(self.mantissa) / f64::from_bits(other.mantissa));
-            return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
+            return F80 {
+                mantissa: r.to_bits(),
+                sign_exponent: RELAXED_TAG,
+            };
         }
         let a = f64::from_bits(self.to_f64());
         let b = f64::from_bits(other.to_f64());
@@ -545,7 +581,10 @@ impl std::ops::Rem for F80 {
     fn rem(self, other: Self) -> Self {
         if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
             let r = f64::from_bits(self.mantissa) % f64::from_bits(other.mantissa);
-            return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
+            return F80 {
+                mantissa: r.to_bits(),
+                sign_exponent: RELAXED_TAG,
+            };
         }
         let quot = (self / other).trunc();
         self - quot * other
@@ -575,11 +614,9 @@ impl PartialOrd for F80 {
 
 #[cfg(test)]
 mod tests {
-    use super::{F80, RoundingMode};
+    use super::{RoundingMode, F80};
 
-    fn f80(value: f64) -> F80 {
-        F80::of_f64(value.to_bits())
-    }
+    fn f80(value: f64) -> F80 { F80::of_f64(value.to_bits()) }
 
     #[test]
     fn truncate_i64_is_toward_zero_regardless_of_control_rounding() {

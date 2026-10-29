@@ -9,6 +9,10 @@ var registerProcessor = function(name, processor) {};
 
 const sampleRate = 0;
 
+// JIT switches read from globalThis by cpu.js (must not be renamed)
+globalThis.ENABLE_JIT_BLOCK_CHAINING;
+globalThis.DISABLE_JIT_DEAD_FLAG_ELISION;
+
 var WabtModule = {
     readWasm: function(buf, opt) {},
     generateNames: function() {},

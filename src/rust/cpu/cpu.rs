@@ -310,9 +310,7 @@ pub static mut jit_slice_limit: u32 = 0;
 /// slices; this setter only makes an urgent zero visible before the current JIT
 /// module can continue through another direct or dynamic edge.
 #[no_mangle]
-pub unsafe fn jit_set_cycle_limit_cached(limit: u32) {
-    jit_cycle_limit_cached = limit;
-}
+pub unsafe fn jit_set_cycle_limit_cached(limit: u32) { jit_cycle_limit_cached = limit; }
 
 // should probably be kept in sync with APIC_TIMER_FREQ in apic.js
 pub const TSC_RATE: f64 = 1_000_000.0;
@@ -321,9 +319,11 @@ pub static mut cpuid_level: u32 = 0x16;
 
 pub static mut jit_block_boundary: bool = false;
 
+#[allow(dead_code)]
 const TSC_ENABLE_IMPRECISE_BROWSER_WORKAROUND: bool = true;
 
 #[cfg(debug_assertions)]
+#[allow(dead_code)]
 const TSC_VERBOSE_LOGGING: bool = false;
 #[cfg(debug_assertions)]
 pub static mut tsc_last_extra: u64 = 0;
@@ -404,20 +404,30 @@ pub static mut DBG_ENABLED: bool = false;
 pub static mut DBG_BP: [u32; DBG_MAX_BP] = [0u32; DBG_MAX_BP];
 pub static mut DBG_BP_COUNT: usize = 0;
 pub static mut DBG_STEP_REMAINING: u32 = 0; // when >0, trace each instr and decrement
-pub static mut DBG_STEP_ON_BP: u32 = 0;     // on a breakpoint hit, auto-arm this many step traces
+pub static mut DBG_STEP_ON_BP: u32 = 0; // on a breakpoint hit, auto-arm this many step traces
 pub static mut DBG_WATCH: [u32; DBG_MAX_WATCH] = [0u32; DBG_MAX_WATCH];
 pub static mut DBG_WATCH_COUNT: usize = 0;
 pub static mut DBG_WATCH_INDIRECT: bool = false; // log *(watch) and the byte at *(watch) too
 pub static mut DBG_STEP_COUNTER: u32 = 0;
-pub static mut DBG_MAX_DUMPS: u32 = 4000;   // hard cap so a runaway trace can't flood
+pub static mut DBG_MAX_DUMPS: u32 = 4000; // hard cap so a runaway trace can't flood
 
-#[no_mangle] pub unsafe fn dbg_enable(on: u32) { DBG_ENABLED = on != 0; }
-#[no_mangle] pub unsafe fn dbg_clear() {
-    DBG_BP_COUNT = 0; DBG_WATCH_COUNT = 0; DBG_STEP_REMAINING = 0; DBG_STEP_ON_BP = 0;
-    DBG_WATCH_INDIRECT = false; DBG_STEP_COUNTER = 0;
+#[no_mangle]
+pub unsafe fn dbg_enable(on: u32) { DBG_ENABLED = on != 0; }
+#[no_mangle]
+pub unsafe fn dbg_clear() {
+    DBG_BP_COUNT = 0;
+    DBG_WATCH_COUNT = 0;
+    DBG_STEP_REMAINING = 0;
+    DBG_STEP_ON_BP = 0;
+    DBG_WATCH_INDIRECT = false;
+    DBG_STEP_COUNTER = 0;
 }
-#[no_mangle] pub unsafe fn dbg_add_bp(eip: u32) {
-    if DBG_BP_COUNT < DBG_MAX_BP { DBG_BP[DBG_BP_COUNT] = eip; DBG_BP_COUNT += 1; }
+#[no_mangle]
+pub unsafe fn dbg_add_bp(eip: u32) {
+    if DBG_BP_COUNT < DBG_MAX_BP {
+        DBG_BP[DBG_BP_COUNT] = eip;
+        DBG_BP_COUNT += 1;
+    }
 }
 /// True if any breakpoint lies on the same 4 KiB page as `eip`. Used to keep that page
 /// interpreted (so dbg_on_instruction can fire the bp) while the rest of the guest JITs.
@@ -425,24 +435,34 @@ pub unsafe fn page_contains_bp(eip: u32) -> bool {
     let page = eip & !0xFFF;
     let mut i = 0;
     while i < DBG_BP_COUNT {
-        if (DBG_BP[i] & !0xFFF) == page { return true; }
+        if (DBG_BP[i] & !0xFFF) == page {
+            return true;
+        }
         i += 1;
     }
     false
 }
-#[no_mangle] pub unsafe fn dbg_set_step_on_bp(n: u32) { DBG_STEP_ON_BP = n; }
-#[no_mangle] pub unsafe fn dbg_arm_step(n: u32) { DBG_STEP_REMAINING = n; }
-#[no_mangle] pub unsafe fn dbg_add_watch(addr: u32) {
-    if DBG_WATCH_COUNT < DBG_MAX_WATCH { DBG_WATCH[DBG_WATCH_COUNT] = addr; DBG_WATCH_COUNT += 1; }
+#[no_mangle]
+pub unsafe fn dbg_set_step_on_bp(n: u32) { DBG_STEP_ON_BP = n; }
+#[no_mangle]
+pub unsafe fn dbg_arm_step(n: u32) { DBG_STEP_REMAINING = n; }
+#[no_mangle]
+pub unsafe fn dbg_add_watch(addr: u32) {
+    if DBG_WATCH_COUNT < DBG_MAX_WATCH {
+        DBG_WATCH[DBG_WATCH_COUNT] = addr;
+        DBG_WATCH_COUNT += 1;
+    }
 }
-#[no_mangle] pub unsafe fn dbg_set_indirect(on: u32) { DBG_WATCH_INDIRECT = on != 0; }
-#[no_mangle] pub unsafe fn dbg_set_max_dumps(n: u32) { DBG_MAX_DUMPS = n; }
-#[no_mangle] pub unsafe fn dbg_read_u32(addr: u32) -> u32 {
+#[no_mangle]
+pub unsafe fn dbg_set_indirect(on: u32) { DBG_WATCH_INDIRECT = on != 0; }
+#[no_mangle]
+pub unsafe fn dbg_set_max_dumps(n: u32) { DBG_MAX_DUMPS = n; }
+#[no_mangle]
+pub unsafe fn dbg_read_u32(addr: u32) -> u32 {
     ptr::read_unaligned(memory::mem8.offset(addr as isize) as *const u32)
 }
-#[no_mangle] pub unsafe fn dbg_read_u8(addr: u32) -> u32 {
-    (*memory::mem8.offset(addr as isize)) as u32
-}
+#[no_mangle]
+pub unsafe fn dbg_read_u8(addr: u32) -> u32 { (*memory::mem8.offset(addr as isize)) as u32 }
 
 // BottleShip memory-write watchpoint. Catches the guest EIP that writes a given
 // address — works through the interpreted write8/16/32 chokepoints (so requires
@@ -455,11 +475,12 @@ pub static mut DBG_WW_HITS: u32 = 0;
 pub static mut DBG_WW_LAST_EIP: u32 = 0;
 pub static mut DBG_WW_LAST_PREV: u32 = 0;
 pub static mut DBG_WW_LAST_VAL: u32 = 0;
-pub static mut DBG_WW_ZERO_EIP: u32 = 0;  // EIP of the most recent write that stored 0
+pub static mut DBG_WW_ZERO_EIP: u32 = 0; // EIP of the most recent write that stored 0
 pub static mut DBG_WW_ZERO_PREV: u32 = 0;
 pub static mut DBG_WW_ZERO_HITS: u32 = 0;
 
-#[no_mangle] pub unsafe fn dbg_set_write_watch(addr: u32) {
+#[no_mangle]
+pub unsafe fn dbg_set_write_watch(addr: u32) {
     crate::jit::fastmem_bump_generation(crate::jit::FASTMEM_BUMP_WRITE_WATCH);
     // Force the watched page onto the store slow path so dbg_check_write
     // still fires when fastmem writes are on (the fast path bypasses it). Move bit2 from
@@ -470,22 +491,36 @@ pub static mut DBG_WW_ZERO_HITS: u32 = 0;
     if addr != 0 {
         crate::jit::fastmem_write_map_set_watch(addr >> 12);
     }
-    DBG_WRITE_WATCH = addr; DBG_WW_HITS = 0; DBG_WW_ZERO_HITS = 0;
-    DBG_WW_LAST_EIP = 0; DBG_WW_LAST_PREV = 0; DBG_WW_LAST_VAL = 0;
-    DBG_WW_ZERO_EIP = 0; DBG_WW_ZERO_PREV = 0;
+    DBG_WRITE_WATCH = addr;
+    DBG_WW_HITS = 0;
+    DBG_WW_ZERO_HITS = 0;
+    DBG_WW_LAST_EIP = 0;
+    DBG_WW_LAST_PREV = 0;
+    DBG_WW_LAST_VAL = 0;
+    DBG_WW_ZERO_EIP = 0;
+    DBG_WW_ZERO_PREV = 0;
 }
-#[no_mangle] pub unsafe fn dbg_ww_hits() -> u32 { DBG_WW_HITS }
-#[no_mangle] pub unsafe fn dbg_ww_last_eip() -> u32 { DBG_WW_LAST_EIP }
-#[no_mangle] pub unsafe fn dbg_ww_last_prev() -> u32 { DBG_WW_LAST_PREV }
-#[no_mangle] pub unsafe fn dbg_ww_last_val() -> u32 { DBG_WW_LAST_VAL }
-#[no_mangle] pub unsafe fn dbg_ww_zero_eip() -> u32 { DBG_WW_ZERO_EIP }
-#[no_mangle] pub unsafe fn dbg_ww_zero_prev() -> u32 { DBG_WW_ZERO_PREV }
-#[no_mangle] pub unsafe fn dbg_ww_zero_hits() -> u32 { DBG_WW_ZERO_HITS }
+#[no_mangle]
+pub unsafe fn dbg_ww_hits() -> u32 { DBG_WW_HITS }
+#[no_mangle]
+pub unsafe fn dbg_ww_last_eip() -> u32 { DBG_WW_LAST_EIP }
+#[no_mangle]
+pub unsafe fn dbg_ww_last_prev() -> u32 { DBG_WW_LAST_PREV }
+#[no_mangle]
+pub unsafe fn dbg_ww_last_val() -> u32 { DBG_WW_LAST_VAL }
+#[no_mangle]
+pub unsafe fn dbg_ww_zero_eip() -> u32 { DBG_WW_ZERO_EIP }
+#[no_mangle]
+pub unsafe fn dbg_ww_zero_prev() -> u32 { DBG_WW_ZERO_PREV }
+#[no_mangle]
+pub unsafe fn dbg_ww_zero_hits() -> u32 { DBG_WW_ZERO_HITS }
 
 #[inline(always)]
 pub unsafe fn dbg_check_write(addr: u32, len: u32, value: i32) {
     let w = DBG_WRITE_WATCH;
-    if w == 0 { return; }
+    if w == 0 {
+        return;
+    }
     // Does [addr, addr+len) cover the watched dword's first byte?
     if addr <= w && w < addr.wrapping_add(len) {
         let eip = *crate::cpu::global_pointers::instruction_pointer as u32;
@@ -504,18 +539,31 @@ pub unsafe fn dbg_check_write(addr: u32, len: u32, value: i32) {
 
 #[inline(always)]
 pub unsafe fn dbg_on_instruction(eip: u32) {
-    if !DBG_ENABLED { return; }
+    if !DBG_ENABLED {
+        return;
+    }
     let stepping = DBG_STEP_REMAINING > 0;
     let mut is_bp = false;
     let mut i = 0;
     while i < DBG_BP_COUNT {
-        if DBG_BP[i] == eip { is_bp = true; break; }
+        if DBG_BP[i] == eip {
+            is_bp = true;
+            break;
+        }
         i += 1;
     }
-    if !is_bp && !stepping { return; }
-    if is_bp && DBG_STEP_ON_BP > 0 { DBG_STEP_REMAINING = DBG_STEP_ON_BP; }
-    if DBG_STEP_REMAINING > 0 { DBG_STEP_REMAINING -= 1; }
-    if DBG_STEP_COUNTER >= DBG_MAX_DUMPS { return; }
+    if !is_bp && !stepping {
+        return;
+    }
+    if is_bp && DBG_STEP_ON_BP > 0 {
+        DBG_STEP_REMAINING = DBG_STEP_ON_BP;
+    }
+    if DBG_STEP_REMAINING > 0 {
+        DBG_STEP_REMAINING -= 1;
+    }
+    if DBG_STEP_COUNTER >= DBG_MAX_DUMPS {
+        return;
+    }
     DBG_STEP_COUNTER = DBG_STEP_COUNTER.wrapping_add(1);
     // Copy the static-mut value into a local: passing the static directly to format! would create
     // a shared reference to a mutable static (UB; the rustc release optimizer can use the implied
@@ -535,7 +583,8 @@ pub unsafe fn dbg_on_instruction(eip: u32) {
         if DBG_WATCH_INDIRECT {
             let b = *memory::mem8.offset(v as isize);
             s.push_str(&format!(" | W{}[{:x}]={:08x}(*={:02x})", w, a, v, b));
-        } else {
+        }
+        else {
             s.push_str(&format!(" | W{}[{:x}]={:08x}", w, a, v));
         }
         w += 1;
@@ -3132,7 +3181,9 @@ pub unsafe fn cycle_internal() {
     else if jit::external_any() && jit::external_first_enabled() {
         let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
         if meta2 != 0 {
-            if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
+            if initial_state_flags
+                == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2))
+            {
                 let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
                 if st != u16::MAX {
                     jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
@@ -3158,8 +3209,7 @@ pub unsafe fn cycle_internal() {
     if jit_entry.is_none() {
         if meta != 0 {
             let unit_index = jit::dispatch_meta_table_index(meta);
-            let unit_state_flags =
-                CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta));
+            let unit_state_flags = CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta));
             let unit_state = if initial_state_flags == unit_state_flags {
                 jit::dispatch_state_lookup(meta, initial_eip as u32)
             }
@@ -3220,7 +3270,9 @@ pub unsafe fn cycle_internal() {
     if jit_entry.is_none() && jit::external_any() && !ext_skip && !jit::external_first_enabled() {
         let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
         if meta2 != 0 {
-            if initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2)) {
+            if initial_state_flags
+                == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2))
+            {
                 let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
                 if st != u16::MAX {
                     jit_entry = Some((jit::dispatch_meta_table_index(meta2), st));
@@ -3250,7 +3302,8 @@ pub unsafe fn cycle_internal() {
         if jit::external_any() && !ext_skip {
             let meta2 = jit::dispatch_ext_get(initial_eip as u32 >> 12);
             if meta2 != 0
-                && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2))
+                && initial_state_flags
+                    == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta2))
             {
                 let st = jit::dispatch_state_lookup(meta2, initial_eip as u32);
                 if st != u16::MAX {
@@ -3264,7 +3317,8 @@ pub unsafe fn cycle_internal() {
         if jit_entry.is_none() {
             let meta_after = jit::dispatch_meta_get(initial_eip as u32 >> 12);
             if meta_after != 0
-                && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta_after))
+                && initial_state_flags
+                    == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta_after))
             {
                 let st = jit::dispatch_state_lookup(meta_after, initial_eip as u32);
                 if st != u16::MAX {
@@ -3305,7 +3359,10 @@ pub unsafe fn cycle_internal() {
             jit::jit_tier2_note_sampled_exit(wasm_table_index, *instruction_pointer as u32);
         }
         if external_entry {
-            jit::ext_trace_exit(*instruction_pointer as u32, (*instruction_counter).wrapping_sub(initial_instruction_counter));
+            jit::ext_trace_exit(
+                *instruction_pointer as u32,
+                (*instruction_counter).wrapping_sub(initial_instruction_counter),
+            );
         }
         if external_entry
             && *instruction_counter == initial_instruction_counter
@@ -3364,8 +3421,7 @@ pub unsafe fn cycle_internal() {
 
         let meta = jit::dispatch_meta_get(initial_eip as u32 >> 12);
         if meta != 0
-            && initial_state_flags
-                == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta))
+            && initial_state_flags == CachedStateFlags::of_u32(jit::dispatch_meta_state_flags(meta))
             && jit::dispatch_state_lookup(meta, initial_eip as u32) != u16::MAX
         {
             profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK);
@@ -3701,7 +3757,11 @@ const JIT_RUN_UNTIL_MAX_ITERATIONS: u32 = 200_000;
 static mut JIT_RUN_UNTIL_ZERO_BUDGET_GRACE: u32 = 512;
 
 #[no_mangle]
-pub fn jit_set_run_until_zero_budget_grace(n: u32) { unsafe { JIT_RUN_UNTIL_ZERO_BUDGET_GRACE = n; } }
+pub fn jit_set_run_until_zero_budget_grace(n: u32) {
+    unsafe {
+        JIT_RUN_UNTIL_ZERO_BUDGET_GRACE = n;
+    }
+}
 #[no_mangle]
 pub fn jit_get_run_until_zero_budget_grace() -> u32 { unsafe { JIT_RUN_UNTIL_ZERO_BUDGET_GRACE } }
 // 0 calls, 1 returned, 2 stopped by a zeroed budget (a thunk asked for an
@@ -3724,8 +3784,15 @@ static mut JIT_RUN_UNTIL_PAGE_CALLS: [u32; JIT_RUN_UNTIL_PAGES] = [0; JIT_RUN_UN
 #[no_mangle]
 pub fn jit_run_until_target_page(slot: u32, field: u32) -> u32 {
     unsafe {
-        if slot as usize >= JIT_RUN_UNTIL_PAGES { return 0; }
-        if field == 0 { JIT_RUN_UNTIL_PAGE_KEY[slot as usize] } else { JIT_RUN_UNTIL_PAGE_CALLS[slot as usize] }
+        if slot as usize >= JIT_RUN_UNTIL_PAGES {
+            return 0;
+        }
+        if field == 0 {
+            JIT_RUN_UNTIL_PAGE_KEY[slot as usize]
+        }
+        else {
+            JIT_RUN_UNTIL_PAGE_CALLS[slot as usize]
+        }
     }
 }
 static mut JIT_RUN_UNTIL_TARGET_EIP: [u32; JIT_RUN_UNTIL_TARGETS] = [0; JIT_RUN_UNTIL_TARGETS];
@@ -3734,14 +3801,28 @@ static mut JIT_RUN_UNTIL_TARGET_CALLS: [u32; JIT_RUN_UNTIL_TARGETS] = [0; JIT_RU
 #[no_mangle]
 pub fn jit_run_until_target(slot: u32, field: u32) -> u32 {
     unsafe {
-        if slot as usize >= JIT_RUN_UNTIL_TARGETS { return 0; }
-        if field == 0 { JIT_RUN_UNTIL_TARGET_EIP[slot as usize] } else { JIT_RUN_UNTIL_TARGET_CALLS[slot as usize] }
+        if slot as usize >= JIT_RUN_UNTIL_TARGETS {
+            return 0;
+        }
+        if field == 0 {
+            JIT_RUN_UNTIL_TARGET_EIP[slot as usize]
+        }
+        else {
+            JIT_RUN_UNTIL_TARGET_CALLS[slot as usize]
+        }
     }
 }
 
 #[no_mangle]
 pub fn jit_run_until_stat(i: u32) -> u32 {
-    unsafe { if (i as usize) < JIT_RUN_UNTIL_STATS.len() { JIT_RUN_UNTIL_STATS[i as usize] } else { 0 } }
+    unsafe {
+        if (i as usize) < (*std::ptr::addr_of!(JIT_RUN_UNTIL_STATS)).len() {
+            JIT_RUN_UNTIL_STATS[i as usize]
+        }
+        else {
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -3836,7 +3917,8 @@ pub unsafe fn jit_run_until(ret_eip: u32, stop_esp: u32, max: u32) -> u32 {
     JIT_RUN_UNTIL_DEPTH -= 1;
     JIT_RUN_UNTIL_STATS[stat_slot] = JIT_RUN_UNTIL_STATS[stat_slot].wrapping_add(1);
     JIT_RUN_UNTIL_STATS[8] = JIT_RUN_UNTIL_STATS[8].wrapping_add(iterations);
-    JIT_RUN_UNTIL_STATS[9] = JIT_RUN_UNTIL_STATS[9].wrapping_add((*instruction_counter).wrapping_sub(start));
+    JIT_RUN_UNTIL_STATS[9] =
+        JIT_RUN_UNTIL_STATS[9].wrapping_add((*instruction_counter).wrapping_sub(start));
     result
 }
 
@@ -4823,11 +4905,7 @@ pub unsafe fn read_tsc() -> u64 {
     // light frames), advance by 1 tick so consecutive reads ALWAYS differ — a real wall jump snaps it
     // forward again. This is a rare safety net, not the normal path (unlike the old guard, which
     // plateaued).
-    let result = if value <= tsc_last_value {
-        tsc_last_value.wrapping_add(1)
-    } else {
-        value
-    };
+    let result = if value <= tsc_last_value { tsc_last_value.wrapping_add(1) } else { value };
     tsc_last_value = result;
     result
 }
@@ -5096,9 +5174,7 @@ pub fn io_port_write32(port: i32, value: i32) {
 // A translated module performing a stub's `out 0xB077, eax` itself: the same
 // path the interpreter takes for that instruction (router, then the host).
 #[no_mangle]
-pub fn jit_hypercall_out(value: i32) {
-    io_port_write32(0xB077i32, value)
-}
+pub fn jit_hypercall_out(value: i32) { io_port_write32(0xB077i32, value) }
 
 #[no_mangle]
 #[cfg(debug_assertions)]

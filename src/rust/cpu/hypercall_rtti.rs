@@ -128,7 +128,8 @@ unsafe fn locate_complete_object(inptr: u32, locator_ptr: u32) -> Option<u32> {
 
     let vtordisp = if cd_offset > 0 && inptr >= cd_offset {
         rd32(inptr - cd_offset).map(|v| v as i32).unwrap_or(0)
-    } else {
+    }
+    else {
         0
     };
     Some(inptr.wrapping_sub(offset).wrapping_sub(vtordisp as u32))
@@ -288,7 +289,8 @@ pub unsafe fn rt_dynamic_cast(
             }
         }
         found
-    } else {
+    }
+    else {
         // inptr points at the vfptr the compiler dereferenced; vf_delta is that
         // vfptr's offset within the source subobject. Undo it: the subobject's
         // delta from the complete object identifies WHICH instance of the
@@ -296,8 +298,13 @@ pub unsafe fn rt_dynamic_cast(
         let src_offset = inptr
             .wrapping_sub(vf_delta as u32)
             .wrapping_sub(complete_object) as i32;
-        match resolve_down_cast(complete_object, &hier, src_type_ptr, src_offset, target_type_ptr)
-        {
+        match resolve_down_cast(
+            complete_object,
+            &hier,
+            src_type_ptr,
+            src_offset,
+            target_type_ptr,
+        ) {
             DownCast::Found(entry) => Some(entry),
             // A virtual-inheritance ambiguity is a hard failure; only a plain
             // miss falls through to the cross-cast rule.
@@ -310,7 +317,7 @@ pub unsafe fn rt_dynamic_cast(
         Some(entry) => {
             let offset = subobject_offset(complete_object, &entry);
             RtDynamicCastResult::Success(complete_object.wrapping_add(offset as u32))
-        }
+        },
         None => fail_cast(is_reference, inptr),
     }
 }
@@ -319,7 +326,8 @@ pub unsafe fn rt_dynamic_cast(
 fn fail_cast(is_reference: i32, inptr: u32) -> RtDynamicCastResult {
     if is_reference != 0 && inptr != 0 {
         RtDynamicCastResult::FailBadCast
-    } else {
+    }
+    else {
         RtDynamicCastResult::FailNull
     }
 }

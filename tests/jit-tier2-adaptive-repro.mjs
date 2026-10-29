@@ -126,7 +126,7 @@ function run(adaptive, program = image(), regions = false)
                 regionRejectedTarget: w.jit_get_tier2_region_rejected_target?.() ?? -1,
                 regionRejectedBudget: w.jit_get_tier2_region_rejected_budget?.() ?? -1,
             };
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             resolve(result);
         };
         emulator.bus.register("cpu-event-halt", () => finish("halt"));

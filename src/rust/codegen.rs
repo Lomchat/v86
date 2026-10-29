@@ -1000,13 +1000,8 @@ fn gen_fastmem_read_split(
     // Range 1: [LOW_MEM_END, r1_top]; min() keeps small-RAM configs correct.
     let r1_top = GUARD_BASE.min(ram_size) - bytes;
     dbg_assert!(r1_top >= LOW_MEM_END); // caller checked max_addr >= LOW_MEM_END
-    // Range 2: [GUARD_END, ram - bytes], only when RAM extends past the red zone.
-    let r2 = if ram_size >= GUARD_END + bytes {
-        Some(ram_size - bytes - GUARD_END)
-    }
-    else {
-        None
-    };
+                                        // Range 2: [GUARD_END, ram - bytes], only when RAM extends past the red zone.
+    let r2 = if ram_size >= GUARD_END + bytes { Some(ram_size - bytes - GUARD_END) } else { None };
 
     let host = ctx.builder.block_i32(); // yields the wasm-memory offset to load from
 
@@ -1272,7 +1267,9 @@ fn gen_fastmem_write_map(
         BitSize::BYTE => ctx.builder.call_fn3_ret("safe_write8_slow_jit"),
         BitSize::WORD => ctx.builder.call_fn3_ret("safe_write16_slow_jit"),
         BitSize::DWORD => ctx.builder.call_fn3_ret("safe_write32_slow_jit"),
-        BitSize::QWORD => ctx.builder.call_fn3_i32_i64_i32_ret("safe_write64_slow_jit"),
+        BitSize::QWORD => ctx
+            .builder
+            .call_fn3_i32_i64_i32_ret("safe_write64_slow_jit"),
         BitSize::DQWORD => ctx
             .builder
             .call_fn4_i32_i64_i64_i32_ret("safe_write128_slow_jit"),
@@ -1533,7 +1530,8 @@ fn gen_push32_coalesced_write(
     address_local: &WasmLocal,
     value_local: &WasmLocal,
 ) -> bool {
-    let Some((cache_page, cache_entry, cache_valid)) = gen_push32_write_cache_slot(ctx) else {
+    let Some((cache_page, cache_entry, cache_valid)) = gen_push32_write_cache_slot(ctx)
+    else {
         return false;
     };
 
@@ -3212,10 +3210,10 @@ pub fn gen_fpu_load_m32(ctx: &mut JitContext, modrm_byte: ModrmByte) {
         // Relaxed mode: inline WASM type conversion ops, no scratch register.
         // F80{mantissa=f64bits(f32bits), sign_exponent=RELAXED_TAG}
         gen_modrm_resolve_safe_read32(ctx, modrm_byte); // i32 raw f32 bits
-        ctx.builder.reinterpret_i32_as_f32();           // f32
-        ctx.builder.promote_f32_to_f64();               // f64
-        ctx.builder.reinterpret_f64_as_i64();           // i64 mantissa
-        ctx.builder.const_i32(0x7FFE);                  // RELAXED_TAG sign_exponent
+        ctx.builder.reinterpret_i32_as_f32(); // f32
+        ctx.builder.promote_f32_to_f64(); // f64
+        ctx.builder.reinterpret_f64_as_i64(); // i64 mantissa
+        ctx.builder.const_i32(0x7FFE); // RELAXED_TAG sign_exponent
     }
     else {
         ctx.builder
@@ -3234,7 +3232,7 @@ pub fn gen_fpu_load_m64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
         // Relaxed mode: raw f64 bits from memory are already the mantissa.
         // F80{mantissa=raw_bits, sign_exponent=RELAXED_TAG}
         gen_modrm_resolve_safe_read64(ctx, modrm_byte); // i64 raw f64 bits = mantissa
-        ctx.builder.const_i32(0x7FFE);                  // RELAXED_TAG sign_exponent
+        ctx.builder.const_i32(0x7FFE); // RELAXED_TAG sign_exponent
     }
     else {
         ctx.builder
@@ -3391,7 +3389,10 @@ pub fn gen_x87_local_cache_flush_all_runtime(ctx: &mut JitContext) {
         return;
     }
     for i in 0..8u32 {
-        let Some(slot) = ctx.x87_local_cache[i as usize].as_ref() else { continue };
+        let Some(slot) = ctx.x87_local_cache[i as usize].as_ref()
+        else {
+            continue;
+        };
         let bits = slot.bits.unsafe_clone();
         let valid = slot.valid.unsafe_clone();
         let dirty = slot.dirty.as_ref().unwrap().unsafe_clone();
@@ -3431,9 +3432,14 @@ pub fn gen_x87_local_cache_invalidate_all_runtime(ctx: &mut JitContext) {
     let valids: Vec<(WasmLocal, Option<WasmLocal>)> = ctx
         .x87_local_cache
         .iter()
-        .filter_map(|slot| slot.as_ref().map(|slot| {
-            (slot.valid.unsafe_clone(), slot.dirty.as_ref().map(|dirty| dirty.unsafe_clone()))
-        }))
+        .filter_map(|slot| {
+            slot.as_ref().map(|slot| {
+                (
+                    slot.valid.unsafe_clone(),
+                    slot.dirty.as_ref().map(|dirty| dirty.unsafe_clone()),
+                )
+            })
+        })
         .collect();
     if valids.is_empty() {
         return;
@@ -3467,11 +3473,7 @@ pub fn gen_x87_local_cache_free_all(ctx: &mut JitContext) {
 /// The architectural TOP changes, but the cached values themselves only shift
 /// by one logical slot; invalidating all eight loses the hottest value in
 /// classic FLD/FMUL/FADD/FSTP game loops.
-fn gen_x87_local_cache_push(
-    ctx: &mut JitContext,
-    mantissa: &WasmLocalI64,
-    tag: &WasmLocal,
-) {
+fn gen_x87_local_cache_push(ctx: &mut JitContext, mantissa: &WasmLocalI64, tag: &WasmLocal) {
     if !x87_local_cache_enabled() {
         return;
     }
@@ -3533,11 +3535,7 @@ fn gen_fpu_relaxed_st_ok(ctx: &mut JitContext, i: u32, addr: &WasmLocal) {
     }
 }
 
-fn gen_fpu_load_relaxed_st_bits(
-    ctx: &mut JitContext,
-    i: u32,
-    addr: &WasmLocal,
-) -> FpuBitsLocal {
+fn gen_fpu_load_relaxed_st_bits(ctx: &mut JitContext, i: u32, addr: &WasmLocal) -> FpuBitsLocal {
     if let Some((bits_cache, valid, dirty)) = gen_x87_local_slot(ctx, i) {
         crate::jit::x87_locals_note_cache_load_site_compiled();
         ctx.builder.get_local(&valid);
@@ -3554,7 +3552,9 @@ fn gen_fpu_load_relaxed_st_bits(
             ctx.builder.set_local(&dirty);
         }
         ctx.builder.block_end();
-        FpuBitsLocal { local: ctx.builder.set_new_local_i64() }
+        FpuBitsLocal {
+            local: ctx.builder.set_new_local_i64(),
+        }
     }
     else {
         FpuBitsLocal {
@@ -3840,7 +3840,14 @@ fn gen_fpu_compare_status_from_bits(
     x_bits: &WasmLocalI64,
     y_bits: &WasmLocalI64,
 ) {
-    let flags = gen_fpu_compare_flags(ctx, x_bits, y_bits, FPU_C0 | FPU_C2 | FPU_C3, FPU_C0, FPU_C3);
+    let flags = gen_fpu_compare_flags(
+        ctx,
+        x_bits,
+        y_bits,
+        FPU_C0 | FPU_C2 | FPU_C3,
+        FPU_C0,
+        FPU_C3,
+    );
     gen_fpu_write_status_compare_flags(ctx, &flags);
     ctx.builder.free_local(flags);
 }
@@ -3870,7 +3877,8 @@ fn gen_fpu_round_f64_bits_to_i32(ctx: &mut JitContext, bits: &WasmLocalI64, trun
         ctx.builder.reinterpret_f64_as_i64();
     }
     else {
-        ctx.builder.load_fixed_u16(global_pointers::fpu_control_word as u32);
+        ctx.builder
+            .load_fixed_u16(global_pointers::fpu_control_word as u32);
         ctx.builder.const_i32(10);
         ctx.builder.shr_u_i32();
         ctx.builder.const_i32(3);
@@ -3972,7 +3980,8 @@ fn gen_fpu_apply_f64_binop(ctx: &mut JitContext, op: FpuFastBinOp) {
     // the game at 5.5 FPS. A predictable branch on a global costs nothing next to
     // the helper call it replaces.
     let value = ctx.builder.set_new_local_f64();
-    ctx.builder.load_fixed_i32(std::ptr::addr_of!(crate::softfloat::PRECISION_SINGLE) as u32);
+    ctx.builder
+        .load_fixed_i32(std::ptr::addr_of!(crate::softfloat::PRECISION_SINGLE) as u32);
     ctx.builder.const_i32(0xFF);
     ctx.builder.and_i32();
     ctx.builder.if_void();
@@ -4001,7 +4010,12 @@ fn gen_fpu_load_m64_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 /// selects it. (m32/m64 float and i16/i32 int operands all convert to f64 exactly, so
 /// the only semantic difference vs the F80 path is the binop/compare rounding.)
 #[derive(Clone, Copy)]
-enum FpuMemSrc { M32, I32, I16, M64 }
+enum FpuMemSrc {
+    M32,
+    I32,
+    I16,
+    M64,
+}
 
 // F80-producing slow load for the relaxed BINOP slow path (feeds call_fn3_i32_i64_i32).
 fn gen_fpu_load_mem_binop_slow(ctx: &mut JitContext, src: FpuMemSrc, modrm_byte: ModrmByte) {
@@ -4034,7 +4048,11 @@ fn gen_fpu_load_mem_as_f64(ctx: &mut JitContext, src: FpuMemSrc, modrm_byte: Mod
 }
 
 // Exact-f64 fast load of the memory operand, returned as an i64-bits local.
-fn gen_fpu_load_mem_as_f64_bits(ctx: &mut JitContext, src: FpuMemSrc, modrm_byte: ModrmByte) -> WasmLocalI64 {
+fn gen_fpu_load_mem_as_f64_bits(
+    ctx: &mut JitContext,
+    src: FpuMemSrc,
+    modrm_byte: ModrmByte,
+) -> WasmLocalI64 {
     match src {
         FpuMemSrc::M32 => gen_fpu_load_m32_as_f64_bits(ctx, modrm_byte),
         FpuMemSrc::I32 => gen_fpu_load_i32_as_f64_bits(ctx, modrm_byte),
@@ -4121,16 +4139,40 @@ fn gen_fpu_relaxed_binop_mem(
     ctx.builder.free_local(st0_addr);
 }
 
-pub fn gen_fpu_relaxed_binop_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, target_sti: u32, op: FpuFastBinOp, slow_helper: &str) {
+pub fn gen_fpu_relaxed_binop_m32(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    target_sti: u32,
+    op: FpuFastBinOp,
+    slow_helper: &str,
+) {
     gen_fpu_relaxed_binop_mem(ctx, modrm_byte, target_sti, op, slow_helper, FpuMemSrc::M32)
 }
-pub fn gen_fpu_relaxed_binop_i32(ctx: &mut JitContext, modrm_byte: ModrmByte, target_sti: u32, op: FpuFastBinOp, slow_helper: &str) {
+pub fn gen_fpu_relaxed_binop_i32(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    target_sti: u32,
+    op: FpuFastBinOp,
+    slow_helper: &str,
+) {
     gen_fpu_relaxed_binop_mem(ctx, modrm_byte, target_sti, op, slow_helper, FpuMemSrc::I32)
 }
-pub fn gen_fpu_relaxed_binop_i16(ctx: &mut JitContext, modrm_byte: ModrmByte, target_sti: u32, op: FpuFastBinOp, slow_helper: &str) {
+pub fn gen_fpu_relaxed_binop_i16(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    target_sti: u32,
+    op: FpuFastBinOp,
+    slow_helper: &str,
+) {
     gen_fpu_relaxed_binop_mem(ctx, modrm_byte, target_sti, op, slow_helper, FpuMemSrc::I16)
 }
-pub fn gen_fpu_relaxed_binop_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, target_sti: u32, op: FpuFastBinOp, slow_helper: &str) {
+pub fn gen_fpu_relaxed_binop_m64(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    target_sti: u32,
+    op: FpuFastBinOp,
+    slow_helper: &str,
+) {
     gen_fpu_relaxed_binop_mem(ctx, modrm_byte, target_sti, op, slow_helper, FpuMemSrc::M64)
 }
 
@@ -4178,19 +4220,23 @@ pub fn gen_fpu_relaxed_pop(ctx: &mut JitContext) {
         return;
     }
     gen_x87_local_cache_pop(ctx);
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
     let ptr_local = ctx.builder.set_new_local();
     ctx.builder.const_i32(1);
     ctx.builder.get_local(&ptr_local);
     ctx.builder.shl_i32();
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_empty as u32);
     ctx.builder.or_i32();
     let new_empty = ctx.builder.set_new_local();
-    ctx.builder.const_i32(global_pointers::fpu_stack_empty as i32);
+    ctx.builder
+        .const_i32(global_pointers::fpu_stack_empty as i32);
     ctx.builder.get_local(&new_empty);
     ctx.builder.store_u8(0);
 
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
     ctx.builder.const_i32(1);
     ctx.builder.add_i32();
     ctx.builder.const_i32(7);
@@ -4215,7 +4261,8 @@ pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
     let mantissa = ctx.builder.set_new_local_i64();
     gen_x87_local_cache_push(ctx, &mantissa, &tag);
 
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
     ctx.builder.const_i32(1);
     ctx.builder.sub_i32();
     ctx.builder.const_i32(7);
@@ -4231,10 +4278,12 @@ pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
     ctx.builder.shl_i32();
     ctx.builder.const_i32(-1);
     ctx.builder.xor_i32();
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_empty as u32);
     ctx.builder.and_i32();
     let new_empty = ctx.builder.set_new_local();
-    ctx.builder.const_i32(global_pointers::fpu_stack_empty as i32);
+    ctx.builder
+        .const_i32(global_pointers::fpu_stack_empty as i32);
     ctx.builder.get_local(&new_empty);
     ctx.builder.store_u8(0);
 
@@ -4574,12 +4623,7 @@ pub fn gen_fpu_relaxed_fist_m16(
     ctx.builder.free_local(address_local);
 }
 
-pub fn gen_fpu_relaxed_fcom_sti(
-    ctx: &mut JitContext,
-    i: u32,
-    pop_count: u32,
-    slow_helper: &str,
-) {
+pub fn gen_fpu_relaxed_fcom_sti(ctx: &mut JitContext, i: u32, pop_count: u32, slow_helper: &str) {
     if !crate::softfloat::is_fpu_relaxed() {
         gen_fpu_get_sti(ctx, i);
         ctx.builder.call_fn2_i64_i32(slow_helper);
@@ -4658,25 +4702,40 @@ fn gen_fpu_relaxed_fcom_mem(
     ctx.builder.free_local(st0_addr);
 }
 
-pub fn gen_fpu_relaxed_fcom_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop_count: u32, slow_helper: &str) {
-    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::M32)
-}
-pub fn gen_fpu_relaxed_fcom_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop_count: u32, slow_helper: &str) {
-    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::M64)
-}
-pub fn gen_fpu_relaxed_fcom_i16(ctx: &mut JitContext, modrm_byte: ModrmByte, pop_count: u32, slow_helper: &str) {
-    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::I16)
-}
-pub fn gen_fpu_relaxed_fcom_i32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop_count: u32, slow_helper: &str) {
-    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::I32)
-}
-
-pub fn gen_fpu_relaxed_fucom_sti(
+pub fn gen_fpu_relaxed_fcom_m32(
     ctx: &mut JitContext,
-    i: u32,
+    modrm_byte: ModrmByte,
     pop_count: u32,
     slow_helper: &str,
 ) {
+    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::M32)
+}
+pub fn gen_fpu_relaxed_fcom_m64(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    pop_count: u32,
+    slow_helper: &str,
+) {
+    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::M64)
+}
+pub fn gen_fpu_relaxed_fcom_i16(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    pop_count: u32,
+    slow_helper: &str,
+) {
+    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::I16)
+}
+pub fn gen_fpu_relaxed_fcom_i32(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    pop_count: u32,
+    slow_helper: &str,
+) {
+    gen_fpu_relaxed_fcom_mem(ctx, modrm_byte, pop_count, slow_helper, FpuMemSrc::I32)
+}
+
+pub fn gen_fpu_relaxed_fucom_sti(ctx: &mut JitContext, i: u32, pop_count: u32, slow_helper: &str) {
     if !crate::softfloat::is_fpu_relaxed() {
         gen_fn1_const(ctx.builder, slow_helper, i);
         return;

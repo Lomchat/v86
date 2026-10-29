@@ -91,7 +91,7 @@ function run(maxPending, clearDuringRun = false, deferredQueue = false)
                 compileTotalMs: +((w.jit_get_compile_total_us?.() ?? 0) / 1000).toFixed(2),
                 compileMaxMs: +((w.jit_get_compile_max_us?.() ?? 0) / 1000).toFixed(2),
             };
-            try { emulator.stop(); } catch {}
+            try { emulator.stop(); } catch{}
             resolve(result);
         };
         emulator.bus.register("cpu-event-halt", () => {

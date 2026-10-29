@@ -1,7 +1,10 @@
 //! BFME-specific inner-loop HLE handlers. These live in the engine-handler
 //! band (128..=255) and are armed only by byte-exact, title-specific hooks.
 
-use crate::cpu::cpu::{readable_or_pagefault, read_reg32, safe_read32s, safe_write32, safe_write8, writable_or_pagefault, write_reg32, EAX, EBP, EBX, ECX, EDX, ESI, ESP};
+use crate::cpu::cpu::{
+    read_reg32, readable_or_pagefault, safe_read32s, safe_write32, safe_write8,
+    writable_or_pagefault, write_reg32, EAX, EBP, EBX, ECX, EDX, ESI, ESP,
+};
 use crate::cpu::hypercall::hc_safe_read8;
 
 pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
@@ -72,7 +75,9 @@ fn ranges_overlap(left: u32, left_len: u32, right: u32, right_len: u32) -> bool 
 /// The paging helper deliberately accepts less than one page at a time.
 #[inline]
 unsafe fn validate_guest_range(address: u32, length: u32, writable: bool) -> bool {
-    if length == 0 || (address as u64 + length as u64) > 0x1_0000_0000 { return false; }
+    if length == 0 || (address as u64 + length as u64) > 0x1_0000_0000 {
+        return false;
+    }
     let mut cursor = address;
     let mut remaining = length;
     while remaining != 0 {
@@ -84,7 +89,9 @@ unsafe fn validate_guest_range(address: u32, length: u32, writable: bool) -> boo
         else {
             readable_or_pagefault(cursor as i32, chunk as i32).is_ok()
         };
-        if !valid { return false; }
+        if !valid {
+            return false;
+        }
         cursor = cursor.wrapping_add(chunk);
         remaining -= chunk;
     }
@@ -96,9 +103,18 @@ unsafe fn validate_guest_range(address: u32, length: u32, writable: bool) -> boo
 /// the complete loop in WASM and preserve every register live at 0x00e290ae.
 unsafe fn handle_rgb24_expand() -> bool {
     let esp = read_reg32(ESP);
-    let source = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(9) };
-    let destination = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(9) };
-    let end = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(9) };
+    let source = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) => v as u32,
+        Err(_) => return rgb24_decline(9),
+    };
+    let destination = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) => v as u32,
+        Err(_) => return rgb24_decline(9),
+    };
+    let end = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) => v as u32,
+        Err(_) => return rgb24_decline(9),
+    };
     let destination_bytes = end.wrapping_sub(destination);
     RGB24_EXPAND_ATTEMPTS = RGB24_EXPAND_ATTEMPTS.wrapping_add(1);
     RGB24_EXPAND_LAST_SOURCE = source;
@@ -106,15 +122,23 @@ unsafe fn handle_rgb24_expand() -> bool {
     RGB24_EXPAND_LAST_END = end;
     RGB24_EXPAND_LAST_COUNT = destination_bytes >> 2;
     RGB24_EXPAND_LAST_FAILURE = 0;
-    if !RGB24_EXPAND_ENABLED { return rgb24_decline(8); }
-    if destination == 0 || source == 0 || end <= destination
-        || destination_bytes & 3 != 0 {
+    if !RGB24_EXPAND_ENABLED {
+        return rgb24_decline(8);
+    }
+    if destination == 0 || source == 0 || end <= destination || destination_bytes & 3 != 0 {
         return rgb24_decline(1);
     }
     let count = destination_bytes >> 2;
-    if count == 0 || count > 0x0100_0000 { return rgb24_decline(2); }
-    let source_bytes = match count.checked_mul(3) { Some(v) => v, None => return rgb24_decline(2) };
-    if source.checked_add(source_bytes).is_none() || destination.checked_add(destination_bytes).is_none() {
+    if count == 0 || count > 0x0100_0000 {
+        return rgb24_decline(2);
+    }
+    let source_bytes = match count.checked_mul(3) {
+        Some(v) => v,
+        None => return rgb24_decline(2),
+    };
+    if source.checked_add(source_bytes).is_none()
+        || destination.checked_add(destination_bytes).is_none()
+    {
         return rgb24_decline(2);
     }
     // The original loop is streaming. Cached reads would change its semantics
@@ -126,7 +150,8 @@ unsafe fn handle_rgb24_expand() -> bool {
     // first output word is written, no later paging failure may route through
     // the original loop and apply a partially completed conversion twice.
     if !validate_guest_range(source, source_bytes, false)
-        || !validate_guest_range(destination, destination_bytes, true) {
+        || !validate_guest_range(destination, destination_bytes, true)
+    {
         return rgb24_decline(7);
     }
 
@@ -142,14 +167,25 @@ unsafe fn handle_rgb24_expand() -> bool {
         else {
             // Do not read a fourth byte beyond the source span on the final
             // pixel, even when it would usually remain inside a mapped page.
-            let r = match hc_safe_read8(src) { Ok(v) => v as u32, Err(_) => return rgb24_decline(4) };
-            let g = match hc_safe_read8(src.wrapping_add(1)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(4) };
-            let b = match hc_safe_read8(src.wrapping_add(2)) { Ok(v) => v as u32, Err(_) => return rgb24_decline(4) };
+            let r = match hc_safe_read8(src) {
+                Ok(v) => v as u32,
+                Err(_) => return rgb24_decline(4),
+            };
+            let g = match hc_safe_read8(src.wrapping_add(1)) {
+                Ok(v) => v as u32,
+                Err(_) => return rgb24_decline(4),
+            };
+            let b = match hc_safe_read8(src.wrapping_add(2)) {
+                Ok(v) => v as u32,
+                Err(_) => return rgb24_decline(4),
+            };
             r | g << 8 | b << 16
         };
         last = ((value & 0xff) << 16) | (value & 0xff00) | ((value >> 16) & 0xff);
         let dst = destination.wrapping_add(i.wrapping_mul(4)) as i32;
-        if safe_write32(dst, last as i32).is_err() { return rgb24_decline(5); }
+        if safe_write32(dst, last as i32).is_err() {
+            return rgb24_decline(5);
+        }
     }
 
     write_reg32(EAX, source.wrapping_add(count.wrapping_mul(3)) as i32);
@@ -189,9 +225,7 @@ pub unsafe fn bfme_rgb24_stat_reset() {
 }
 
 #[no_mangle]
-pub unsafe fn bfme_rgb24_set_enabled(enabled: u32) {
-    RGB24_EXPAND_ENABLED = enabled != 0;
-}
+pub unsafe fn bfme_rgb24_set_enabled(enabled: u32) { RGB24_EXPAND_ENABLED = enabled != 0; }
 
 #[no_mangle]
 pub unsafe fn bfme_rgb24_get_enabled() -> u32 { RGB24_EXPAND_ENABLED as u32 }
@@ -226,24 +260,55 @@ unsafe fn handle_sparse_float4() -> bool {
     // those two clobbered registers. Stack after CALL return address:
     // EAX, EDI, ECX, EDX, ESI, EBX, EBP.
     let esp = read_reg32(ESP);
-    let source_begin = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
-    let mut source_float4 = match safe_read32s(esp.wrapping_add(16)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
-    let frame = match safe_read32s(esp.wrapping_add(28)) { Ok(v) => v, Err(_) => return sparse_float4_decline(1) };
-    let sparse_begin = match safe_read32s(frame.wrapping_sub(0x2c)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
-    let sparse_end = match safe_read32s(frame.wrapping_sub(0x10)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
-    let destination_tables = match safe_read32s(frame.wrapping_sub(0x08)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
-    let source_end = match safe_read32s(frame.wrapping_sub(0x28)) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(1) };
+    let source_begin = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) => v as u32,
+        Err(_) => return sparse_float4_decline(1),
+    };
+    let mut source_float4 = match safe_read32s(esp.wrapping_add(16)) {
+        Ok(v) => v as u32,
+        Err(_) => return sparse_float4_decline(1),
+    };
+    let frame = match safe_read32s(esp.wrapping_add(28)) {
+        Ok(v) => v,
+        Err(_) => return sparse_float4_decline(1),
+    };
+    let sparse_begin = match safe_read32s(frame.wrapping_sub(0x2c)) {
+        Ok(v) => v as u32,
+        Err(_) => return sparse_float4_decline(1),
+    };
+    let sparse_end = match safe_read32s(frame.wrapping_sub(0x10)) {
+        Ok(v) => v as u32,
+        Err(_) => return sparse_float4_decline(1),
+    };
+    let destination_tables = match safe_read32s(frame.wrapping_sub(0x08)) {
+        Ok(v) => v as u32,
+        Err(_) => return sparse_float4_decline(1),
+    };
+    let source_end = match safe_read32s(frame.wrapping_sub(0x28)) {
+        Ok(v) => v as u32,
+        Err(_) => return sparse_float4_decline(1),
+    };
     SPARSE_FLOAT4_ATTEMPTS = SPARSE_FLOAT4_ATTEMPTS.wrapping_add(1);
     SPARSE_FLOAT4_LAST_FAILURE = 0;
-    if !SPARSE_FLOAT4_ENABLED { return sparse_float4_decline(8); }
+    if !SPARSE_FLOAT4_ENABLED {
+        return sparse_float4_decline(8);
+    }
     let sparse_bytes = sparse_end.wrapping_sub(sparse_begin);
-    if source_begin == 0 || source_begin >= source_end || sparse_begin == 0
-        || sparse_end <= sparse_begin || sparse_bytes & 7 != 0 {
+    if source_begin == 0
+        || source_begin >= source_end
+        || sparse_begin == 0
+        || sparse_end <= sparse_begin
+        || sparse_bytes & 7 != 0
+    {
         return sparse_float4_decline(2);
     }
     let sparse_count = sparse_bytes >> 3;
-    if sparse_count == 0 || sparse_count > 0x0010_0000 { return sparse_float4_decline(3); }
-    if source_float4 < 8 || source_float4.checked_add(8).is_none() { return sparse_float4_decline(4); }
+    if sparse_count == 0 || sparse_count > 0x0010_0000 {
+        return sparse_float4_decline(3);
+    }
+    if source_float4 < 8 || source_float4.checked_add(8).is_none() {
+        return sparse_float4_decline(4);
+    }
 
     let initial_source_float4 = source_float4;
     let mut min_table_index = u32::MAX;
@@ -252,13 +317,27 @@ unsafe fn handle_sparse_float4() -> bool {
     let mut item_count = 0u32;
     let mut group_count = 0u32;
     while source_group < source_end {
-        let relative_end = match safe_read32s(source_group as i32) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(5) };
-        let group_end = match source_group.checked_add(relative_end) { Some(v) => v, None => return sparse_float4_decline(5) };
-        let entries = match source_group.checked_add(4) { Some(v) => v, None => return sparse_float4_decline(5) };
-        if group_end <= entries || group_end > source_end || group_end.wrapping_sub(entries) & 7 != 0 {
+        let relative_end = match safe_read32s(source_group as i32) {
+            Ok(v) => v as u32,
+            Err(_) => return sparse_float4_decline(5),
+        };
+        let group_end = match source_group.checked_add(relative_end) {
+            Some(v) => v,
+            None => return sparse_float4_decline(5),
+        };
+        let entries = match source_group.checked_add(4) {
+            Some(v) => v,
+            None => return sparse_float4_decline(5),
+        };
+        if group_end <= entries
+            || group_end > source_end
+            || group_end.wrapping_sub(entries) & 7 != 0
+        {
             return sparse_float4_decline(5);
         }
-        if !validate_guest_range(source_float4 - 8, 16, false) { return sparse_float4_decline(4); }
+        if !validate_guest_range(source_float4 - 8, 16, false) {
+            return sparse_float4_decline(4);
+        }
 
         let inner_count = group_end.wrapping_sub(entries) >> 3;
         item_count = match item_count.checked_add(inner_count.saturating_mul(sparse_count)) {
@@ -272,24 +351,50 @@ unsafe fn handle_sparse_float4() -> bool {
 
         let mut sparse = sparse_begin;
         while sparse < sparse_end {
-            let table_index = match safe_read32s(sparse as i32) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(6) };
+            let table_index = match safe_read32s(sparse as i32) {
+                Ok(v) => v as u32,
+                Err(_) => return sparse_float4_decline(6),
+            };
             min_table_index = min_table_index.min(table_index);
             max_table_index = max_table_index.max(table_index);
-            if read_f32(sparse.wrapping_add(4) as i32).is_none() { return sparse_float4_decline(6); }
-            let table_offset = match table_index.checked_mul(12) { Some(v) => v, None => return sparse_float4_decline(6) };
-            let table_slot = match destination_tables.checked_add(table_offset) { Some(v) => v, None => return sparse_float4_decline(6) };
-            let destination_base = match safe_read32s(table_slot as i32) { Ok(v) if v != 0 => v as u32, _ => return sparse_float4_decline(6) };
+            if read_f32(sparse.wrapping_add(4) as i32).is_none() {
+                return sparse_float4_decline(6);
+            }
+            let table_offset = match table_index.checked_mul(12) {
+                Some(v) => v,
+                None => return sparse_float4_decline(6),
+            };
+            let table_slot = match destination_tables.checked_add(table_offset) {
+                Some(v) => v,
+                None => return sparse_float4_decline(6),
+            };
+            let destination_base = match safe_read32s(table_slot as i32) {
+                Ok(v) if v != 0 => v as u32,
+                _ => return sparse_float4_decline(6),
+            };
 
             let mut entry = entries;
             while entry < group_end {
-                let index = match safe_read32s(entry as i32) { Ok(v) => v as u32, Err(_) => return sparse_float4_decline(7) };
-                if read_f32(entry.wrapping_add(4) as i32).is_none() { return sparse_float4_decline(7); }
-                let destination_offset = match index.checked_mul(16) { Some(v) => v, None => return sparse_float4_decline(7) };
-                let destination = match destination_base.checked_add(destination_offset) { Some(v) => v, None => return sparse_float4_decline(7) };
+                let index = match safe_read32s(entry as i32) {
+                    Ok(v) => v as u32,
+                    Err(_) => return sparse_float4_decline(7),
+                };
+                if read_f32(entry.wrapping_add(4) as i32).is_none() {
+                    return sparse_float4_decline(7);
+                }
+                let destination_offset = match index.checked_mul(16) {
+                    Some(v) => v,
+                    None => return sparse_float4_decline(7),
+                };
+                let destination = match destination_base.checked_add(destination_offset) {
+                    Some(v) => v,
+                    None => return sparse_float4_decline(7),
+                };
                 if destination.checked_add(16).is_none()
                     || ranges_overlap(destination, 16, source_begin, source_end - source_begin)
                     || ranges_overlap(destination, 16, sparse_begin, sparse_bytes)
-                    || !validate_guest_range(destination, 16, true) {
+                    || !validate_guest_range(destination, 16, true)
+                {
                     return sparse_float4_decline(7);
                 }
                 for lane in 0..4u32 {
@@ -304,7 +409,9 @@ unsafe fn handle_sparse_float4() -> bool {
         source_group = group_end;
         source_float4 = source_float4.wrapping_add(16);
     }
-    if source_group != source_end { return sparse_float4_decline(5); }
+    if source_group != source_end {
+        return sparse_float4_decline(5);
+    }
 
     let source_float_bytes = match group_count.checked_mul(16) {
         Some(v) => v,
@@ -314,14 +421,18 @@ unsafe fn handle_sparse_float4() -> bool {
     if !validate_guest_range(source_float_begin, source_float_bytes, false) {
         return sparse_float4_decline(4);
     }
-    let table_window_begin = match min_table_index.checked_mul(12)
-        .and_then(|offset| destination_tables.checked_add(offset)) {
+    let table_window_begin = match min_table_index
+        .checked_mul(12)
+        .and_then(|offset| destination_tables.checked_add(offset))
+    {
         Some(v) => v,
         None => return sparse_float4_decline(6),
     };
-    let table_window_end = match max_table_index.checked_mul(12)
+    let table_window_end = match max_table_index
+        .checked_mul(12)
         .and_then(|offset| destination_tables.checked_add(offset))
-        .and_then(|slot| slot.checked_add(4)) {
+        .and_then(|slot| slot.checked_add(4))
+    {
         Some(v) => v,
         None => return sparse_float4_decline(6),
     };
@@ -332,7 +443,8 @@ unsafe fn handle_sparse_float4() -> bool {
     source_group = source_begin;
     source_float4 = initial_source_float4;
     while source_group < source_end {
-        let group_end = source_group.wrapping_add(safe_read32s(source_group as i32).unwrap() as u32);
+        let group_end =
+            source_group.wrapping_add(safe_read32s(source_group as i32).unwrap() as u32);
         let entries = source_group.wrapping_add(4);
         let mut sparse = sparse_begin;
         while sparse < sparse_end {
@@ -344,7 +456,8 @@ unsafe fn handle_sparse_float4() -> bool {
                 let index = safe_read32s(entry as i32).unwrap() as u32;
                 let destination = destination_base.wrapping_add(index * 16);
                 if ranges_overlap(destination, 16, source_float_begin, source_float_bytes)
-                    || ranges_overlap(destination, 16, table_window_begin, table_window_bytes) {
+                    || ranges_overlap(destination, 16, table_window_begin, table_window_bytes)
+                {
                     return sparse_float4_decline(7);
                 }
                 entry = entry.wrapping_add(8);
@@ -358,17 +471,22 @@ unsafe fn handle_sparse_float4() -> bool {
     source_group = source_begin;
     source_float4 = initial_source_float4;
     while source_group < source_end {
-        let group_end = source_group.wrapping_add(safe_read32s(source_group as i32).unwrap() as u32);
+        let group_end =
+            source_group.wrapping_add(safe_read32s(source_group as i32).unwrap() as u32);
         let entries = source_group.wrapping_add(4);
         let mut source_lanes = [0f64; 4];
         for lane in 0..4u32 {
-            source_lanes[lane as usize] = read_f32(source_float4.wrapping_sub(8).wrapping_add(lane * 4) as i32).unwrap() as f64;
+            source_lanes[lane as usize] =
+                read_f32(source_float4.wrapping_sub(8).wrapping_add(lane * 4) as i32).unwrap()
+                    as f64;
         }
         let mut sparse = sparse_begin;
         while sparse < sparse_end {
             let table_index = safe_read32s(sparse as i32).unwrap() as u32;
             let multiplier = read_f32(sparse.wrapping_add(4) as i32).unwrap() as f64;
-            let destination_base = safe_read32s(destination_tables.wrapping_add(table_index * 12) as i32).unwrap() as u32;
+            let destination_base =
+                safe_read32s(destination_tables.wrapping_add(table_index * 12) as i32).unwrap()
+                    as u32;
             let mut entry = entries;
             while entry < group_end {
                 let index = safe_read32s(entry as i32).unwrap() as u32;
@@ -457,9 +575,15 @@ static mut DXT_SHADOW_SAMPLES: f64 = 0.0;
 
 #[inline(always)]
 fn dxt_clamp01(value: f32) -> f32 {
-    if !value.is_finite() || value <= 0.0 { 0.0 }
-    else if value >= 1.0 { 1.0 }
-    else { value }
+    if !value.is_finite() || value <= 0.0 {
+        0.0
+    }
+    else if value >= 1.0 {
+        1.0
+    }
+    else {
+        value
+    }
 }
 
 #[inline(always)]
@@ -489,7 +613,8 @@ fn dxt_palette(c0: u16, c1: u16, three_colour: bool) -> [[f32; 3]; 4] {
     for lane in 0..3 {
         if three_colour {
             result[2][lane] = (a[lane] + b[lane]) * 0.5;
-        } else {
+        }
+        else {
             result[2][lane] = (a[lane] * 2.0 + b[lane]) * (1.0 / 3.0);
             result[3][lane] = (a[lane] + b[lane] * 2.0) * (1.0 / 3.0);
         }
@@ -522,8 +647,12 @@ fn dxt_fast_encode(words: &[u32; DXT_SOURCE_WORDS], mode: i32) -> [u32; 2] {
         if visible {
             for lane in 0..3 {
                 let value = dxt_clamp01(f32::from_bits(words[i * 4 + lane]));
-                if value < lo[lane] { lo[lane] = value; }
-                if value > hi[lane] { hi[lane] = value; }
+                if value < lo[lane] {
+                    lo[lane] = value;
+                }
+                if value > hi[lane] {
+                    hi[lane] = value;
+                }
             }
             opaque_count += 1;
         }
@@ -538,8 +667,11 @@ fn dxt_fast_encode(words: &[u32; DXT_SOURCE_WORDS], mode: i32) -> [u32; 2] {
     let mut c1 = dxt_pack_565(lo);
 
     if three_colour {
-        if c0 > c1 { core::mem::swap(&mut c0, &mut c1); }
-    } else if c0 < c1 {
+        if c0 > c1 {
+            core::mem::swap(&mut c0, &mut c1);
+        }
+    }
+    else if c0 < c1 {
         core::mem::swap(&mut c0, &mut c1);
     }
     let palette = dxt_palette(c0, c1, three_colour);
@@ -550,7 +682,8 @@ fn dxt_fast_encode(words: &[u32; DXT_SOURCE_WORDS], mode: i32) -> [u32; 2] {
         let visible = mode == 0 || !alpha.is_finite() || alpha >= 0.5;
         let best = if !visible {
             3usize
-        } else {
+        }
+        else {
             let pixel = [
                 dxt_clamp01(f32::from_bits(words[i * 4])),
                 dxt_clamp01(f32::from_bits(words[i * 4 + 1])),
@@ -560,7 +693,10 @@ fn dxt_fast_encode(words: &[u32; DXT_SOURCE_WORDS], mode: i32) -> [u32; 2] {
             let mut best_error = f32::INFINITY;
             for selector in 0..palette_len {
                 let error = dxt_colour_error(pixel, palette[selector]);
-                if error < best_error { best_error = error; selected = selector; }
+                if error < best_error {
+                    best_error = error;
+                    selected = selector;
+                }
             }
             selected
         };
@@ -620,14 +756,31 @@ unsafe fn read_dxt_source(source: i32) -> Option<([u32; DXT_SOURCE_WORDS], u32)>
 /// record its authoritative eight-byte output.
 unsafe fn handle_dxt_encode_cache() -> bool {
     let esp = read_reg32(ESP);
-    let source = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let output = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
-    let mode = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v, Err(_) => return false };
-    let option = match safe_read32s(esp.wrapping_add(16)) { Ok(v) => v, Err(_) => return false };
-    let phase = match safe_read32s(esp.wrapping_add(20)) { Ok(v) => v, Err(_) => return false };
+    let source = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let output = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let mode = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let option = match safe_read32s(esp.wrapping_add(16)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let phase = match safe_read32s(esp.wrapping_add(20)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
     if !DXT_CACHE_ENABLED {
-        if phase == 0 { DXT_CACHE_BYPASSES = DXT_CACHE_BYPASSES.wrapping_add(1); }
+        if phase == 0 {
+            DXT_CACHE_BYPASSES = DXT_CACHE_BYPASSES.wrapping_add(1);
+        }
         write_reg32(EAX, 0);
         return true;
     }
@@ -635,7 +788,10 @@ unsafe fn handle_dxt_encode_cache() -> bool {
         Some(v) => v,
         None => return false,
     };
-    hash = dxt_finish_hash(dxt_hash_word(dxt_hash_word(hash, mode as u32), option as u32));
+    hash = dxt_finish_hash(dxt_hash_word(
+        dxt_hash_word(hash, mode as u32),
+        option as u32,
+    ));
     let set = (hash as usize) & (DXT_CACHE_SETS - 1);
     let set_base = set * DXT_CACHE_WAYS;
 
@@ -676,9 +832,17 @@ unsafe fn handle_dxt_encode_cache() -> bool {
     }
 
     if phase == 1 {
-        let out0 = match safe_read32s(output) { Ok(v) => v as u32, Err(_) => return false };
-        let out1 = match safe_read32s(output.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return false };
-        if DXT_SHADOW_ENABLED { dxt_shadow_compare(&words, mode, [out0, out1]); }
+        let out0 = match safe_read32s(output) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        let out1 = match safe_read32s(output.wrapping_add(4)) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        if DXT_SHADOW_ENABLED {
+            dxt_shadow_compare(&words, mode, [out0, out1]);
+        }
         let mut slot = set_base;
         let mut found_empty = false;
         for way in 0..DXT_CACHE_WAYS {
@@ -691,7 +855,8 @@ unsafe fn handle_dxt_encode_cache() -> bool {
         }
         if !found_empty {
             slot = set_base + (DXT_CACHE_NEXT_WAY[set] as usize);
-            DXT_CACHE_NEXT_WAY[set] = ((DXT_CACHE_NEXT_WAY[set] as usize + 1) % DXT_CACHE_WAYS) as u8;
+            DXT_CACHE_NEXT_WAY[set] =
+                ((DXT_CACHE_NEXT_WAY[set] as usize + 1) % DXT_CACHE_WAYS) as u8;
             DXT_CACHE_REPLACEMENTS = DXT_CACHE_REPLACEMENTS.wrapping_add(1);
         }
         DXT_CACHE_HASH[slot] = hash;
@@ -708,17 +873,13 @@ unsafe fn handle_dxt_encode_cache() -> bool {
 }
 
 #[no_mangle]
-pub unsafe fn bfme_dxt_cache_set_enabled(enabled: u32) {
-    DXT_CACHE_ENABLED = enabled != 0;
-}
+pub unsafe fn bfme_dxt_cache_set_enabled(enabled: u32) { DXT_CACHE_ENABLED = enabled != 0; }
 
 #[no_mangle]
 pub unsafe fn bfme_dxt_cache_get_enabled() -> u32 { DXT_CACHE_ENABLED as u32 }
 
 #[no_mangle]
-pub unsafe fn bfme_dxt_fast_set_enabled(enabled: u32) {
-    DXT_FAST_ENABLED = enabled != 0;
-}
+pub unsafe fn bfme_dxt_fast_set_enabled(enabled: u32) { DXT_FAST_ENABLED = enabled != 0; }
 
 #[no_mangle]
 pub unsafe fn bfme_dxt_fast_get_enabled() -> u32 { DXT_FAST_ENABLED as u32 }
@@ -750,7 +911,8 @@ fn bc1_decode_block(block: [u32; 2]) -> ([[f32; 3]; 16], u16) {
         let selector = ((block[1] >> (i * 2)) & 3) as usize;
         if three_colour && selector == 3 {
             transparent |= 1 << i;
-        } else {
+        }
+        else {
             texels[i] = palette[selector];
         }
     }
@@ -776,23 +938,31 @@ unsafe fn dxt_shadow_compare(words: &[u32; DXT_SOURCE_WORDS], mode: i32, authori
     let mut block_worst = 0u32;
     for i in 0..16 {
         // A texel transparent on both sides carries no colour to compare.
-        if (want_mask >> i) & 1 == 1 && (got_mask >> i) & 1 == 1 { continue; }
+        if (want_mask >> i) & 1 == 1 && (got_mask >> i) & 1 == 1 {
+            continue;
+        }
         for lane in 0..3 {
             let delta = ((want[i][lane] - got[i][lane]).abs() * 255.0 + 0.5) as u32;
-            if delta > block_worst { block_worst = delta; }
+            if delta > block_worst {
+                block_worst = delta;
+            }
             DXT_SHADOW_SUM_ABS += delta as f64;
             DXT_SHADOW_SAMPLES += 1.0;
         }
     }
-    if block_worst > DXT_SHADOW_WORST_CHANNEL { DXT_SHADOW_WORST_CHANNEL = block_worst; }
-    if block_worst > 4 { DXT_SHADOW_BLOCKS_OVER_4 = DXT_SHADOW_BLOCKS_OVER_4.wrapping_add(1); }
-    if block_worst > 16 { DXT_SHADOW_BLOCKS_OVER_16 = DXT_SHADOW_BLOCKS_OVER_16.wrapping_add(1); }
+    if block_worst > DXT_SHADOW_WORST_CHANNEL {
+        DXT_SHADOW_WORST_CHANNEL = block_worst;
+    }
+    if block_worst > 4 {
+        DXT_SHADOW_BLOCKS_OVER_4 = DXT_SHADOW_BLOCKS_OVER_4.wrapping_add(1);
+    }
+    if block_worst > 16 {
+        DXT_SHADOW_BLOCKS_OVER_16 = DXT_SHADOW_BLOCKS_OVER_16.wrapping_add(1);
+    }
 }
 
 #[no_mangle]
-pub unsafe fn bfme_dxt_shadow_set_enabled(enabled: u32) {
-    DXT_SHADOW_ENABLED = enabled != 0;
-}
+pub unsafe fn bfme_dxt_shadow_set_enabled(enabled: u32) { DXT_SHADOW_ENABLED = enabled != 0; }
 
 #[no_mangle]
 pub unsafe fn bfme_dxt_shadow_get_enabled() -> u32 { DXT_SHADOW_ENABLED as u32 }
@@ -834,7 +1004,6 @@ pub unsafe fn bfme_dxt_cache_reset_stats() {
     DXT_FAST_ENCODES = 0;
 }
 
-
 #[inline(always)]
 fn bc1_interpolate(left: f32, right: f32, scale: f32) -> f32 {
     (((right as f64 - left as f64) * scale as f64) + left as f64) as f32
@@ -856,26 +1025,48 @@ fn bc1_endpoint(value: u32) -> [f32; 4] {
 /// output write, preserving the original's alias behaviour and fault surface.
 unsafe fn handle_bc1_color_block() -> bool {
     let esp = read_reg32(ESP);
-    let output = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let input = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
-    if !decode_bc1_color_block(output, input) { return false; }
+    let output = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let input = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    if !decode_bc1_color_block(output, input) {
+        return false;
+    }
     write_reg32(EAX, 0);
     true
 }
 
 unsafe fn decode_bc1_color_block(output: i32, input: i32) -> bool {
-    let color0 = match read_u16(input) { Some(v) => v, None => return false };
-    let color1 = match read_u16(input.wrapping_add(2)) { Some(v) => v, None => return false };
-    let selectors = match safe_read32s(input.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return false };
-    if safe_read32s(output).is_err() || safe_read32s(output.wrapping_add(252)).is_err() { return false; }
+    let color0 = match read_u16(input) {
+        Some(v) => v,
+        None => return false,
+    };
+    let color1 = match read_u16(input.wrapping_add(2)) {
+        Some(v) => v,
+        None => return false,
+    };
+    let selectors = match safe_read32s(input.wrapping_add(4)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if safe_read32s(output).is_err() || safe_read32s(output.wrapping_add(252)).is_err() {
+        return false;
+    }
 
     let mut palette = [[0.0f32; 4]; 4];
     palette[0] = bc1_endpoint(color0);
     palette[1] = bc1_endpoint(color1);
     if color0 <= color1 {
         let scale = f32::from_bits(0x3f00_0000);
-        for lane in 0..4 { palette[2][lane] = bc1_interpolate(palette[0][lane], palette[1][lane], scale); }
-    } else {
+        for lane in 0..4 {
+            palette[2][lane] = bc1_interpolate(palette[0][lane], palette[1][lane], scale);
+        }
+    }
+    else {
         let third = f32::from_bits(0x3eaa_aaab);
         let two_thirds = f32::from_bits(0x3f2a_aaab);
         for lane in 0..4 {
@@ -887,7 +1078,12 @@ unsafe fn decode_bc1_color_block(output: i32, input: i32) -> bool {
         let color = palette[((selectors >> (pixel * 2)) & 3) as usize];
         let destination = output.wrapping_add(pixel * 16);
         for lane in 0..4i32 {
-            if safe_write32(destination.wrapping_add(lane * 4), color[lane as usize].to_bits() as i32).is_err() {
+            if safe_write32(
+                destination.wrapping_add(lane * 4),
+                color[lane as usize].to_bits() as i32,
+            )
+            .is_err()
+            {
                 return false;
             }
         }
@@ -916,7 +1112,7 @@ unsafe fn handle_memory_stream_read1() -> bool {
         Ok(0) => {
             write_reg32(EAX, -1);
             return true;
-        }
+        },
         Ok(v) => v,
         Err(_) => return false,
     };
@@ -935,7 +1131,9 @@ unsafe fn handle_memory_stream_read1() -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if safe_write8(destination, byte).is_err() { return false; }
+        if safe_write8(destination, byte).is_err() {
+            return false;
+        }
     }
     if safe_write32(object.wrapping_add(0x18), position.wrapping_add(count)).is_err() {
         return false;
@@ -944,33 +1142,56 @@ unsafe fn handle_memory_stream_read1() -> bool {
     true
 }
 
-
-
 #[inline(always)]
-fn scanf_space(byte: i32) -> bool {
-    byte == 0x20 || (byte >= 0x09 && byte <= 0x0d)
-}
+fn scanf_space(byte: i32) -> bool { byte == 0x20 || (byte >= 0x09 && byte <= 0x0d) }
 
 /// MSVCR71.dll 7.10.3052.4 `sscanf`: the entry filter admits only the exact
 /// one-output formats `%d`, `%u` and `%f`. Complex/variadic formats never enter
 /// this handler and remain authoritative in the original CRT.
 unsafe fn handle_msvcr71_sscanf_scalar() -> bool {
     let esp = read_reg32(ESP);
-    let mut at = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let fmt = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
-    let output = match safe_read32s(esp.wrapping_add(12)) { Ok(v) if v != 0 => v, _ => return false };
-    if hc_safe_read8(fmt).ok() != Some(b'%' as i32) || hc_safe_read8(fmt.wrapping_add(2)).ok() != Some(0) {
+    let mut at = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let fmt = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let output = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    if hc_safe_read8(fmt).ok() != Some(b'%' as i32)
+        || hc_safe_read8(fmt.wrapping_add(2)).ok() != Some(0)
+    {
         return false;
     }
-    let kind = match hc_safe_read8(fmt.wrapping_add(1)) { Ok(v) => v, Err(_) => return false };
-    if kind != b'd' as i32 && kind != b'u' as i32 && kind != b'f' as i32 { return false; }
-    if hc_safe_read8(output).is_err() { return false; }
+    let kind = match hc_safe_read8(fmt.wrapping_add(1)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if kind != b'd' as i32 && kind != b'u' as i32 && kind != b'f' as i32 {
+        return false;
+    }
+    if hc_safe_read8(output).is_err() {
+        return false;
+    }
 
-    while scanf_space(match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false }) {
+    while scanf_space(match hc_safe_read8(at) {
+        Ok(v) => v,
+        Err(_) => return false,
+    }) {
         at = at.wrapping_add(1);
     }
-    let first = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
-    if first == 0 { write_reg32(EAX, -1); return true; }
+    let first = match hc_safe_read8(at) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if first == 0 {
+        write_reg32(EAX, -1);
+        return true;
+    }
     let mut negative = false;
     if first == b'+' as i32 || first == b'-' as i32 {
         negative = first == b'-' as i32;
@@ -978,89 +1199,140 @@ unsafe fn handle_msvcr71_sscanf_scalar() -> bool {
     }
 
     let parsed_bits = if kind == b'd' as i32 || kind == b'u' as i32 {
-            let mut value: u64 = 0;
-            let mut digits = 0u32;
-            loop {
-                let byte = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
-                if byte < b'0' as i32 || byte > b'9' as i32 { break; }
-                value = value * 10 + (byte - b'0' as i32) as u64;
-                digits += 1;
-                at = at.wrapping_add(1);
-                if value > 0xffff_ffff { return false; }
+        let mut value: u64 = 0;
+        let mut digits = 0u32;
+        loop {
+            let byte = match hc_safe_read8(at) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if byte < b'0' as i32 || byte > b'9' as i32 {
+                break;
             }
-            if digits == 0 {
-                write_reg32(EAX, 0);
-                return true;
-            }
-            if kind == b'd' as i32 {
-                let limit = if negative { 0x8000_0000u64 } else { 0x7fff_ffffu64 };
-                if value > limit { return false; }
-            }
-            let mut bits = value as u32;
-            if negative { bits = bits.wrapping_neg(); }
-            bits
-    } else {
-            // Let the original CRT decide legacy spellings such as 1.#INF/NAN.
-            let lead = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
-            if lead == b'i' as i32 || lead == b'I' as i32 || lead == b'n' as i32 || lead == b'N' as i32 {
+            value = value * 10 + (byte - b'0' as i32) as u64;
+            digits += 1;
+            at = at.wrapping_add(1);
+            if value > 0xffff_ffff {
                 return false;
             }
-            let mut value = 0.0f64;
-            let mut digits = 0u32;
+        }
+        if digits == 0 {
+            write_reg32(EAX, 0);
+            return true;
+        }
+        if kind == b'd' as i32 {
+            let limit = if negative { 0x8000_0000u64 } else { 0x7fff_ffffu64 };
+            if value > limit {
+                return false;
+            }
+        }
+        let mut bits = value as u32;
+        if negative {
+            bits = bits.wrapping_neg();
+        }
+        bits
+    }
+    else {
+        // Let the original CRT decide legacy spellings such as 1.#INF/NAN.
+        let lead = match hc_safe_read8(at) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if lead == b'i' as i32 || lead == b'I' as i32 || lead == b'n' as i32 || lead == b'N' as i32
+        {
+            return false;
+        }
+        let mut value = 0.0f64;
+        let mut digits = 0u32;
+        loop {
+            let byte = match hc_safe_read8(at) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if byte < b'0' as i32 || byte > b'9' as i32 {
+                break;
+            }
+            value = value * 10.0 + (byte - b'0' as i32) as f64;
+            digits += 1;
+            at = at.wrapping_add(1);
+            if digits > 128 {
+                return false;
+            }
+        }
+        if hc_safe_read8(at).ok() == Some(b'.' as i32) {
+            at = at.wrapping_add(1);
+            let mut scale = 0.1f64;
             loop {
-                let byte = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
-                if byte < b'0' as i32 || byte > b'9' as i32 { break; }
-                value = value * 10.0 + (byte - b'0' as i32) as f64;
+                let byte = match hc_safe_read8(at) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if byte < b'0' as i32 || byte > b'9' as i32 {
+                    break;
+                }
+                value += (byte - b'0' as i32) as f64 * scale;
+                scale *= 0.1;
                 digits += 1;
                 at = at.wrapping_add(1);
-                if digits > 128 { return false; }
+                if digits > 128 {
+                    return false;
+                }
             }
-            if hc_safe_read8(at).ok() == Some(b'.' as i32) {
+        }
+        if digits == 0 {
+            write_reg32(EAX, 0);
+            return true;
+        }
+        let marker = match hc_safe_read8(at) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if marker == b'e' as i32 || marker == b'E' as i32 {
+            at = at.wrapping_add(1);
+            let mut exp_negative = false;
+            let exp_sign = match hc_safe_read8(at) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if exp_sign == b'+' as i32 || exp_sign == b'-' as i32 {
+                exp_negative = exp_sign == b'-' as i32;
                 at = at.wrapping_add(1);
-                let mut scale = 0.1f64;
-                loop {
-                    let byte = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
-                    if byte < b'0' as i32 || byte > b'9' as i32 { break; }
-                    value += (byte - b'0' as i32) as f64 * scale;
-                    scale *= 0.1;
-                    digits += 1;
-                    at = at.wrapping_add(1);
-                    if digits > 128 { return false; }
+            }
+            let mut exponent = 0u32;
+            let mut exp_digits = 0u32;
+            loop {
+                let byte = match hc_safe_read8(at) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if byte < b'0' as i32 || byte > b'9' as i32 {
+                    break;
                 }
-            }
-            if digits == 0 {
-                write_reg32(EAX, 0);
-                return true;
-            }
-            let marker = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
-            if marker == b'e' as i32 || marker == b'E' as i32 {
+                exponent = exponent
+                    .saturating_mul(10)
+                    .saturating_add((byte - b'0' as i32) as u32);
+                exp_digits += 1;
                 at = at.wrapping_add(1);
-                let mut exp_negative = false;
-                let exp_sign = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
-                if exp_sign == b'+' as i32 || exp_sign == b'-' as i32 {
-                    exp_negative = exp_sign == b'-' as i32;
-                    at = at.wrapping_add(1);
-                }
-                let mut exponent = 0u32;
-                let mut exp_digits = 0u32;
-                loop {
-                    let byte = match hc_safe_read8(at) { Ok(v) => v, Err(_) => return false };
-                    if byte < b'0' as i32 || byte > b'9' as i32 { break; }
-                    exponent = exponent.saturating_mul(10).saturating_add((byte - b'0' as i32) as u32);
-                    exp_digits += 1;
-                    at = at.wrapping_add(1);
-                    if exponent > 64 { return false; }
-                }
-                if exp_digits == 0 { return false; }
-                for _ in 0..exponent {
-                    value = if exp_negative { value * 0.1 } else { value * 10.0 };
+                if exponent > 64 {
+                    return false;
                 }
             }
-            if negative { value = -value; }
-            (value as f32).to_bits()
+            if exp_digits == 0 {
+                return false;
+            }
+            for _ in 0..exponent {
+                value = if exp_negative { value * 0.1 } else { value * 10.0 };
+            }
+        }
+        if negative {
+            value = -value;
+        }
+        (value as f32).to_bits()
     };
 
-    if safe_write32(output, parsed_bits as i32).is_err() { return false; }
+    if safe_write32(output, parsed_bits as i32).is_err() {
+        return false;
+    }
     write_reg32(EAX, 1);
     true
 }
@@ -1068,13 +1340,28 @@ unsafe fn handle_msvcr71_sscanf_scalar() -> bool {
 /// MSVCR71.dll 7.10.3052.4 @ RVA 0x32ec: ASCII-only `_stricmp`.
 unsafe fn handle_msvcr71_stricmp() -> bool {
     let esp = read_reg32(ESP);
-    let mut left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let mut right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    let mut left = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let mut right = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
     for _ in 0..16_384 {
-        let a = match hc_safe_read8(left) { Ok(v) => v, Err(_) => return false };
-        let b = match hc_safe_read8(right) { Ok(v) => v, Err(_) => return false };
+        let a = match hc_safe_read8(left) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let b = match hc_safe_read8(right) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         if a == b {
-            if a == 0 { write_reg32(EAX, 0); return true; }
+            if a == 0 {
+                write_reg32(EAX, 0);
+                return true;
+            }
         }
         else {
             let folded_a = if a >= 0x41 && a <= 0x5a { a + 0x20 } else { a };
@@ -1094,12 +1381,27 @@ unsafe fn handle_msvcr71_stricmp() -> bool {
 /// -1/0/+1 rather than the raw difference used by our generic CRT handler.
 unsafe fn handle_msvcr71_memcmp() -> bool {
     let esp = read_reg32(ESP);
-    let left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
-    let right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v, Err(_) => return false };
-    let length = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
+    let left = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let right = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let length = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
     for offset in 0..length {
-        let a = match hc_safe_read8(left.wrapping_add(offset as i32)) { Ok(v) => v, Err(_) => return false };
-        let b = match hc_safe_read8(right.wrapping_add(offset as i32)) { Ok(v) => v, Err(_) => return false };
+        let a = match hc_safe_read8(left.wrapping_add(offset as i32)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let b = match hc_safe_read8(right.wrapping_add(offset as i32)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         if a != b {
             write_reg32(EAX, if a < b { -1 } else { 1 });
             return true;
@@ -1115,30 +1417,64 @@ unsafe fn handle_msvcr71_memcmp() -> bool {
 /// original from a clean state.
 unsafe fn handle_msvcr71_memmove() -> bool {
     let esp = read_reg32(ESP);
-    let dst = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
-    let src = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v, Err(_) => return false };
-    let len = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
-    if len == 0 { write_reg32(EAX, dst); return true; }
-    if len > 0x1000_0000 { return false; }
-    if readable_or_pagefault(src, len as i32).is_err() || writable_or_pagefault(dst, len as i32).is_err() { return false; }
+    let dst = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let src = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let len = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if len == 0 {
+        write_reg32(EAX, dst);
+        return true;
+    }
+    if len > 0x1000_0000 {
+        return false;
+    }
+    if readable_or_pagefault(src, len as i32).is_err()
+        || writable_or_pagefault(dst, len as i32).is_err()
+    {
+        return false;
+    }
     let (d, s) = (dst as u32, src as u32);
     if d > s && d < s.wrapping_add(len) {
         let mut i = len;
         while i > 0 {
             i -= 1;
-            let byte = match hc_safe_read8(src.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
-            if safe_write8(dst.wrapping_add(i as i32), byte).is_err() { return false; }
+            let byte = match hc_safe_read8(src.wrapping_add(i as i32)) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if safe_write8(dst.wrapping_add(i as i32), byte).is_err() {
+                return false;
+            }
         }
-    } else {
+    }
+    else {
         let mut i = 0u32;
         while i + 4 <= len {
-            let word = match safe_read32s(src.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
-            if safe_write32(dst.wrapping_add(i as i32), word).is_err() { return false; }
+            let word = match safe_read32s(src.wrapping_add(i as i32)) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if safe_write32(dst.wrapping_add(i as i32), word).is_err() {
+                return false;
+            }
             i += 4;
         }
         while i < len {
-            let byte = match hc_safe_read8(src.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
-            if safe_write8(dst.wrapping_add(i as i32), byte).is_err() { return false; }
+            let byte = match hc_safe_read8(src.wrapping_add(i as i32)) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if safe_write8(dst.wrapping_add(i as i32), byte).is_err() {
+                return false;
+            }
             i += 1;
         }
     }
@@ -1151,18 +1487,35 @@ unsafe fn handle_msvcr71_memmove() -> bool {
 /// sbb sequence.
 unsafe fn handle_msvcr71_strncmp() -> bool {
     let esp = read_reg32(ESP);
-    let left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
-    let right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v, Err(_) => return false };
-    let count = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
+    let left = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let right = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let count = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
     let mut i = 0u32;
     while i < count {
-        let a = match hc_safe_read8(left.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
-        let b = match hc_safe_read8(right.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
+        let a = match hc_safe_read8(left.wrapping_add(i as i32)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let b = match hc_safe_read8(right.wrapping_add(i as i32)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         if a != b {
             write_reg32(EAX, if a < b { -1 } else { 1 });
             return true;
         }
-        if a == 0 { break; }
+        if a == 0 {
+            break;
+        }
         i += 1;
     }
     write_reg32(EAX, 0);
@@ -1173,18 +1526,34 @@ unsafe fn handle_msvcr71_strncmp() -> bool {
 /// the terminator included (a zero byte finds it), else NULL.
 unsafe fn handle_msvcr71_strrchr() -> bool {
     let esp = read_reg32(ESP);
-    let string = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let wanted = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v & 0xff, Err(_) => return false };
+    let string = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let wanted = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) => v & 0xff,
+        Err(_) => return false,
+    };
     let mut length = 0u32;
     loop {
-        let byte = match hc_safe_read8(string.wrapping_add(length as i32)) { Ok(v) => v, Err(_) => return false };
-        if byte == 0 { break; }
+        let byte = match hc_safe_read8(string.wrapping_add(length as i32)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if byte == 0 {
+            break;
+        }
         length += 1;
-        if length > 0x1000_0000 { return false; }
+        if length > 0x1000_0000 {
+            return false;
+        }
     }
     let mut i = length as i64;
     while i >= 0 {
-        let byte = match hc_safe_read8(string.wrapping_add(i as i32)) { Ok(v) => v, Err(_) => return false };
+        let byte = match hc_safe_read8(string.wrapping_add(i as i32)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         if byte == wanted {
             write_reg32(EAX, string.wrapping_add(i as i32));
             return true;
@@ -1199,12 +1568,23 @@ unsafe fn handle_msvcr71_strrchr() -> bool {
 /// memory, matching the native function's fault behaviour on invalid input.
 unsafe fn handle_msvcr71_strlen() -> bool {
     let esp = read_reg32(ESP);
-    let string = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
+    let string = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
     let mut length = 0u32;
     loop {
-        let byte = match hc_safe_read8(string.wrapping_add(length as i32)) { Ok(v) => v, Err(_) => return false };
-        if byte == 0 { break; }
-        length = match length.checked_add(1) { Some(v) => v, None => return false };
+        let byte = match hc_safe_read8(string.wrapping_add(length as i32)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if byte == 0 {
+            break;
+        }
+        length = match length.checked_add(1) {
+            Some(v) => v,
+            None => return false,
+        };
     }
     write_reg32(EAX, length as i32);
     true
@@ -1215,24 +1595,50 @@ unsafe fn handle_msvcr71_strlen() -> bool {
 /// a declined HLE call can safely execute the relocated original.
 unsafe fn handle_msvcr71_strncpy() -> bool {
     let esp = read_reg32(ESP);
-    let destination = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
-    let source = match safe_read32s(esp.wrapping_add(8)) { Ok(v) => v, Err(_) => return false };
-    let count = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
-    if count == 0 { write_reg32(EAX, destination); return true; }
-    if destination == 0 || source == 0 || !validate_guest_range(destination as u32, count, true) { return false; }
+    let destination = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let source = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let count = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if count == 0 {
+        write_reg32(EAX, destination);
+        return true;
+    }
+    if destination == 0 || source == 0 || !validate_guest_range(destination as u32, count, true) {
+        return false;
+    }
 
     let mut copied = 0u32;
     while copied < count {
-        let byte = match hc_safe_read8(source.wrapping_add(copied as i32)) { Ok(v) => v, Err(_) => return false };
+        let byte = match hc_safe_read8(source.wrapping_add(copied as i32)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         copied += 1;
-        if byte == 0 { break; }
+        if byte == 0 {
+            break;
+        }
     }
     for offset in 0..count {
         let byte = if offset < copied {
-            match hc_safe_read8(source.wrapping_add(offset as i32)) { Ok(v) => v, Err(_) => return false }
+            match hc_safe_read8(source.wrapping_add(offset as i32)) {
+                Ok(v) => v,
+                Err(_) => return false,
+            }
         }
-        else { 0 };
-        if safe_write8(destination.wrapping_add(offset as i32), byte).is_err() { return false; }
+        else {
+            0
+        };
+        if safe_write8(destination.wrapping_add(offset as i32), byte).is_err() {
+            return false;
+        }
     }
     write_reg32(EAX, destination);
     true
@@ -1241,14 +1647,32 @@ unsafe fn handle_msvcr71_strncpy() -> bool {
 /// MSVCR71.dll 7.10.3052.4 internal ASCII `_strnicmp` @ RVA 0x38d9.
 unsafe fn handle_msvcr71_strnicmp() -> bool {
     let esp = read_reg32(ESP);
-    let mut left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let mut right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
-    let count = match safe_read32s(esp.wrapping_add(12)) { Ok(v) => v as u32, Err(_) => return false };
+    let mut left = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let mut right = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let count = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
     for _ in 0..count {
-        let a = match hc_safe_read8(left) { Ok(v) => v, Err(_) => return false };
-        let b = match hc_safe_read8(right) { Ok(v) => v, Err(_) => return false };
+        let a = match hc_safe_read8(left) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let b = match hc_safe_read8(right) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         if a == b {
-            if a == 0 { write_reg32(EAX, 0); return true; }
+            if a == 0 {
+                write_reg32(EAX, 0);
+                return true;
+            }
         }
         else {
             let folded_a = if a >= 0x41 && a <= 0x5a { a + 0x20 } else { a };
@@ -1269,16 +1693,31 @@ unsafe fn handle_msvcr71_strnicmp() -> bool {
 /// -1/0/+1 rather than the raw byte difference used by the generic handler.
 unsafe fn handle_msvcr71_strcmp() -> bool {
     let esp = read_reg32(ESP);
-    let mut left = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let mut right = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
+    let mut left = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let mut right = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
     loop {
-        let a = match hc_safe_read8(left) { Ok(v) => v, Err(_) => return false };
-        let b = match hc_safe_read8(right) { Ok(v) => v, Err(_) => return false };
+        let a = match hc_safe_read8(left) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let b = match hc_safe_read8(right) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         if a != b {
             write_reg32(EAX, if a < b { -1 } else { 1 });
             return true;
         }
-        if a == 0 { write_reg32(EAX, 0); return true; }
+        if a == 0 {
+            write_reg32(EAX, 0);
+            return true;
+        }
         left = left.wrapping_add(1);
         right = right.wrapping_add(1);
     }
@@ -1288,9 +1727,18 @@ unsafe fn handle_msvcr71_strcmp() -> bool {
 /// using an 8-bit opacity stream while preserving destination alpha.
 unsafe fn handle_pixel_alpha_blend() -> bool {
     let esp = read_reg32(ESP);
-    let source = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let destination = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
-    let alpha = match safe_read32s(esp.wrapping_add(12)) { Ok(v) if v != 0 => v, _ => return false };
+    let source = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let destination = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let alpha = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
     let count = match safe_read32s(esp.wrapping_add(16)) {
         Ok(v) if v > 0 && v <= 0x0010_0000 => v,
         _ => return false,
@@ -1302,7 +1750,8 @@ unsafe fn handle_pixel_alpha_blend() -> bool {
         let offset = i.wrapping_mul(4);
         if safe_read32s(source.wrapping_add(offset)).is_err()
             || safe_read32s(destination.wrapping_add(offset)).is_err()
-            || safe_read32s(alpha.wrapping_add(offset)).is_err() {
+            || safe_read32s(alpha.wrapping_add(offset)).is_err()
+        {
             return false;
         }
     }
@@ -1320,7 +1769,9 @@ unsafe fn handle_pixel_alpha_blend() -> bool {
             let blended = ((src_byte * opacity) >> 8) + ((dst_byte * inverse) >> 8);
             result |= (blended & 0xff) << shift;
         }
-        if safe_write32(destination.wrapping_add(offset), result as i32).is_err() { return false; }
+        if safe_write32(destination.wrapping_add(offset), result as i32).is_err() {
+            return false;
+        }
     }
     write_reg32(EAX, 0);
     true
@@ -1340,9 +1791,7 @@ const IDCT_FIX_2_562915447: i32 = 20995;
 const IDCT_FIX_3_072711026: i32 = 25172;
 
 #[inline(always)]
-fn idct_descale(value: i32, bits: u32) -> i32 {
-    value.wrapping_add(1i32 << (bits - 1)) >> bits
-}
+fn idct_descale(value: i32, bits: u32) -> i32 { value.wrapping_add(1i32 << (bits - 1)) >> bits }
 
 #[inline(always)]
 fn idct_1d(v: [i32; 8], shift: u32) -> [i32; 8] {
@@ -1403,20 +1852,47 @@ unsafe fn bfme_read_i16(address: i32) -> Option<i32> {
 /// passes and writes eight bytes to each supplied output row.
 unsafe fn handle_jpeg_idct_islow() -> bool {
     let esp = read_reg32(ESP);
-    let cinfo = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let component = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
-    let coefficients = match safe_read32s(esp.wrapping_add(12)) { Ok(v) if v != 0 => v, _ => return false };
-    let output_rows = match safe_read32s(esp.wrapping_add(16)) { Ok(v) if v != 0 => v, _ => return false };
-    let output_column = match safe_read32s(esp.wrapping_add(20)) { Ok(v) if v >= 0 && v <= 0x0010_0000 => v, _ => return false };
-    let range_limit = match safe_read32s(cinfo.wrapping_add(0x148)) { Ok(v) if v != 0 => v.wrapping_add(0x80), _ => return false };
-    let quantization = match safe_read32s(component.wrapping_add(0x50)) { Ok(v) if v != 0 => v, _ => return false };
+    let cinfo = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let component = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let coefficients = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let output_rows = match safe_read32s(esp.wrapping_add(16)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let output_column = match safe_read32s(esp.wrapping_add(20)) {
+        Ok(v) if v >= 0 && v <= 0x0010_0000 => v,
+        _ => return false,
+    };
+    let range_limit = match safe_read32s(cinfo.wrapping_add(0x148)) {
+        Ok(v) if v != 0 => v.wrapping_add(0x80),
+        _ => return false,
+    };
+    let quantization = match safe_read32s(component.wrapping_add(0x50)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
 
     let mut coef = [0i32; 64];
     let mut quant = [0i32; 64];
     let mut rows = [0i32; 8];
     for i in 0..64i32 {
-        coef[i as usize] = match bfme_read_i16(coefficients.wrapping_add(i * 2)) { Some(v) => v, None => return false };
-        quant[i as usize] = match bfme_read_i16(quantization.wrapping_add(i * 2)) { Some(v) => v, None => return false };
+        coef[i as usize] = match bfme_read_i16(coefficients.wrapping_add(i * 2)) {
+            Some(v) => v,
+            None => return false,
+        };
+        quant[i as usize] = match bfme_read_i16(quantization.wrapping_add(i * 2)) {
+            Some(v) => v,
+            None => return false,
+        };
     }
     for row in 0..8i32 {
         rows[row as usize] = match safe_read32s(output_rows.wrapping_add(row * 4)) {
@@ -1429,7 +1905,9 @@ unsafe fn handle_jpeg_idct_islow() -> bool {
     for column in 0..8usize {
         if (1..8usize).all(|row| coef[row * 8 + column] == 0) {
             let dc = coef[column].wrapping_mul(quant[column]).wrapping_shl(2);
-            for row in 0..8usize { workspace[row * 8 + column] = dc; }
+            for row in 0..8usize {
+                workspace[row * 8 + column] = dc;
+            }
             continue;
         }
         let mut input = [0i32; 8];
@@ -1438,7 +1916,9 @@ unsafe fn handle_jpeg_idct_islow() -> bool {
             input[row] = coef[index].wrapping_mul(quant[index]);
         }
         let output = idct_1d(input, 11);
-        for row in 0..8usize { workspace[row * 8 + column] = output[row]; }
+        for row in 0..8usize {
+            workspace[row * 8 + column] = output[row];
+        }
     }
 
     for row in 0..8usize {
@@ -1447,7 +1927,8 @@ unsafe fn handle_jpeg_idct_islow() -> bool {
         if (1..8usize).all(|x| workspace[base + x] == 0) {
             let value = idct_descale(workspace[base], 5);
             output.fill(value);
-        } else {
+        }
+        else {
             let mut input = [0i32; 8];
             input.copy_from_slice(&workspace[base..base + 8]);
             output = idct_1d(input, 18);
@@ -1457,7 +1938,9 @@ unsafe fn handle_jpeg_idct_islow() -> bool {
                 Ok(v) => v,
                 Err(_) => return false,
             };
-            if safe_write8(rows[row].wrapping_add(x as i32), sample).is_err() { return false; }
+            if safe_write8(rows[row].wrapping_add(x as i32), sample).is_err() {
+                return false;
+            }
         }
     }
     write_reg32(EAX, 0);
@@ -1470,25 +1953,68 @@ unsafe fn handle_jpeg_idct_islow() -> bool {
 unsafe fn handle_vertex_blend() -> bool {
     let frame = read_reg32(EBP);
     let owner = read_reg32(EBX);
-    if frame == 0 || owner == 0 { return false; }
-    let stream = match safe_read32s(owner.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let count = match safe_read32s(stream.wrapping_add(0x68)) { Ok(v) if v > 0 && v <= 0x0100_0000 => v, _ => return false };
-    let output = match safe_read32s(frame.wrapping_sub(0x10)) { Ok(v) if v != 0 => v, _ => return false };
-    let source_a = match safe_read32s(frame.wrapping_sub(0x18)) { Ok(v) if v != 0 => v, _ => return false };
-    let source_b = match safe_read32s(frame.wrapping_sub(0x04)) { Ok(v) if v != 0 => v, _ => return false };
-    let source_c = match safe_read32s(frame.wrapping_sub(0x08)) { Ok(v) if v != 0 => v, _ => return false };
-    let source_d = match safe_read32s(frame.wrapping_sub(0x1c)) { Ok(v) if v != 0 => v, _ => return false };
-    let scale = match read_f32(0x0108_3b6c) { Some(v) => v as f64, None => return false };
+    if frame == 0 || owner == 0 {
+        return false;
+    }
+    let stream = match safe_read32s(owner.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let count = match safe_read32s(stream.wrapping_add(0x68)) {
+        Ok(v) if v > 0 && v <= 0x0100_0000 => v,
+        _ => return false,
+    };
+    let output = match safe_read32s(frame.wrapping_sub(0x10)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let source_a = match safe_read32s(frame.wrapping_sub(0x18)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let source_b = match safe_read32s(frame.wrapping_sub(0x04)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let source_c = match safe_read32s(frame.wrapping_sub(0x08)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let source_d = match safe_read32s(frame.wrapping_sub(0x1c)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let scale = match read_f32(0x0108_3b6c) {
+        Some(v) => v as f64,
+        None => return false,
+    };
 
     for i in 0..count {
         let offset = i.wrapping_mul(16);
         for lane in 0..4i32 {
             let lane_offset = offset.wrapping_add(lane * 4);
-            let a = match read_f32(source_a.wrapping_add(lane_offset)) { Some(v) => v as f64, None => return false };
-            let b = match read_f32(source_b.wrapping_add(lane_offset)) { Some(v) => v as f64, None => return false };
-            let c = match read_f32(source_c.wrapping_add(lane_offset)) { Some(v) => v as f64, None => return false };
-            let d = match read_f32(source_d.wrapping_add(lane_offset)) { Some(v) => v as f64, None => return false };
-            if !write_f32(output.wrapping_add(lane_offset), (((a + b) + c) + d) * scale) { return false; }
+            let a = match read_f32(source_a.wrapping_add(lane_offset)) {
+                Some(v) => v as f64,
+                None => return false,
+            };
+            let b = match read_f32(source_b.wrapping_add(lane_offset)) {
+                Some(v) => v as f64,
+                None => return false,
+            };
+            let c = match read_f32(source_c.wrapping_add(lane_offset)) {
+                Some(v) => v as f64,
+                None => return false,
+            };
+            let d = match read_f32(source_d.wrapping_add(lane_offset)) {
+                Some(v) => v as f64,
+                None => return false,
+            };
+            if !write_f32(
+                output.wrapping_add(lane_offset),
+                (((a + b) + c) + d) * scale,
+            ) {
+                return false;
+            }
         }
     }
     write_reg32(EDX, count);
@@ -1566,14 +2092,29 @@ unsafe fn write_f32(address: i32, value: f64) -> bool {
 /// final binary32 store. Inputs are loaded first because the output may alias.
 unsafe fn handle_matrix_multiply() -> bool {
     let esp = read_reg32(ESP);
-    let left_address = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    let right_address = match safe_read32s(esp.wrapping_add(8)) { Ok(v) if v != 0 => v, _ => return false };
-    let output = match safe_read32s(esp.wrapping_add(12)) { Ok(v) if v != 0 => v, _ => return false };
+    let left_address = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let right_address = match safe_read32s(esp.wrapping_add(8)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let output = match safe_read32s(esp.wrapping_add(12)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
     let mut left = [0f64; 6];
     let mut right = [0f64; 6];
     for i in 0..6i32 {
-        left[i as usize] = match read_f32(left_address.wrapping_add(i * 4)) { Some(v) => v as f64, None => return false };
-        right[i as usize] = match read_f32(right_address.wrapping_add(i * 4)) { Some(v) => v as f64, None => return false };
+        left[i as usize] = match read_f32(left_address.wrapping_add(i * 4)) {
+            Some(v) => v as f64,
+            None => return false,
+        };
+        right[i as usize] = match read_f32(right_address.wrapping_add(i * 4)) {
+            Some(v) => v as f64,
+            None => return false,
+        };
     }
     let result = [
         left[2] * right[1] + left[0] * right[0],
@@ -1584,7 +2125,9 @@ unsafe fn handle_matrix_multiply() -> bool {
         right[5] * left[3] + right[4] * left[1] + left[5],
     ];
     for i in 0..6i32 {
-        if !write_f32(output.wrapping_add(i * 4), result[i as usize]) { return false; }
+        if !write_f32(output.wrapping_add(i * 4), result[i as usize]) {
+            return false;
+        }
     }
     write_reg32(EAX, output);
     true
@@ -1603,7 +2146,9 @@ unsafe fn copy_matrix32(source: i32, destination: i32) -> bool {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if safe_write32(destination.wrapping_add(offset), value).is_err() { return false; }
+        if safe_write32(destination.wrapping_add(offset), value).is_err() {
+            return false;
+        }
     }
     true
 }
@@ -1611,14 +2156,22 @@ unsafe fn copy_matrix32(source: i32, destination: i32) -> bool {
 /// 0x00cd2b50: save the current 32-byte matrix state into the inline stack.
 unsafe fn handle_matrix_push() -> bool {
     let object = read_reg32(ECX);
-    if object == 0 { return false; }
+    if object == 0 {
+        return false;
+    }
     let depth = match safe_read32s(object.wrapping_add(MATRIX_DEPTH)) {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let destination = object.wrapping_add(MATRIX_STACK).wrapping_add(depth.wrapping_mul(32));
-    if !copy_matrix32(object, destination) { return false; }
-    if safe_write32(object.wrapping_add(MATRIX_DEPTH), depth.wrapping_add(1)).is_err() { return false; }
+    let destination = object
+        .wrapping_add(MATRIX_STACK)
+        .wrapping_add(depth.wrapping_mul(32));
+    if !copy_matrix32(object, destination) {
+        return false;
+    }
+    if safe_write32(object.wrapping_add(MATRIX_DEPTH), depth.wrapping_add(1)).is_err() {
+        return false;
+    }
     write_reg32(EAX, object);
     true
 }
@@ -1626,15 +2179,21 @@ unsafe fn handle_matrix_push() -> bool {
 /// 0x00cd2b80: restore the most recently saved 32-byte matrix state.
 unsafe fn handle_matrix_pop() -> bool {
     let object = read_reg32(ECX);
-    if object == 0 { return false; }
+    if object == 0 {
+        return false;
+    }
     let depth = match safe_read32s(object.wrapping_add(MATRIX_DEPTH)) {
         Ok(v) => v.wrapping_sub(1),
         Err(_) => return false,
     };
-    if safe_write32(object.wrapping_add(MATRIX_DEPTH), depth).is_err() { return false; }
+    if safe_write32(object.wrapping_add(MATRIX_DEPTH), depth).is_err() {
+        return false;
+    }
     let offset = depth.wrapping_mul(32);
     let source = object.wrapping_add(MATRIX_STACK).wrapping_add(offset);
-    if !copy_matrix32(source, object) { return false; }
+    if !copy_matrix32(source, object) {
+        return false;
+    }
     write_reg32(EAX, offset);
     true
 }
@@ -1644,37 +2203,56 @@ unsafe fn handle_matrix_pop() -> bool {
 /// transform-update callback still runs after the WASM copy.
 unsafe fn handle_transform_push() -> bool {
     let object = read_reg32(ECX);
-    if object == 0 { return false; }
+    if object == 0 {
+        return false;
+    }
     let depth = match safe_read32s(object.wrapping_add(TRANSFORM_DEPTH)) {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let destination = object.wrapping_add(TRANSFORM_STACK).wrapping_add(depth.wrapping_mul(24));
+    let destination = object
+        .wrapping_add(TRANSFORM_STACK)
+        .wrapping_add(depth.wrapping_mul(24));
     for offset in (0..24i32).step_by(4) {
         let value = match safe_read32s(object.wrapping_add(TRANSFORM_SOURCE).wrapping_add(offset)) {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if safe_write32(destination.wrapping_add(offset), value).is_err() { return false; }
+        if safe_write32(destination.wrapping_add(offset), value).is_err() {
+            return false;
+        }
     }
-    if safe_write32(object.wrapping_add(TRANSFORM_DEPTH), depth.wrapping_add(1)).is_err() { return false; }
+    if safe_write32(object.wrapping_add(TRANSFORM_DEPTH), depth.wrapping_add(1)).is_err() {
+        return false;
+    }
     write_reg32(EAX, destination);
     true
 }
 
 unsafe fn handle_transform_pop() -> bool {
     let object = read_reg32(ECX);
-    if object == 0 { return false; }
+    if object == 0 {
+        return false;
+    }
     let depth = match safe_read32s(object.wrapping_add(TRANSFORM_DEPTH)) {
         Ok(v) => v.wrapping_sub(1),
         Err(_) => return false,
     };
-    if safe_write32(object.wrapping_add(TRANSFORM_DEPTH), depth).is_err() { return false; }
-    let source = object.wrapping_add(TRANSFORM_STACK).wrapping_add(depth.wrapping_mul(24));
+    if safe_write32(object.wrapping_add(TRANSFORM_DEPTH), depth).is_err() {
+        return false;
+    }
+    let source = object
+        .wrapping_add(TRANSFORM_STACK)
+        .wrapping_add(depth.wrapping_mul(24));
     let destination = object.wrapping_add(TRANSFORM_SOURCE);
     for offset in (0..24i32).step_by(4) {
-        let value = match safe_read32s(source.wrapping_add(offset)) { Ok(v) => v, Err(_) => return false };
-        if safe_write32(destination.wrapping_add(offset), value).is_err() { return false; }
+        let value = match safe_read32s(source.wrapping_add(offset)) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if safe_write32(destination.wrapping_add(offset), value).is_err() {
+            return false;
+        }
     }
     write_reg32(EAX, destination);
     true
@@ -1685,21 +2263,35 @@ unsafe fn handle_transform_pop() -> bool {
 unsafe fn handle_matrix_adjust() -> bool {
     let object = read_reg32(ECX);
     let esp = read_reg32(ESP);
-    let adjustment = match safe_read32s(esp.wrapping_add(4)) { Ok(v) if v != 0 => v, _ => return false };
-    if object == 0 { return false; }
+    let adjustment = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    if object == 0 {
+        return false;
+    }
     let mut current = [0f64; 8];
     let mut delta = [0f64; 8];
     for i in 0..8i32 {
-        current[i as usize] = match read_f32(object.wrapping_add(i * 4)) { Some(v) => v as f64, None => return false };
-        delta[i as usize] = match read_f32(adjustment.wrapping_add(i * 4)) { Some(v) => v as f64, None => return false };
+        current[i as usize] = match read_f32(object.wrapping_add(i * 4)) {
+            Some(v) => v as f64,
+            None => return false,
+        };
+        delta[i as usize] = match read_f32(adjustment.wrapping_add(i * 4)) {
+            Some(v) => v as f64,
+            None => return false,
+        };
     }
     for i in 0..8i32 {
         let value = if i < 4 {
             delta[i as usize] * current[i as usize]
-        } else {
+        }
+        else {
             delta[i as usize] + current[i as usize]
         };
-        if !write_f32(object.wrapping_add(i * 4), value) { return false; }
+        if !write_f32(object.wrapping_add(i * 4), value) {
+            return false;
+        }
     }
     write_reg32(EAX, object);
     true
@@ -1717,7 +2309,9 @@ unsafe fn read_u16(address: i32) -> Option<u32> {
 #[inline(always)]
 unsafe fn read_stringbase(object: i32) -> Option<(i32, u32)> {
     let storage = safe_read32s(object).ok()?;
-    if storage == 0 { return Some((0, 0)); }
+    if storage == 0 {
+        return Some((0, 0));
+    }
     let length = read_u16(storage.wrapping_add(4))?;
     Some((storage.wrapping_add(8), length))
 }
@@ -1732,7 +2326,9 @@ unsafe fn handle_stringbase_find() -> bool {
         Ok(v) if v != 0 => v,
         _ => return false,
     };
-    if container == 0 { return false; }
+    if container == 0 {
+        return false;
+    }
     let (key_chars, key_length) = match read_stringbase(key_object) {
         Some(v) => v,
         None => return false,
@@ -1792,19 +2388,37 @@ unsafe fn stringbase_lock_ready() -> bool {
 /// BFME's global reference-count lock. A unique store declines to guest code,
 /// which performs the real free.
 unsafe fn handle_stringbase_release() -> bool {
-    if !stringbase_lock_ready() { return false; }
+    if !stringbase_lock_ready() {
+        return false;
+    }
     let object = read_reg32(ECX);
-    if object == 0 { return false; }
-    let storage = match safe_read32s(object) { Ok(v) => v, Err(_) => return false };
+    if object == 0 {
+        return false;
+    }
+    let storage = match safe_read32s(object) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     if storage == 0 {
-        if safe_write32(object, 0).is_err() { return false; }
+        if safe_write32(object, 0).is_err() {
+            return false;
+        }
         write_reg32(EAX, 0);
         return true;
     }
-    let refs = match safe_read32s(storage) { Ok(v) => v as u32, Err(_) => return false };
-    if refs <= 1 { return false; }
-    if safe_write32(storage, refs.wrapping_sub(1) as i32).is_err() { return false; }
-    if safe_write32(object, 0).is_err() { return false; }
+    let refs = match safe_read32s(storage) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if refs <= 1 {
+        return false;
+    }
+    if safe_write32(storage, refs.wrapping_sub(1) as i32).is_err() {
+        return false;
+    }
+    if safe_write32(object, 0).is_err() {
+        return false;
+    }
     write_reg32(EAX, 0);
     true
 }
@@ -1813,17 +2427,34 @@ unsafe fn handle_stringbase_release() -> bool {
 /// by v86, so the source refcount update is indivisible with respect to another
 /// guest thread even without the emulated process-wide lock.
 unsafe fn handle_stringbase_copy() -> bool {
-    if !stringbase_lock_ready() { return false; }
+    if !stringbase_lock_ready() {
+        return false;
+    }
     let destination = read_reg32(ECX);
     let esp = read_reg32(ESP);
-    let source = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
-    if destination == 0 || source == 0 { return false; }
-    let storage = match safe_read32s(source) { Ok(v) => v, Err(_) => return false };
-    if storage != 0 {
-        let refs = match safe_read32s(storage) { Ok(v) => v as u32, Err(_) => return false };
-        if safe_write32(storage, refs.wrapping_add(1) as i32).is_err() { return false; }
+    let source = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if destination == 0 || source == 0 {
+        return false;
     }
-    if safe_write32(destination, storage).is_err() { return false; }
+    let storage = match safe_read32s(source) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if storage != 0 {
+        let refs = match safe_read32s(storage) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        if safe_write32(storage, refs.wrapping_add(1) as i32).is_err() {
+            return false;
+        }
+    }
+    if safe_write32(destination, storage).is_err() {
+        return false;
+    }
     write_reg32(EAX, destination);
     true
 }
@@ -1832,31 +2463,58 @@ unsafe fn handle_stringbase_copy() -> bool {
 /// destination, or a shared old value. A uniquely-owned old value declines so
 /// the original function can invoke BFME's allocator/free routine.
 unsafe fn handle_stringbase_assign() -> bool {
-    if !stringbase_lock_ready() { return false; }
+    if !stringbase_lock_ready() {
+        return false;
+    }
     let destination = read_reg32(ECX);
     let esp = read_reg32(ESP);
-    let source = match safe_read32s(esp.wrapping_add(4)) { Ok(v) => v, Err(_) => return false };
-    if destination == 0 || source == 0 { return false; }
+    let source = match safe_read32s(esp.wrapping_add(4)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if destination == 0 || source == 0 {
+        return false;
+    }
     if destination == source {
         write_reg32(EAX, destination);
         return true;
     }
-    let old_storage = match safe_read32s(destination) { Ok(v) => v, Err(_) => return false };
-    let new_storage = match safe_read32s(source) { Ok(v) => v, Err(_) => return false };
+    let old_storage = match safe_read32s(destination) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let new_storage = match safe_read32s(source) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     if old_storage == new_storage {
         write_reg32(EAX, destination);
         return true;
     }
     if old_storage != 0 {
-        let refs = match safe_read32s(old_storage) { Ok(v) => v as u32, Err(_) => return false };
-        if refs <= 1 { return false; }
-        if safe_write32(old_storage, refs.wrapping_sub(1) as i32).is_err() { return false; }
+        let refs = match safe_read32s(old_storage) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        if refs <= 1 {
+            return false;
+        }
+        if safe_write32(old_storage, refs.wrapping_sub(1) as i32).is_err() {
+            return false;
+        }
     }
     if new_storage != 0 {
-        let refs = match safe_read32s(new_storage) { Ok(v) => v as u32, Err(_) => return false };
-        if safe_write32(new_storage, refs.wrapping_add(1) as i32).is_err() { return false; }
+        let refs = match safe_read32s(new_storage) {
+            Ok(v) => v as u32,
+            Err(_) => return false,
+        };
+        if safe_write32(new_storage, refs.wrapping_add(1) as i32).is_err() {
+            return false;
+        }
     }
-    if safe_write32(destination, new_storage).is_err() { return false; }
+    if safe_write32(destination, new_storage).is_err() {
+        return false;
+    }
     write_reg32(EAX, destination);
     true
 }
@@ -1878,10 +2536,22 @@ unsafe fn handle_stringbase_lower() -> bool {
         Ok(v) => v as u32,
         Err(_) => return false,
     };
-    let len_lo = match hc_safe_read8(storage.wrapping_add(4)) { Ok(v) => v as u32, Err(_) => return false };
-    let len_hi = match hc_safe_read8(storage.wrapping_add(5)) { Ok(v) => v as u32, Err(_) => return false };
-    let cap_lo = match hc_safe_read8(storage.wrapping_add(6)) { Ok(v) => v as u32, Err(_) => return false };
-    let cap_hi = match hc_safe_read8(storage.wrapping_add(7)) { Ok(v) => v as u32, Err(_) => return false };
+    let len_lo = match hc_safe_read8(storage.wrapping_add(4)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let len_hi = match hc_safe_read8(storage.wrapping_add(5)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let cap_lo = match hc_safe_read8(storage.wrapping_add(6)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let cap_hi = match hc_safe_read8(storage.wrapping_add(7)) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
     let length = len_lo | len_hi << 8;
     let capacity = cap_lo | cap_hi << 8;
     if refs != 1 || length >= capacity {
